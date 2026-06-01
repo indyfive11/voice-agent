@@ -1,0 +1,22 @@
+# Secrets
+.env
+
+# Python / venv
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Session + transcript logs
+logs/
+
+# uv
+# (uv.lock IS committed for reproducibility — do not ignore it)
+
+# Local Pipecat fork (escape hatch — see pyproject.toml [tool.uv.sources])
+vendor/
+
+# Model caches downloaded on first run (Whisper / Kokoro / Silero / SmartTurn)
+models/
+*.onnx
+*.bin

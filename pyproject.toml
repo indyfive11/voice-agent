@@ -1,0 +1,43 @@
+[project]
+name = "voice-agent"
+version = "0.1.0"
+description = "Real-time spoken assistant for Claude (Pipecat, local-first, tool-enabled)"
+requires-python = ">=3.12,<3.13"
+
+# Pipecat is PINNED so the local-fork escape hatch below has a stable base and the
+# SmartTurn V2->V3 / extras-rename drift can't recur silently. Bump deliberately.
+dependencies = [
+    "pipecat-ai[anthropic,silero,whisper,local,kokoro,local-smart-turn]==1.3.0",
+    "onnxruntime",
+    "python-dotenv",
+    "loguru",
+    "websockets>=16.0",
+]
+
+[project.optional-dependencies]
+# LLM-swap extras — not installed by default. Enable with: uv sync --extra swap
+# NB: there is no `ollama` extra at 1.3.0 — OLLamaLLMService rides on [openai]
+# (it just points an OpenAI-compatible client at the Ollama base_url).
+swap = [
+    "pipecat-ai[openai]==1.3.0",
+]
+
+[dependency-groups]
+# Installed by default with `uv sync`. Safety unit tests (Phase 3.5).
+dev = [
+    "pytest",
+]
+
+[tool.uv]
+# This is an application, not a library — don't try to build/install it as a package.
+package = false
+
+# --- Local fork escape hatch (documented, default OFF) ---
+# Don't fork preemptively; ship on the pinned PyPI release above. When you need to
+# patch Pipecat (fix a bug, set a breakpoint, hack a service), clone your fork to
+# ./vendor/pipecat (gitignored or a submodule) and uncomment the stanza below — edits
+# there then take effect live (editable). `uv sync` to switch; re-comment to return.
+# Alternative for reproducible committed fixes:
+#   pipecat-ai = { git = "https://github.com/<you>/pipecat", branch = "my-fixes" }
+# [tool.uv.sources]
+# pipecat-ai = { path = "./vendor/pipecat", editable = true }
