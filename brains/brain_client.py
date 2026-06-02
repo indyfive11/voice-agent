@@ -25,6 +25,7 @@ class BrainEvent:
       - "status"  : optional short narration to speak (`text`)
       - "confirm" : a gated action awaiting a decision (`id`, `tier`, `method`, `summary`, `reason`)
       - "blocked" : a refused action to announce (`reason`, `action`)
+      - "error"   : a turn-level failure to speak (`text` speakable, `summary` structured cause)
       - "done"    : end of this turn
     """
 
@@ -36,6 +37,10 @@ class BrainEvent:
     summary: str | None = None
     reason: str | None = None
     action: str | None = None
+    # confirm only: when True, `summary` is the ENTIRE spoken line (it carries its own
+    # yes/no choice) — speak it verbatim and append no proceed/cancel tail. Omitted (None)
+    # = normal Option A: `summary` is a bare action and voice-agent owns the yes/no tail.
+    prompt_is_complete: bool | None = None
 
 
 @runtime_checkable

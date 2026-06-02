@@ -98,6 +98,39 @@ def test_error_event_spoken_once_fallback_status_suppressed():
     assert _texts(pushed) == ["Sorry, I hit a problem."]
 
 
+def test_confirm_prompt_phrasing():
+    cp = BrainLLMService._confirm_prompt
+    # Imperative fragment → wrapped with "I'll …" + our yes/no tail.
+    assert cp("edit the project README") == \
+        "I'll edit the project README. Say yes to proceed, or no to cancel."
+    # Already-formed question → spoken verbatim, no "I'll", no double "?.".
+    assert cp("Play The Matrix in Jellyfin?") == \
+        "Play The Matrix in Jellyfin? Say yes to proceed, or no to cancel."
+    # Summary that already poses its own yes/no choice → we don't double it up.
+    assert cp("Play on your open Chrome? Yes to use it, no to open a new window.") == \
+        "Play on your open Chrome? Yes to use it, no to open a new window."
+    # Never emits a broken "I'll …?" or a double period.
+    for s in ("Play The Matrix in Jellyfin?", "Delete the file.", "Restart now!"):
+        out = cp(s)
+        assert "I'll Play" not in out and ".." not in out and "?." not in out
+
+
+def test_confirm_prompt_is_complete_spoken_verbatim():
+    # prompt_is_complete → summary is the whole line (own yes/no), append nothing.
+    line = "Play The Matrix on your open Chrome? Say yes to play there, or no to open a new window."
+    client = FakeBrainClient(
+        respond_events=[BrainEvent("confirm", id="c9", tier=2, method="spoken_yesno",
+                                   summary=line, prompt_is_complete=True)],
+        confirm_events=[BrainEvent("token", text="Playing."), BrainEvent("done")],
+    )
+    svc, pushed = _service_with_recorder(client)
+    asyncio.run(svc._process_context(_ctx("yes on chrome")))
+    spoken = " ".join(_texts(pushed))
+    assert spoken == line  # verbatim, no "I'll", no appended proceed/cancel tail
+    assert "Say yes to proceed" not in spoken
+    assert svc._pending_confirm == {"id": "c9", "method": "spoken_yesno"}
+
+
 def test_repeated_status_spoken_once():
     client = FakeBrainClient(respond_events=[
         BrainEvent("status", text="Looking into it."),

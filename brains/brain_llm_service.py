@@ -176,10 +176,12 @@ class BrainLLMService(LLMService):
                         return
                     # spoken_yesno (Tier 2): two-turn — speak prompt, remember, end the turn.
                     self._pending_confirm = {"id": ev.id, "method": method}
-                    prompt = summary if summary.lower().startswith(("i ", "i'll")) else f"I'll {summary}"
-                    if ev.reason:
-                        prompt += f" {ev.reason}"
-                    await self._speak(f"{prompt}. Say yes to proceed, or no to cancel.")
+                    if ev.prompt_is_complete:
+                        # summary is the ENTIRE spoken line (carries its own yes/no choice):
+                        # speak verbatim, append nothing.
+                        await self._speak(summary)
+                    else:
+                        await self._speak(self._confirm_prompt(summary, ev.reason))
                     return
                 elif ev.type == "blocked":
                     # NOT a stream boundary (per protocol): speak the reason, keep consuming;
@@ -205,6 +207,31 @@ class BrainLLMService(LLMService):
                     await aclose()
                 except Exception:  # noqa: BLE001 - best-effort
                     pass
+
+    @staticmethod
+    def _confirm_prompt(summary: str, reason: str | None = None) -> str:
+        """Build the spoken Tier-2 confirm line, robust to either summary style.
+
+        The brain may send an imperative fragment ("edit the README") or a fully-formed
+        spoken question ("Play The Matrix in Jellyfin?"). Wrap the former with "I'll …";
+        speak the latter verbatim. Either way append a single clean yes/no instruction —
+        unless the summary already poses its own choice (a "yes…/no…" line), in which case
+        we don't double it up.
+        """
+        s = (summary or "perform that action").strip()
+        if s.endswith((".", "?", "!")):
+            prompt = s  # already a complete spoken line
+        elif s.lower().startswith(("i ", "i'll", "i'd", "i will")):
+            prompt = f"{s}."
+        else:
+            prompt = f"I'll {s}."
+        if reason:
+            prompt += f" {reason.strip()}"
+        # If the brain already spelled out the yes/no choice, don't append ours.
+        low = prompt.lower()
+        if "yes to" in low or "say yes" in low or ("yes or no" in low):
+            return prompt
+        return f"{prompt} Say yes to proceed, or no to cancel."
 
     @staticmethod
     def _latest_user_text(context) -> str:
