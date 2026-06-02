@@ -140,6 +140,20 @@ class HttpBrainClient:
         except Exception as e:  # noqa: BLE001
             logger.debug(f"Brain: /media/duck failed (ignored): {e}")
 
+    async def media_state(self, session_id: str) -> dict | None:
+        """Best-effort `GET /media/state` → provider-neutral `{"playing": bool, "state":
+        "playing"|"paused"|"idle"}`. None if the brain doesn't expose it (older brain / 404) or on any
+        error — caller then assumes media may be playing."""
+        try:
+            r = await self._http.get(
+                "/media/state", params={"session_id": session_id}, timeout=httpx.Timeout(2.0)
+            )
+            if r.status_code == 200:
+                return r.json()
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"Brain: /media/state unavailable (ignored): {e}")
+        return None
+
     async def aclose(self) -> None:
         """Full teardown: cancel any active turn, close HTTP, stop the spawned process."""
         if self._active_session:

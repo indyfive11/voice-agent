@@ -28,6 +28,8 @@ tempfile.tempdir = None  # drop any cached value so TMPDIR is re-read
 from dotenv import load_dotenv
 from loguru import logger
 
+from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
+from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.frames.frames import LLMRunFrame
@@ -39,6 +41,12 @@ from pipecat.processors.aggregators.llm_response_universal import (
     LLMUserAggregatorParams,
 )
 from pipecat.turns.user_mute import AlwaysUserMuteStrategy
+from pipecat.turns.user_start import MinWordsUserTurnStartStrategy
+from pipecat.turns.user_stop import TurnAnalyzerUserTurnStopStrategy
+from pipecat.turns.user_turn_strategies import (
+    UserTurnStrategies,
+    default_user_turn_start_strategies,
+)
 from pipecat.workers.runner import WorkerRunner
 
 import config
@@ -151,25 +159,60 @@ async def run() -> None:
         + ("half-duplex — mic muted while speaking, no barge-in (HALF_DUPLEX=0 for barge-in)"
            if half_duplex else "full-duplex — barge-in on (needs headphones or echo-cancel)")
     )
-    # Turn-detection tuning: the VAD's `stop_secs` is how long a silence must last before a
-    # turn is considered (possibly) over. The default (0.2s) is aggressive and fragments
-    # natural multi-clause speech ("…start music… draft an email… can you do that?") into
-    # separate turns. A more forgiving default (0.6s) absorbs short mid-thought pauses;
-    # SmartTurn v3 still decides true end-of-turn. Tune via VAD_STOP_SECS.
-    vad_stop_secs = float(os.environ.get("VAD_STOP_SECS", "0.6"))
-    logger.info(f"VAD stop_secs={vad_stop_secs}s (pause tolerance before end-of-turn)")
+    # Turn-detection tuning. TWO distinct `stop_secs` knobs — don't conflate them:
+    #   * VAD `stop_secs` — silence before the VAD says "user stopped", which *triggers*
+    #     SmartTurn inference. SmartTurn v3 is trained against 0.2s segmentation and then
+    #     dynamically decides the *real* end-of-turn itself, so 0.2 is correct here. (A higher
+    #     value fights SmartTurn and trips a startup warning.)
+    #   * SmartTurn `stop_secs` — SmartTurn's hard max-silence fallback (default 3s): when a
+    #     mid-sentence pause hits it, the turn is force-completed regardless of the model verdict.
+    #     That 3s default is what fragmented the user's multi-clause speech ("…start music… Tidal…
+    #     recommendations…") into separate turns. Raise it (~4s) so a thinking pause doesn't split
+    #     the turn; SmartTurn still ends the turn promptly once it judges the user is done.
+    vad_stop_secs = float(os.environ.get("VAD_STOP_SECS", "0.2"))
+    smart_turn_stop_secs = float(os.environ.get("SMART_TURN_STOP_SECS", "4.0"))
+    logger.info(
+        f"Turn detection: VAD stop_secs={vad_stop_secs}s → SmartTurn v3 "
+        f"(stop_secs={smart_turn_stop_secs}s max-silence fallback)"
+    )
+    turn_analyzer = LocalSmartTurnAnalyzerV3(
+        params=SmartTurnParams(
+            stop_secs=smart_turn_stop_secs, max_duration_secs=8, pre_speech_ms=500
+        )
+    )
+    # Start strategies: half-duplex keeps the default VAD-onset start. Full-duplex (mic open
+    # during TTS) gates turn-start on transcribed words via MinWords so residual TTS/media bleed
+    # can't false-start a turn / barge-in (min_words applies only while the bot is speaking; a
+    # single word starts a turn otherwise). Tune the interruption threshold via BARGE_IN_MIN_WORDS.
+    if half_duplex:
+        start_strategies = default_user_turn_start_strategies()
+    else:
+        min_words = int(os.environ.get("BARGE_IN_MIN_WORDS", "2"))
+        start_strategies = [
+            MinWordsUserTurnStartStrategy(min_words=min_words, use_interim=True)
+        ]
+        logger.info(f"Full-duplex barge-in gated on min_words={min_words}")
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(
             vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=vad_stop_secs)),
             user_mute_strategies=[AlwaysUserMuteStrategy()] if half_duplex else [],
+            user_turn_strategies=UserTurnStrategies(
+                start=start_strategies,
+                stop=[TurnAnalyzerUserTurnStopStrategy(turn_analyzer=turn_analyzer)],
+            ),
         ),
     )
+
+    # Media-duck controller goes right after STT — it's the only spot that sees transcription
+    # frames (the user aggregator consumes them). No-op / absent for a raw-LLM brain.
+    media_duck = config.build_media_duck(llm)
 
     pipeline = Pipeline(
         [
             transport.input(),     # mic (PipeWire → PyAudio)
             stt,                   # Whisper (local)
+            *([media_duck] if media_duck else []),  # duck media on confirmed speech (gabagent brain)
             user_aggregator,       # VAD + SmartTurn v3 + user-side context
             llm,                   # Claude / OpenAI-compatible / local Ollama
             tts,                   # Kokoro (local)

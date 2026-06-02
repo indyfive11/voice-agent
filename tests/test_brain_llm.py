@@ -156,6 +156,32 @@ def test_shutdown_phrase_ends_pipeline_cleanly():
     assert "goodbye" in " ".join(_texts(pushed)).lower()
 
 
+def test_shutdown_phrase_survives_stt_punctuation():
+    # Live regression (session 621ac1b2…): Whisper emitted "Shut down, voice mode." with a comma,
+    # which defeated the plain substring match → shutdown never fired, session only ended on Ctrl-C.
+    # Normalization must strip the punctuation so the gate fires.
+    from pipecat.frames.frames import EndTaskFrame
+
+    client = FakeBrainClient(respond_events=[BrainEvent("token", text="Hi!"), BrainEvent("done")])
+    svc, pushed = _service_with_recorder(client)
+    asyncio.run(svc._process_context(_ctx("Shut down, voice mode.")))
+    assert client.respond_calls == []                          # never reaches the brain
+    assert any(isinstance(f, EndTaskFrame) for f in pushed)    # graceful end requested
+    assert "goodbye" in " ".join(_texts(pushed)).lower()
+
+
+def test_shutdown_close_variant_fires():
+    # Live regression (session 61a6228b): "Close down voice mode" missed the gate (no "close"
+    # variant) → brain fielded it, couldn't exit. Close-variants must fire the clean exit.
+    from pipecat.frames.frames import EndTaskFrame
+
+    client = FakeBrainClient(respond_events=[BrainEvent("token", text="Hi!"), BrainEvent("done")])
+    svc, pushed = _service_with_recorder(client)
+    asyncio.run(svc._process_context(_ctx("Close down voice mode.")))
+    assert client.respond_calls == []
+    assert any(isinstance(f, EndTaskFrame) for f in pushed)
+
+
 def test_meta_question_about_shutdown_does_not_exit():
     # "Do you know how to turn yourself off yet?" is a QUESTION about the control — must not exit;
     # it should reach the brain so Aria can explain (regression from live session 3ba40222…).
@@ -204,32 +230,63 @@ def test_confirm_prompt_is_complete_spoken_verbatim():
     assert svc._pending_confirm == {"id": "c9", "method": "spoken_yesno"}
 
 
-def test_media_duck_on_user_speech_restore_after_bot():
-    from pipecat.frames.frames import (
-        BotStartedSpeakingFrame, BotStoppedSpeakingFrame, UserStartedSpeakingFrame,
-    )
+# --- media ducking (MediaDuckController; redesigned 2026-06-02) ---------------
+from brains.media_duck import MediaDuckController  # noqa: E402
+from pipecat.frames.frames import (  # noqa: E402
+    BotStartedSpeakingFrame,
+    BotStoppedSpeakingFrame,
+    InterimTranscriptionFrame,
+    TranscriptionFrame,
+)
+
+
+def _duck(client, **kw):
+    kw.setdefault("min_words", 2)
+    kw.setdefault("restore_grace", 8.0)
+    return MediaDuckController(client, "sess-test", **kw)
+
+
+def _spoken(text):
+    return TranscriptionFrame(text, "user", "2026-01-01T00:00:00Z")
+
+
+def test_media_duck_on_confirmed_speech_restore_after_bot():
     client = FakeBrainClient()
-    svc, _ = _service_with_recorder(client)
+    ctl = _duck(client)
 
     async def go():
-        svc._maybe_duck(UserStartedSpeakingFrame())   # user starts → duck on
+        ctl._handle(_spoken("let's play a movie"))   # confirmed words → duck on
         await asyncio.sleep(0)
-        svc._maybe_duck(BotStartedSpeakingFrame())     # Aria starts replying
-        svc._maybe_duck(BotStoppedSpeakingFrame())     # Aria done → restore
+        ctl._handle(BotStartedSpeakingFrame())        # Aria replies
+        ctl._handle(BotStoppedSpeakingFrame())        # Aria done → restore
         await asyncio.sleep(0)
 
     asyncio.run(go())
     assert client.duck_calls == [("sess-test", True), ("sess-test", False)]
 
 
-def test_media_duck_not_doubled_on_repeat_user_speech():
-    from pipecat.frames.frames import UserStartedSpeakingFrame
+def test_media_duck_ignores_non_speech_vad_noise():
+    # Sub-min_words transcription (movie effect / blip) must NOT duck — this is the whole point of
+    # gating on confirmed speech instead of raw VAD.
     client = FakeBrainClient()
-    svc, _ = _service_with_recorder(client)
+    ctl = _duck(client, min_words=2)
 
     async def go():
-        svc._maybe_duck(UserStartedSpeakingFrame())
-        svc._maybe_duck(UserStartedSpeakingFrame())  # already ducked → no second call
+        ctl._handle(_spoken("hmm"))                   # 1 word < min_words → ignored
+        ctl._handle(InterimTranscriptionFrame("", "user", "t"))  # empty → ignored
+        await asyncio.sleep(0)
+
+    asyncio.run(go())
+    assert client.duck_calls == []
+
+
+def test_media_duck_not_doubled_on_repeat_speech():
+    client = FakeBrainClient()
+    ctl = _duck(client)
+
+    async def go():
+        ctl._handle(_spoken("play some music"))
+        ctl._handle(_spoken("play some music now"))   # already ducked → no second on
         await asyncio.sleep(0)
 
     asyncio.run(go())
@@ -237,33 +294,53 @@ def test_media_duck_not_doubled_on_repeat_user_speech():
 
 
 def test_media_duck_fallback_restores_when_no_bot_speech():
-    from pipecat.frames.frames import UserStartedSpeakingFrame, UserStoppedSpeakingFrame
     client = FakeBrainClient()
-    svc, _ = _service_with_recorder(client)
-    svc._restore_grace = 0.01  # short fallback for the test
+    ctl = _duck(client, restore_grace=0.01)  # short idle fallback for the test
 
     async def go():
-        svc._maybe_duck(UserStartedSpeakingFrame())
-        await asyncio.sleep(0)
-        svc._maybe_duck(UserStoppedSpeakingFrame())  # no bot speech → arm fallback
-        await asyncio.sleep(0.05)
+        ctl._handle(_spoken("turn it down please"))
+        await asyncio.sleep(0.05)                      # no bot speech → idle restore fires
 
     asyncio.run(go())
     assert client.duck_calls == [("sess-test", True), ("sess-test", False)]
 
 
-def test_media_duck_skipped_while_asleep():
-    from pipecat.frames.frames import UserStartedSpeakingFrame
+def test_media_duck_skipped_when_nothing_playing():
     client = FakeBrainClient()
-    svc, _ = _service_with_recorder(client)
-    svc._sleeping = True
+    client.media_state_value = {"playing": False, "state": "idle"}  # neutral shape, nothing playing
+    ctl = _duck(client)
 
     async def go():
-        svc._maybe_duck(UserStartedSpeakingFrame())
+        ctl._handle(_spoken("hello there aria"))
         await asyncio.sleep(0)
 
     asyncio.run(go())
-    assert client.duck_calls == []  # asleep: nothing to make room for
+    assert client.duck_calls == []  # media-state gate → no duck when nothing plays
+
+
+def test_media_duck_fires_when_something_playing():
+    client = FakeBrainClient()
+    client.media_state_value = {"playing": True, "state": "playing"}  # neutral shape, playing
+    ctl = _duck(client)
+
+    async def go():
+        ctl._handle(_spoken("hello there aria"))
+        await asyncio.sleep(0)
+
+    asyncio.run(go())
+    assert client.duck_calls == [("sess-test", True)]
+
+
+def test_media_duck_skipped_while_asleep():
+    client = FakeBrainClient()
+    ctl = _duck(client, should_duck=lambda: False)  # asleep → gate closed
+
+    async def go():
+        ctl._handle(_spoken("wake up please aria"))
+        await asyncio.sleep(0)
+
+    asyncio.run(go())
+    assert client.duck_calls == []
 
 
 def test_repeated_status_spoken_once():

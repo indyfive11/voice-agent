@@ -201,12 +201,77 @@ def list_audio_devices() -> None:
         pa.terminate()
 
 
+def _resolve_device_index(name: str | None, *, want_output: bool) -> int | None:
+    """Resolve a PyAudio device index by case-insensitive substring match on its name.
+
+    Returns None if `name` is unset or nothing matches (caller falls back to the OS default).
+    Pinning by name survives index reshuffles; pin to avoid the silent-sink failure where the OS
+    default changes mid-session (e.g. a monitor/HDMI move) and the already-open stream keeps writing
+    to the now-silent original device.
+    """
+    if not name:
+        return None
+    try:
+        import pyaudio
+    except Exception as e:  # pragma: no cover - diagnostic only
+        logger.warning(f"Cannot resolve audio device by name ({e}); using default.")
+        return None
+    kind = "output" if want_output else "input"
+    pa = pyaudio.PyAudio()
+    try:
+        nlow = name.lower()
+        for i in range(pa.get_device_count()):
+            d = pa.get_device_info_by_index(i)
+            chans = d.get("maxOutputChannels" if want_output else "maxInputChannels") or 0
+            if chans > 0 and nlow in str(d.get("name", "")).lower():
+                logger.info(f"Audio: matched {kind} name~={name!r} → [{i}] {d['name']}")
+                return i
+        logger.warning(f"Audio: no {kind} device matched name~={name!r}; using system default.")
+    finally:
+        pa.terminate()
+    return None
+
+
+def _readback_device(index: int | None, *, want_output: bool) -> None:
+    """Log the device actually selected, so a silent/wrong sink is visible in the log.
+
+    With index=None the OS default is used — which can silently change at runtime (the monitor-move
+    failure). Warns if the resolved device has zero channels of the needed direction. Pipecat's
+    Bot-started/stopped-speaking frames are bookkeeping around the TTS queue and fire even when
+    output went nowhere, so this read-back is the only place a dead output sink surfaces.
+    """
+    try:
+        import pyaudio
+    except Exception:  # pragma: no cover - diagnostic only
+        return
+    kind = "output" if want_output else "input"
+    pa = pyaudio.PyAudio()
+    try:
+        try:
+            if index is not None:
+                d = pa.get_device_info_by_index(index)
+            else:
+                d = (pa.get_default_output_device_info() if want_output
+                     else pa.get_default_input_device_info())
+        except Exception as e:
+            logger.warning(f"Audio {kind}: could not read back device (index={index}): {e}")
+            return
+        chans = d.get("maxOutputChannels" if want_output else "maxInputChannels") or 0
+        msg = f"Audio {kind} in use: [{d.get('index')}] {d.get('name')!r} ({kind} channels={chans})"
+        if index is None:
+            msg += f" — system DEFAULT (can change at runtime; pin with AUDIO_{kind.upper()}_DEVICE_NAME)"
+        (logger.warning if chans == 0 else logger.info)(msg)
+    finally:
+        pa.terminate()
+
+
 def build_transport():
     """LocalAudioTransport bound to the mic/speaker (PipeWire via PyAudio).
 
-    Mic = Logitech C110 (mono). Set AUDIO_INPUT_DEVICE_INDEX to pin it explicitly
-    (find the index in the `list_audio_devices()` log); unset lets PyAudio use the
-    system default source, which is the C110 on this machine.
+    Mic = Logitech C110 (mono). Pin devices explicitly with AUDIO_{INPUT,OUTPUT}_DEVICE_INDEX
+    (numeric, from the `list_audio_devices()` log) or AUDIO_{INPUT,OUTPUT}_DEVICE_NAME (substring,
+    resolved at startup); index wins. Unset → PyAudio's system default (the C110 mic on this box,
+    but the default output can change mid-session — prefer pinning the output by name).
     """
     from pipecat.transports.local.audio import (
         LocalAudioTransport,
@@ -214,8 +279,14 @@ def build_transport():
     )
 
     in_idx = _env_int("AUDIO_INPUT_DEVICE_INDEX")
+    if in_idx is None:
+        in_idx = _resolve_device_index(_env("AUDIO_INPUT_DEVICE_NAME"), want_output=False)
     out_idx = _env_int("AUDIO_OUTPUT_DEVICE_INDEX")
+    if out_idx is None:
+        out_idx = _resolve_device_index(_env("AUDIO_OUTPUT_DEVICE_NAME"), want_output=True)
     logger.info(f"Transport: local audio  input_device_index={in_idx}  output_device_index={out_idx}")
+    _readback_device(in_idx, want_output=False)
+    _readback_device(out_idx, want_output=True)
     return LocalAudioTransport(
         LocalAudioTransportParams(
             audio_in_enabled=True,
@@ -223,6 +294,32 @@ def build_transport():
             input_device_index=in_idx,
             output_device_index=out_idx,
         )
+    )
+
+
+# --------------------------------------------------------------------------- media ducking
+def build_media_duck(llm):
+    """Build the MediaDuckController for an external brain, or None for a raw LLM.
+
+    Inserted right after STT (see main.py) so it can see transcription frames — it ducks the brain's
+    media on *confirmed* user speech and restores when Aria finishes. Shares the brain's session_id
+    so `/media/duck` correlates, and gates on the brain's sleep state.
+    """
+    from brains.brain_llm_service import BrainLLMService
+
+    if not isinstance(llm, BrainLLMService):
+        return None
+    from brains.media_duck import MediaDuckController
+
+    min_words = int(_env("DUCK_MIN_WORDS", "2"))
+    restore_grace = float(_env("DUCK_RESTORE_GRACE", "8.0"))
+    logger.info(f"Media ducking: on confirmed speech (min_words={min_words}, restore_grace={restore_grace}s)")
+    return MediaDuckController(
+        llm.brain_client,
+        llm.session_id,
+        min_words=min_words,
+        restore_grace=restore_grace,
+        should_duck=lambda: not llm.is_sleeping,
     )
 
 

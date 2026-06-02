@@ -15,22 +15,19 @@ whose continuation is streamed normally.
 from __future__ import annotations
 
 import asyncio
+import re
 import shutil
 import uuid
 
 from loguru import logger
 
 from pipecat.frames.frames import (
-    BotStartedSpeakingFrame,
-    BotStoppedSpeakingFrame,
     EndTaskFrame,
     Frame,
     LLMContextFrame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
     LLMTextFrame,
-    UserStartedSpeakingFrame,
-    UserStoppedSpeakingFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.llm_service import LLMService
@@ -50,6 +47,10 @@ _SHUTDOWN_PHRASES = (
     "shut yourself down", "shut down voice mode", "shut down voice agent",
     "shut down the voice agent", "exit voice mode", "quit voice mode",
     "end voice mode", "turn yourself off", "stop the voice agent",
+    # "close…" variants (live: "Close down voice mode" missed the gate). All require
+    # "voice mode"/"voice agent" so they can't fire on "close the window/movie".
+    "close voice mode", "close down voice mode", "close the voice agent",
+    "close voice agent", "close down the voice agent",
 )
 
 # If the user is ASKING ABOUT a control rather than issuing it ("what's the command to make you
@@ -88,12 +89,6 @@ class BrainLLMService(LLMService):
         self._pending_confirm: dict | None = None  # {"id":…, "method":…}
         self._reply_buf: list[str] = []  # accumulates this turn's spoken text (transcript log)
         self._sleeping = False  # when True, ignore all input except a wake phrase
-        # Media ducking: while the user speaks (and through Aria's reply), ask the brain to duck
-        # music / pause video so playback doesn't drown out the mic (or get transcribed itself).
-        self._media_ducked = False
-        self._bot_spoke_since_duck = False
-        self._restore_timer: asyncio.Task | None = None
-        self._restore_grace = 2.0  # fallback restore if a ducked turn yields no bot speech
         # Log the correlation key so the transcript can be lined up with the brain's own logs.
         _tlog(f"BRAIN | gabagent session_id={self._session_id}")
 
@@ -102,11 +97,19 @@ class BrainLLMService(LLMService):
         """The underlying BrainClient (used by config.start_brain/stop_brain)."""
         return self._client
 
+    @property
+    def session_id(self) -> str:
+        """The brain session key — shared with MediaDuckController so duck calls correlate."""
+        return self._session_id
+
+    @property
+    def is_sleeping(self) -> bool:
+        """True while asleep (used to gate media ducking — nothing to make room for)."""
+        return self._sleeping
+
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         """Handle LLMContextFrame by streaming the brain's reply; forward everything else."""
         await super().process_frame(frame, direction)
-
-        self._maybe_duck(frame)
 
         if isinstance(frame, LLMContextFrame):
             try:
@@ -121,67 +124,6 @@ class BrainLLMService(LLMService):
         else:
             await self.push_frame(frame, direction)
 
-    def _maybe_duck(self, frame: Frame) -> None:
-        """Drive media ducking off the VAD/bot speaking frames flowing through the pipeline.
-
-        Duck on user-speech onset; restore when Aria finishes speaking (so playback stays low /
-        paused through the whole exchange, not just while the user talks). A fallback timer
-        restores if a ducked turn produces no bot speech. Skipped while asleep (we're ignoring
-        the user, so there's nothing to make room for).
-        """
-        if isinstance(frame, UserStartedSpeakingFrame):
-            if self._sleeping:
-                return
-            self._cancel_restore_timer()
-            if not self._media_ducked:
-                self._media_ducked = True
-                self._bot_spoke_since_duck = False
-                self._fire_duck(True)
-        elif isinstance(frame, BotStartedSpeakingFrame):
-            self._bot_spoke_since_duck = True
-            self._cancel_restore_timer()
-        elif isinstance(frame, BotStoppedSpeakingFrame):
-            if self._media_ducked:
-                self._media_ducked = False
-                self._fire_duck(False)
-        elif isinstance(frame, UserStoppedSpeakingFrame):
-            # If the bot never speaks this turn (e.g. an ignored/no-op turn), restore anyway.
-            if self._media_ducked and not self._bot_spoke_since_duck:
-                self._arm_restore_timer()
-
-    def _fire_duck(self, on: bool) -> None:
-        """Fire-and-forget the brain duck call — never block the audio pipeline."""
-        duck = getattr(self._client, "duck", None)
-        if duck is None:
-            return
-
-        async def _go():
-            try:
-                await duck(self._session_id, on)
-            except Exception:  # noqa: BLE001 - best-effort; media control must never break audio
-                pass
-
-        asyncio.create_task(_go())
-
-    def _arm_restore_timer(self) -> None:
-        self._cancel_restore_timer()
-
-        async def _later():
-            try:
-                await asyncio.sleep(self._restore_grace)
-                if self._media_ducked and not self._bot_spoke_since_duck:
-                    self._media_ducked = False
-                    self._fire_duck(False)
-            except asyncio.CancelledError:
-                pass
-
-        self._restore_timer = asyncio.create_task(_later())
-
-    def _cancel_restore_timer(self) -> None:
-        if self._restore_timer is not None and not self._restore_timer.done():
-            self._restore_timer.cancel()
-        self._restore_timer = None
-
     async def _speak(self, text: str) -> None:
         """Push text to TTS and record it for the transcript log."""
         if text:
@@ -194,14 +136,19 @@ class BrainLLMService(LLMService):
         self._last_status: str | None = None  # suppress repeated identical status spam
         self._suppress_next_status = False  # skip the transitional fallback status after an error
         low = user_text.strip().lower()
+        # Normalize STT punctuation before matching control phrases: Whisper sprinkles commas/periods
+        # ("Shut down, voice mode.") that defeat a plain substring test against punctuation-free
+        # phrases ("shut down voice mode") — which is exactly how a live shutdown failed. Strip
+        # non-word chars to spaces and collapse whitespace, then match the gates against this.
+        low_norm = re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", low)).strip()
         # A question *about* the controls, not a command — don't fire the destructive gates.
-        is_meta = any(m in low for m in _META_COMMAND_MARKERS)
+        is_meta = any(m in low_norm for m in _META_COMMAND_MARKERS)
         try:
             # --- shutdown: a clean voice exit of the whole agent. Works in any state
             # (even asleep). Speak a goodbye, then request graceful pipeline closure by
             # pushing EndTaskFrame UPSTREAM — the task flushes queued frames (so the
             # goodbye is spoken) then ends; main.py's finally tears the brain down.
-            if not is_meta and any(p in low for p in _SHUTDOWN_PHRASES):
+            if not is_meta and any(p in low_norm for p in _SHUTDOWN_PHRASES):
                 _tlog(f"SHUTDOWN| {user_text!r}")
                 await self._speak("Shutting down voice mode. Goodbye.")
                 await self.push_frame(EndTaskFrame(), FrameDirection.UPSTREAM)
@@ -210,14 +157,14 @@ class BrainLLMService(LLMService):
             # --- sleep/wake gate (the mic stays on; while asleep we ignore all but a wake
             # phrase, and never call the brain). This is the real "stop listening" control.
             if self._sleeping:
-                if any(p in low for p in _WAKE_PHRASES):
+                if any(p in low_norm for p in _WAKE_PHRASES):
                     self._sleeping = False
                     _tlog(f"WAKE  | {user_text!r}")
                     await self._speak("I'm awake. What do you need?")
                 else:
                     _tlog(f"ASLEEP| ignoring: {user_text!r}")
                 return
-            if not is_meta and any(p in low for p in _SLEEP_PHRASES):
+            if not is_meta and any(p in low_norm for p in _SLEEP_PHRASES):
                 self._sleeping = True
                 _tlog(f"SLEEP | {user_text!r}")
                 await self._speak("Going to sleep. Say 'wake up' when you need me.")

@@ -62,9 +62,16 @@ class BrainClient(Protocol):
         ...
 
     async def duck(self, session_id: str, on: bool) -> None:
-        """Best-effort: tell the brain to duck/pause (on=True) or restore (on=False) active
-        media while the user is speaking, so playback doesn't drown out the mic. No-op if the
+        """Best-effort: tell the brain to lower (on=True) or restore (on=False) the volume of its
+        active media while the user is speaking, so playback doesn't drown out the mic. No-op if the
         brain controls no media; must never raise."""
+        ...
+
+    async def media_state(self, session_id: str) -> dict | None:
+        """Best-effort, provider-neutral playback snapshot: {"playing": bool, "state":
+        "playing"|"paused"|"idle"} so the caller can skip ducking when nothing is playing. Brain-
+        agnostic by contract — no per-provider keys. None if the brain doesn't expose it (older brain /
+        404) or on any error; never raises."""
         ...
 
     async def aclose(self) -> None:
@@ -94,6 +101,8 @@ class FakeBrainClient:
         self.confirm_calls: list[tuple[str, str, bool, str | None]] = []
         self.cancel_calls: list[str] = []
         self.duck_calls: list[tuple[str, bool]] = []
+        # Tests set this to drive media_state(); None → capability absent (callers assume "playing").
+        self.media_state_value: dict | None = None
 
     async def respond(self, session_id: str, text: str) -> AsyncIterator[BrainEvent]:
         self.respond_calls.append((session_id, text))
@@ -116,6 +125,9 @@ class FakeBrainClient:
 
     async def duck(self, session_id: str, on: bool) -> None:
         self.duck_calls.append((session_id, on))
+
+    async def media_state(self, session_id: str) -> dict | None:
+        return self.media_state_value
 
     async def aclose(self) -> None:
         self.closed = True
