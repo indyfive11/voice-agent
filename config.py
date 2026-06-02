@@ -33,6 +33,13 @@ def _env_int(key: str) -> int | None:
     return int(val) if val is not None else None
 
 
+# Canonical pipeline audio rate. Whisper STT and the Silero VAD both want 16 kHz; the mic is
+# captured at whatever rate the device can open and resampled to this once, up front (see
+# audio_resample.InputResampler + build_transport). Pin STT/VAD to this so they never adopt the
+# device's native rate off the StartFrame.
+PIPELINE_AUDIO_RATE = 16000
+
+
 # --------------------------------------------------------------------------- system prompt
 # Voice-assistant framing. The full 3-tier safety guardrail wording is added in Phase 3
 # once tools exist; for the Phase-2 talk-only loop this keeps replies short and speakable.
@@ -58,8 +65,14 @@ def build_stt():
         # this AMD box (no CUDA), which is faster-than-real-time here.
         model = _env("STT_MODEL", "small.en")
         logger.info(f"STT: local Whisper (faster-whisper) model={model!r} device=auto")
+        # Pin to the pipeline rate so Whisper never adopts the device's native capture rate
+        # (the mic is resampled to PIPELINE_AUDIO_RATE before it reaches STT). Whisper assumes
+        # its input array is already at this rate — feeding it 48 kHz samples would make it
+        # transcribe everything 3× too fast.
         return WhisperSTTService(
-            settings=WhisperSTTService.Settings(model=model), device="auto"
+            settings=WhisperSTTService.Settings(model=model),
+            device="auto",
+            sample_rate=PIPELINE_AUDIO_RATE,
         )
 
     if provider == "deepgram":
@@ -265,6 +278,41 @@ def _readback_device(index: int | None, *, want_output: bool) -> None:
         pa.terminate()
 
 
+def _supported_input_rate(index: int | None, prefer: int = PIPELINE_AUDIO_RATE) -> int:
+    """Return a sample rate the input device can actually open at.
+
+    Prefer the pipeline rate (16 kHz → no resampling needed). Some PipeWire capture nodes only
+    expose their native rate and reject a 16 kHz open with `-9997` — notably the `echo-cancel-source`
+    (AEC Mic), which is 48 kHz only. In that case fall back to the device's native default rate;
+    `InputResampler` converts it back to the pipeline rate. Returns `prefer` if probing fails (the
+    transport will surface a clear error if even that doesn't open).
+    """
+    try:
+        import pyaudio
+    except Exception:  # pragma: no cover - diagnostic only
+        return prefer
+    pa = pyaudio.PyAudio()
+    try:
+        try:
+            if pa.is_format_supported(
+                prefer, input_device=index, input_channels=1, input_format=pyaudio.paInt16
+            ):
+                return prefer
+        except Exception:
+            pass  # prefer unsupported → fall back to the device's native rate
+        try:
+            d = (
+                pa.get_device_info_by_index(index)
+                if index is not None
+                else pa.get_default_input_device_info()
+            )
+            return int(d.get("defaultSampleRate") or prefer)
+        except Exception:
+            return prefer
+    finally:
+        pa.terminate()
+
+
 def build_transport():
     """LocalAudioTransport bound to the mic/speaker (PipeWire via PyAudio).
 
@@ -287,14 +335,33 @@ def build_transport():
     logger.info(f"Transport: local audio  input_device_index={in_idx}  output_device_index={out_idx}")
     _readback_device(in_idx, want_output=False)
     _readback_device(out_idx, want_output=True)
+    # Capture at a rate the device can actually open; InputResampler normalizes to PIPELINE_AUDIO_RATE.
+    capture_rate = _supported_input_rate(in_idx)
+    if capture_rate != PIPELINE_AUDIO_RATE:
+        logger.info(
+            f"Audio input: device can't open at {PIPELINE_AUDIO_RATE}Hz — capturing at "
+            f"{capture_rate}Hz and resampling to {PIPELINE_AUDIO_RATE}Hz (InputResampler)."
+        )
     return LocalAudioTransport(
         LocalAudioTransportParams(
             audio_in_enabled=True,
             audio_out_enabled=True,
+            audio_in_sample_rate=capture_rate,
             input_device_index=in_idx,
             output_device_index=out_idx,
         )
     )
+
+
+def build_input_resampler():
+    """Resampler that normalizes mic capture to PIPELINE_AUDIO_RATE. Goes first in the pipeline.
+
+    Always present (cheap, no-op when the device already opens at the pipeline rate) so the rest of
+    the pipeline sees one consistent rate regardless of which mic/AEC source is bound.
+    """
+    from audio_resample import InputResampler
+
+    return InputResampler(target_rate=PIPELINE_AUDIO_RATE)
 
 
 # --------------------------------------------------------------------------- media ducking

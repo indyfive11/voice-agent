@@ -195,7 +195,12 @@ async def run() -> None:
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(
-            vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=vad_stop_secs)),
+            # Pinned to the pipeline rate: the mic is resampled to PIPELINE_AUDIO_RATE up front
+            # (InputResampler), so the VAD must not adopt the device's native capture rate.
+            vad_analyzer=SileroVADAnalyzer(
+                sample_rate=config.PIPELINE_AUDIO_RATE,
+                params=VADParams(stop_secs=vad_stop_secs),
+            ),
             user_mute_strategies=[AlwaysUserMuteStrategy()] if half_duplex else [],
             user_turn_strategies=UserTurnStrategies(
                 start=start_strategies,
@@ -211,6 +216,7 @@ async def run() -> None:
     pipeline = Pipeline(
         [
             transport.input(),     # mic (PipeWire → PyAudio)
+            config.build_input_resampler(),  # normalize capture → 16 kHz (AEC source is 48 kHz-only)
             stt,                   # Whisper (local)
             *([media_duck] if media_duck else []),  # duck media on confirmed speech (gabagent brain)
             user_aggregator,       # VAD + SmartTurn v3 + user-side context
