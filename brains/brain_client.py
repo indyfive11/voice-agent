@@ -61,6 +61,12 @@ class BrainClient(Protocol):
         """Abort the in-flight turn (barge-in) without tearing the client down."""
         ...
 
+    async def duck(self, session_id: str, on: bool) -> None:
+        """Best-effort: tell the brain to duck/pause (on=True) or restore (on=False) active
+        media while the user is speaking, so playback doesn't drown out the mic. No-op if the
+        brain controls no media; must never raise."""
+        ...
+
     async def aclose(self) -> None:
         """Full teardown — release transport + any spawned brain process (shutdown)."""
         ...
@@ -87,6 +93,7 @@ class FakeBrainClient:
         self.respond_calls: list[tuple[str, str]] = []
         self.confirm_calls: list[tuple[str, str, bool, str | None]] = []
         self.cancel_calls: list[str] = []
+        self.duck_calls: list[tuple[str, bool]] = []
 
     async def respond(self, session_id: str, text: str) -> AsyncIterator[BrainEvent]:
         self.respond_calls.append((session_id, text))
@@ -106,6 +113,9 @@ class FakeBrainClient:
 
     async def cancel(self, session_id: str) -> None:
         self.cancel_calls.append(session_id)
+
+    async def duck(self, session_id: str, on: bool) -> None:
+        self.duck_calls.append((session_id, on))
 
     async def aclose(self) -> None:
         self.closed = True

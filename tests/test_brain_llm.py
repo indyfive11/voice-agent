@@ -204,6 +204,68 @@ def test_confirm_prompt_is_complete_spoken_verbatim():
     assert svc._pending_confirm == {"id": "c9", "method": "spoken_yesno"}
 
 
+def test_media_duck_on_user_speech_restore_after_bot():
+    from pipecat.frames.frames import (
+        BotStartedSpeakingFrame, BotStoppedSpeakingFrame, UserStartedSpeakingFrame,
+    )
+    client = FakeBrainClient()
+    svc, _ = _service_with_recorder(client)
+
+    async def go():
+        svc._maybe_duck(UserStartedSpeakingFrame())   # user starts → duck on
+        await asyncio.sleep(0)
+        svc._maybe_duck(BotStartedSpeakingFrame())     # Aria starts replying
+        svc._maybe_duck(BotStoppedSpeakingFrame())     # Aria done → restore
+        await asyncio.sleep(0)
+
+    asyncio.run(go())
+    assert client.duck_calls == [("sess-test", True), ("sess-test", False)]
+
+
+def test_media_duck_not_doubled_on_repeat_user_speech():
+    from pipecat.frames.frames import UserStartedSpeakingFrame
+    client = FakeBrainClient()
+    svc, _ = _service_with_recorder(client)
+
+    async def go():
+        svc._maybe_duck(UserStartedSpeakingFrame())
+        svc._maybe_duck(UserStartedSpeakingFrame())  # already ducked → no second call
+        await asyncio.sleep(0)
+
+    asyncio.run(go())
+    assert client.duck_calls == [("sess-test", True)]
+
+
+def test_media_duck_fallback_restores_when_no_bot_speech():
+    from pipecat.frames.frames import UserStartedSpeakingFrame, UserStoppedSpeakingFrame
+    client = FakeBrainClient()
+    svc, _ = _service_with_recorder(client)
+    svc._restore_grace = 0.01  # short fallback for the test
+
+    async def go():
+        svc._maybe_duck(UserStartedSpeakingFrame())
+        await asyncio.sleep(0)
+        svc._maybe_duck(UserStoppedSpeakingFrame())  # no bot speech → arm fallback
+        await asyncio.sleep(0.05)
+
+    asyncio.run(go())
+    assert client.duck_calls == [("sess-test", True), ("sess-test", False)]
+
+
+def test_media_duck_skipped_while_asleep():
+    from pipecat.frames.frames import UserStartedSpeakingFrame
+    client = FakeBrainClient()
+    svc, _ = _service_with_recorder(client)
+    svc._sleeping = True
+
+    async def go():
+        svc._maybe_duck(UserStartedSpeakingFrame())
+        await asyncio.sleep(0)
+
+    asyncio.run(go())
+    assert client.duck_calls == []  # asleep: nothing to make room for
+
+
 def test_repeated_status_spoken_once():
     client = FakeBrainClient(respond_events=[
         BrainEvent("status", text="Looking into it."),
