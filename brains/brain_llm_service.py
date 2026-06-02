@@ -21,6 +21,7 @@ import uuid
 from loguru import logger
 
 from pipecat.frames.frames import (
+    EndTaskFrame,
     Frame,
     LLMContextFrame,
     LLMFullResponseEndFrame,
@@ -38,6 +39,14 @@ _YES_WORDS = ("yes", "yeah", "yep", "yup", "confirm", "proceed", "go ahead", "do
 # Multi-word phrases only (single words like "sleep"/"wake" cause false hits, e.g. "otters sleep").
 _SLEEP_PHRASES = ("go to sleep", "stop listening", "pause listening", "stop responding")
 _WAKE_PHRASES = ("wake up", "i'm back", "are you awake", "you awake", "start listening")
+
+# Clean exit of the whole voice agent. Deliberately specific to *this process* — never bare
+# "shut down"/"power off", which are the brain's job (system control) and must pass through.
+_SHUTDOWN_PHRASES = (
+    "shut yourself down", "shut down voice mode", "shut down voice agent",
+    "shut down the voice agent", "exit voice mode", "quit voice mode",
+    "end voice mode", "turn yourself off", "stop the voice agent",
+)
 
 
 def _tlog(message: str) -> None:
@@ -103,6 +112,16 @@ class BrainLLMService(LLMService):
         self._suppress_next_status = False  # skip the transitional fallback status after an error
         low = user_text.strip().lower()
         try:
+            # --- shutdown: a clean voice exit of the whole agent. Works in any state
+            # (even asleep). Speak a goodbye, then request graceful pipeline closure by
+            # pushing EndTaskFrame UPSTREAM — the task flushes queued frames (so the
+            # goodbye is spoken) then ends; main.py's finally tears the brain down.
+            if any(p in low for p in _SHUTDOWN_PHRASES):
+                _tlog(f"SHUTDOWN| {user_text!r}")
+                await self._speak("Shutting down voice mode. Goodbye.")
+                await self.push_frame(EndTaskFrame(), FrameDirection.UPSTREAM)
+                return
+
             # --- sleep/wake gate (the mic stays on; while asleep we ignore all but a wake
             # phrase, and never call the brain). This is the real "stop listening" control.
             if self._sleeping:
@@ -164,10 +183,17 @@ class BrainLLMService(LLMService):
                     summary = ev.summary or "perform that action"
                     _tlog(f"CONFIRM| tier={ev.tier} method={method} {summary!r}")
                     if method == "keyboard":
-                        # Tier 3: out-of-band physical confirm, resolved in this same turn.
-                        await self._speak(f"{summary}. Please confirm at the keyboard.")
-                        if ev.reason:
-                            await self._speak(ev.reason)
+                        # Tier 3: out-of-band physical confirm via an on-screen dialog (kdialog),
+                        # resolved in this same turn. Never read a raw tool-call summary aloud —
+                        # the dialog body carries the full detail visually; speak only a short,
+                        # human heads-up. Refer to the on-screen prompt (it's a mouse dialog —
+                        # don't say "keyboard", which is inaccurate and confusing).
+                        if self._looks_like_raw_tool(summary):
+                            await self._speak("This one needs your approval — "
+                                              "please confirm in the prompt on screen.")
+                        else:
+                            await self._speak(f"{self._confirm_prompt(summary, None, tail=False)} "
+                                              "Please confirm in the prompt on screen.")
                         approved = await self._keyboard_confirm(summary, ev.reason)
                         _tlog(f"CONFIRM| keyboard decision: approved={approved}")
                         await self._consume(
@@ -209,14 +235,21 @@ class BrainLLMService(LLMService):
                     pass
 
     @staticmethod
-    def _confirm_prompt(summary: str, reason: str | None = None) -> str:
+    def _looks_like_raw_tool(summary: str) -> bool:
+        """True if a summary looks like an un-speakable raw tool call (not for TTS)."""
+        s = summary or ""
+        return ("\n" in s) or ("(content=" in s) or ("command_id=" in s) or ("args=" in s)
+
+    @staticmethod
+    def _confirm_prompt(summary: str, reason: str | None = None, *, tail: bool = True) -> str:
         """Build the spoken Tier-2 confirm line, robust to either summary style.
 
         The brain may send an imperative fragment ("edit the README") or a fully-formed
-        spoken question ("Play The Matrix in Jellyfin?"). Wrap the former with "I'll …";
-        speak the latter verbatim. Either way append a single clean yes/no instruction —
-        unless the summary already poses its own choice (a "yes…/no…" line), in which case
-        we don't double it up.
+        spoken question ("Play The Matrix in Jellyfin?"). Wrap the former with "I'll …"
+        (lower-casing its leading verb so it reads as a sentence, not "I'll Open …"); speak
+        the latter verbatim. With `tail`, append a single clean yes/no instruction — unless
+        the summary already poses its own choice (a "yes…/no…" line), in which case we don't
+        double it up. `tail=False` returns just the action clause (used by the keyboard path).
         """
         s = (summary or "perform that action").strip()
         if s.endswith((".", "?", "!")):
@@ -224,9 +257,11 @@ class BrainLLMService(LLMService):
         elif s.lower().startswith(("i ", "i'll", "i'd", "i will")):
             prompt = f"{s}."
         else:
-            prompt = f"I'll {s}."
+            prompt = f"I'll {s[:1].lower()}{s[1:]}."  # "Open a URL" -> "I'll open a URL."
         if reason:
             prompt += f" {reason.strip()}"
+        if not tail:
+            return prompt
         # If the brain already spelled out the yes/no choice, don't append ours.
         low = prompt.lower()
         if "yes to" in low or "say yes" in low or ("yes or no" in low):

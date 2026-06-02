@@ -103,16 +103,67 @@ def test_confirm_prompt_phrasing():
     # Imperative fragment → wrapped with "I'll …" + our yes/no tail.
     assert cp("edit the project README") == \
         "I'll edit the project README. Say yes to proceed, or no to cancel."
+    # Leading verb is lower-cased so it reads as a sentence ("I'll open…", not "I'll Open…").
+    assert cp("Open a URL in the default browser") == \
+        "I'll open a URL in the default browser. Say yes to proceed, or no to cancel."
     # Already-formed question → spoken verbatim, no "I'll", no double "?.".
     assert cp("Play The Matrix in Jellyfin?") == \
         "Play The Matrix in Jellyfin? Say yes to proceed, or no to cancel."
     # Summary that already poses its own yes/no choice → we don't double it up.
     assert cp("Play on your open Chrome? Yes to use it, no to open a new window.") == \
         "Play on your open Chrome? Yes to use it, no to open a new window."
+    # tail=False → just the action clause (keyboard path), no yes/no instruction.
+    assert cp("Open a URL in the default browser", tail=False) == \
+        "I'll open a URL in the default browser."
     # Never emits a broken "I'll …?" or a double period.
     for s in ("Play The Matrix in Jellyfin?", "Delete the file.", "Restart now!"):
         out = cp(s)
         assert "I'll Play" not in out and ".." not in out and "?." not in out
+
+
+def test_keyboard_confirm_never_speaks_raw_tool_call():
+    # Tier-3 keyboard confirm with a raw, multi-line tool-call summary → spoken heads-up
+    # must NOT contain the raw payload; kdialog (stubbed) carries the detail.
+    raw = ("memory_write (content=Voice Agent Feature Requests:\n1. Close current browser tab.\n"
+           "2. Capture screenshot.)")
+    client = FakeBrainClient(
+        respond_events=[BrainEvent("confirm", id="k9", tier=3, method="keyboard", summary=raw)],
+        confirm_events=[BrainEvent("token", text="Saved it."), BrainEvent("done")],
+    )
+    svc, pushed = _service_with_recorder(client)
+
+    async def _fake_kbd(summary, reason=None):
+        return True
+
+    svc._keyboard_confirm = _fake_kbd
+    asyncio.run(svc._process_context(_ctx("save those to memory")))
+    spoken = " ".join(_texts(pushed))
+    assert "memory_write" not in spoken and "content=" not in spoken and "\n" not in spoken
+    # Heads-up points at the on-screen dialog (it's a mouse prompt) — never says "keyboard".
+    assert ("screen" in spoken.lower() or "prompt" in spoken.lower())
+    assert "keyboard" not in spoken.lower()
+    assert "Saved it." in spoken
+
+
+def test_shutdown_phrase_ends_pipeline_cleanly():
+    from pipecat.frames.frames import EndTaskFrame
+
+    client = FakeBrainClient(respond_events=[BrainEvent("token", text="Hi!"), BrainEvent("done")])
+    svc, pushed = _service_with_recorder(client)
+    asyncio.run(svc._process_context(_ctx("okay, please shut down voice mode now")))
+    assert client.respond_calls == []                          # never reaches the brain
+    assert any(isinstance(f, EndTaskFrame) for f in pushed)    # graceful end requested
+    assert "goodbye" in " ".join(_texts(pushed)).lower()
+
+
+def test_bare_shutdown_passes_through_to_brain():
+    # "shut down the computer" is system control (brain's job) — must NOT exit voice mode.
+    client = FakeBrainClient(respond_events=[BrainEvent("token", text="Okay."), BrainEvent("done")])
+    svc, pushed = _service_with_recorder(client)
+    from pipecat.frames.frames import EndTaskFrame
+    asyncio.run(svc._process_context(_ctx("shut down the computer")))
+    assert client.respond_calls == [("sess-test", "shut down the computer")]
+    assert not any(isinstance(f, EndTaskFrame) for f in pushed)
 
 
 def test_confirm_prompt_is_complete_spoken_verbatim():
