@@ -48,6 +48,16 @@ _SHUTDOWN_PHRASES = (
     "end voice mode", "turn yourself off", "stop the voice agent",
 )
 
+# If the user is ASKING ABOUT a control rather than issuing it ("what's the command to make you
+# stop listening?", "do you know how to turn yourself off?"), don't fire the gate — let it reach
+# the brain so Aria can explain. Only guards the destructive gates (shutdown/sleep); wake stays
+# permissive since a false wake is harmless.
+_META_COMMAND_MARKERS = (
+    "what's the command", "what is the command", "whats the command",
+    "the command to", "the command for", "which command", "what command",
+    "do you know how", "how do i", "how do you", "how can i", "how would i",
+)
+
 
 def _tlog(message: str) -> None:
     """Write one line to the transcript log (loguru sink filtered on extra['transcript'])."""
@@ -111,12 +121,14 @@ class BrainLLMService(LLMService):
         self._last_status: str | None = None  # suppress repeated identical status spam
         self._suppress_next_status = False  # skip the transitional fallback status after an error
         low = user_text.strip().lower()
+        # A question *about* the controls, not a command — don't fire the destructive gates.
+        is_meta = any(m in low for m in _META_COMMAND_MARKERS)
         try:
             # --- shutdown: a clean voice exit of the whole agent. Works in any state
             # (even asleep). Speak a goodbye, then request graceful pipeline closure by
             # pushing EndTaskFrame UPSTREAM — the task flushes queued frames (so the
             # goodbye is spoken) then ends; main.py's finally tears the brain down.
-            if any(p in low for p in _SHUTDOWN_PHRASES):
+            if not is_meta and any(p in low for p in _SHUTDOWN_PHRASES):
                 _tlog(f"SHUTDOWN| {user_text!r}")
                 await self._speak("Shutting down voice mode. Goodbye.")
                 await self.push_frame(EndTaskFrame(), FrameDirection.UPSTREAM)
@@ -132,7 +144,7 @@ class BrainLLMService(LLMService):
                 else:
                     _tlog(f"ASLEEP| ignoring: {user_text!r}")
                 return
-            if any(p in low for p in _SLEEP_PHRASES):
+            if not is_meta and any(p in low for p in _SLEEP_PHRASES):
                 self._sleeping = True
                 _tlog(f"SLEEP | {user_text!r}")
                 await self._speak("Going to sleep. Say 'wake up' when you need me.")

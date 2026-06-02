@@ -156,6 +156,28 @@ def test_shutdown_phrase_ends_pipeline_cleanly():
     assert "goodbye" in " ".join(_texts(pushed)).lower()
 
 
+def test_meta_question_about_shutdown_does_not_exit():
+    # "Do you know how to turn yourself off yet?" is a QUESTION about the control — must not exit;
+    # it should reach the brain so Aria can explain (regression from live session 3ba40222…).
+    from pipecat.frames.frames import EndTaskFrame
+    client = FakeBrainClient(respond_events=[BrainEvent("token", text="Just say 'shut down voice mode'."),
+                                             BrainEvent("done")])
+    svc, pushed = _service_with_recorder(client)
+    asyncio.run(svc._process_context(_ctx("Do you know how to turn yourself off yet?")))
+    assert not any(isinstance(f, EndTaskFrame) for f in pushed)
+    assert client.respond_calls == [("sess-test", "Do you know how to turn yourself off yet?")]
+
+
+def test_meta_question_about_sleep_does_not_sleep():
+    # "What's the command to make you stop listening?" must not put it to sleep (live regression).
+    client = FakeBrainClient(respond_events=[BrainEvent("token", text="Say 'go to sleep'."),
+                                             BrainEvent("done")])
+    svc, pushed = _service_with_recorder(client)
+    asyncio.run(svc._process_context(_ctx("What's the command to make you stop listening to me?")))
+    assert svc._sleeping is False
+    assert client.respond_calls and "stop listening" in client.respond_calls[0][1].lower()
+
+
 def test_bare_shutdown_passes_through_to_brain():
     # "shut down the computer" is system control (brain's job) — must NOT exit voice mode.
     client = FakeBrainClient(respond_events=[BrainEvent("token", text="Okay."), BrainEvent("done")])
