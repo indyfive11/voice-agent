@@ -33,13 +33,17 @@ CHUNK = 1280  # samples @16k = 80ms (openWakeWord's preferred frame)
 
 
 def main() -> None:
-    pkg = os.path.dirname(openwakeword.__file__)
-    model_path = os.path.join(pkg, "resources", "models", f"{MODEL}_v0.1.onnx")
+    # MODEL is either a path to a custom .onnx (e.g. wakewords/aria.onnx) or a bundled name.
+    if MODEL.endswith(".onnx") and os.path.exists(os.path.expanduser(MODEL)):
+        model_path = os.path.expanduser(MODEL)
+    else:
+        pkg = os.path.dirname(openwakeword.__file__)
+        model_path = os.path.join(pkg, "resources", "models", f"{MODEL}_v0.1.onnx")
     if not os.path.exists(model_path):
-        sys.exit(f"no pretrained model {MODEL!r} at {model_path}")
+        sys.exit(f"no model at {model_path!r} (give a bundled name like hey_jarvis or a path to a .onnx)")
     oww = Model(wakeword_model_paths=[model_path], vad_threshold=0.0)  # probe raw scores
     key = next(iter(oww.models.keys()))
-    print(f"model: {key}  threshold={THRESHOLD}  source={SOURCE}  (say '{MODEL.replace('_', ' ')}')")
+    print(f"model: {key}  threshold={THRESHOLD}  source={SOURCE}  (say the wake word)")
 
     cmd = [
         "parec", f"--device={SOURCE}", f"--rate={RATE}",
