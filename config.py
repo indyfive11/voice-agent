@@ -412,6 +412,106 @@ def build_media_duck(llm):
     )
 
 
+# --------------------------------------------------------------------------- wake word
+def _wake_model_paths(names: str) -> list[str]:
+    """Resolve comma-separated WAKE_WORD entries to ONNX paths.
+
+    Each entry is either a path to a custom .onnx model (e.g. a trained "Aria" — used as-is) or a
+    bundled openWakeWord pretrained name (hey_jarvis, alexa, …) resolved under the package's
+    resources/models. Unknown entries are skipped with a warning.
+    """
+    import openwakeword
+
+    res = os.path.join(os.path.dirname(openwakeword.__file__), "resources", "models")
+    paths = []
+    for n in (x.strip() for x in names.split(",") if x.strip()):
+        if n.endswith(".onnx") and os.path.exists(os.path.expanduser(n)):
+            paths.append(os.path.expanduser(n))  # custom model path (e.g. trained "Aria")
+            continue
+        p = os.path.join(res, f"{n}_v0.1.onnx")
+        if os.path.exists(p):
+            paths.append(p)
+        else:
+            logger.warning(f"Wake word: {n!r} is neither a custom .onnx path nor a bundled model; skipping.")
+    return paths
+
+
+def _media_playing_check(llm):
+    """Async, 1s-cached 'is media playing?' for the wake gate. Fails OPEN (False → open-mic) on any
+    uncertainty so a brain hiccup never locks the user out behind the wake word."""
+    client = llm.brain_client
+    state = {"v": None, "t": 0.0}
+
+    async def is_playing() -> bool:
+        import time as _t
+
+        now = _t.monotonic()
+        if state["v"] is not None and now - state["t"] < 1.0:
+            return state["v"]
+        ms = getattr(client, "media_state", None)
+        if ms is None:
+            return False
+        try:
+            st = await ms(llm.session_id)
+        except Exception:  # noqa: BLE001
+            return False  # don't cache transient errors
+        if not st:
+            v = False
+        elif "playing" in st:
+            v = bool(st["playing"])
+        else:
+            v = any(str(x).lower() == "playing" for x in st.values())
+        state["v"], state["t"] = v, now
+        return v
+
+    return is_playing
+
+
+def build_wake_word_gate(llm):
+    """Wake-word gate (opt-in via WAKE_WORD), or None. See wake_word.WakeWordGate.
+
+    Inserted right after the InputResampler (16 kHz). While media plays it requires a wake word before
+    commands reach STT (media_only, default on) — sidestepping STT-over-music — and pre-ducks on wake.
+    """
+    names = _env("WAKE_WORD", "")
+    if not names:
+        return None  # not configured → open-mic as before
+    paths = _wake_model_paths(names)
+    if not paths:
+        logger.warning("Wake word: no valid models resolved; gate disabled.")
+        return None
+
+    from openwakeword.model import Model
+
+    from wake_word import WakeWordGate
+    from brains.brain_llm_service import BrainLLMService
+
+    threshold = float(_env("WAKE_WORD_THRESHOLD", "0.5"))
+    vad_threshold = float(_env("WAKE_WORD_VAD_THRESHOLD", "0.5"))
+    window_secs = float(_env("WAKE_WINDOW_SECS", "15"))
+    media_only = _env("WAKE_WORD_MEDIA_ONLY", "1") not in ("0", "false", "False")
+    oww = Model(wakeword_model_paths=paths, vad_threshold=vad_threshold)
+
+    brain_client = session_id = is_playing = None
+    if isinstance(llm, BrainLLMService):
+        brain_client = llm.brain_client
+        session_id = llm.session_id
+        is_playing = _media_playing_check(llm)
+    logger.info(
+        f"Wake word: gate ON models={list(oww.models.keys())} threshold={threshold} "
+        f"media_only={media_only and is_playing is not None} window={window_secs}s"
+    )
+    return WakeWordGate(
+        oww,
+        threshold=threshold,
+        window_secs=window_secs,
+        brain_client=brain_client,
+        session_id=session_id or "",
+        is_media_playing=is_playing,
+        media_only=media_only,
+    )
+
+
 # --------------------------------------------------------------------------- brain lifecycle
 async def start_brain(llm) -> None:
     """If `llm` wraps an external brain that needs starting (spawn + health), do it.

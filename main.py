@@ -224,10 +224,15 @@ async def run() -> None:
     # frames (the user aggregator consumes them). No-op / absent for a raw-LLM brain.
     media_duck = config.build_media_duck(llm)
 
+    # Wake-word gate (opt-in via WAKE_WORD) sits before STT — while media plays it requires the wake
+    # word before audio reaches STT (sidesteps STT-over-music) and pre-ducks on wake. None when unset.
+    wake_gate = config.build_wake_word_gate(llm)
+
     pipeline = Pipeline(
         [
             transport.input(),     # mic (PipeWire → PyAudio)
             config.build_input_resampler(),  # normalize capture → 16 kHz (AEC source is 48 kHz-only)
+            *([wake_gate] if wake_gate else []),  # wake-word gate (opt-in; mutes until wake while media plays)
             stt,                   # Whisper (local)
             *([media_duck] if media_duck else []),  # duck media on confirmed speech (gabagent brain)
             user_aggregator,       # VAD + SmartTurn v3 + user-side context

@@ -12,6 +12,7 @@ dependencies = [
     "python-dotenv",
     "loguru",
     "websockets>=16.0",
+    "openwakeword>=0.4.0",
 ]
 
 [project.optional-dependencies]

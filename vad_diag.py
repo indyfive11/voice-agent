@@ -39,12 +39,14 @@ class LoggingSileroVADAnalyzer(SileroVADAnalyzer):
     # Capture the per-frame values the base computes (these run in the analyzer's executor thread;
     # the await in analyze_audio is a happens-before barrier before we read them).
     def voice_confidence(self, audio: bytes) -> float:
-        self._dbg_conf = super().voice_confidence(audio)
-        return self._dbg_conf
+        c = super().voice_confidence(audio)
+        self._dbg_conf = float(c)  # Silero may return a 0-dim ndarray; coerce for the f-string/compare
+        return c
 
     def _get_smoothed_volume(self, audio: bytes) -> float:
-        self._dbg_vol = super()._get_smoothed_volume(audio)
-        return self._dbg_vol
+        v = super()._get_smoothed_volume(audio)
+        self._dbg_vol = float(v)
+        return v
 
     async def analyze_audio(self, buffer: bytes):
         state = await super().analyze_audio(buffer)
