@@ -127,7 +127,7 @@ class HttpBrainClient:
         try:
             await self._http.post("/cancel", json={"session_id": session_id})
         except Exception as e:  # noqa: BLE001
-            logger.debug(f"Brain: /cancel failed (already done?): {e}")
+            logger.debug(f"Brain: /cancel failed (already done?): {type(e).__name__}: {e}")
 
     async def duck(self, session_id: str, on: bool) -> None:
         """Duck/pause (on=True) or restore (on=False) the brain's active media. Best-effort:
@@ -138,7 +138,7 @@ class HttpBrainClient:
                 timeout=httpx.Timeout(5.0),
             )
         except Exception as e:  # noqa: BLE001
-            logger.debug(f"Brain: /media/duck failed (ignored): {e}")
+            logger.debug(f"Brain: /media/duck failed (ignored): {type(e).__name__}: {e}")
 
     async def media_state(self, session_id: str) -> dict | None:
         """Best-effort `GET /media/state` → provider-neutral `{"playing": bool, "state":
@@ -150,8 +150,8 @@ class HttpBrainClient:
             )
             if r.status_code == 200:
                 return r.json()
-        except Exception as e:  # noqa: BLE001
-            logger.debug(f"Brain: /media/state unavailable (ignored): {e}")
+        except Exception as e:  # noqa: BLE001 - type matters: an empty-str httpx timeout vs a real error
+            logger.debug(f"Brain: /media/state unavailable (ignored): {type(e).__name__}: {e}")
         return None
 
     async def aclose(self) -> None:

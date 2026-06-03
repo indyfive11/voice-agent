@@ -28,6 +28,7 @@ from pipecat.frames.frames import (
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
     LLMTextFrame,
+    TTSSpeakFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.llm_service import LLMService
@@ -140,11 +141,26 @@ class BrainLLMService(LLMService):
         else:
             await self.push_frame(frame, direction)
 
-    async def _speak(self, text: str) -> None:
-        """Push text to TTS and record it for the transcript log."""
+    async def _speak(self, text: str, *, immediate: bool = False) -> None:
+        """Push text to TTS and record it for the transcript log.
+
+        immediate=True pushes a TTSSpeakFrame (synthesized at once as a standalone utterance) instead of
+        an LLMTextFrame. Use it for short status fillers: the TTS SENTENCE aggregator holds a lone phrase
+        ending in "…" waiting for a following non-whitespace lookahead char that never arrives until the
+        (often slow) result text — so a plain-LLMTextFrame filler stays silent for ~20s then speaks
+        bundled with the result. TTSSpeakFrame bypasses that buffer so "Trying tidal…" is heard now.
+        """
         if text:
             self._reply_buf.append(text)
-            await self.push_frame(LLMTextFrame(text))
+            await self.push_frame(TTSSpeakFrame(text) if immediate else LLMTextFrame(text))
+
+    async def _hold_wake(self, hold: bool) -> None:
+        """Tell the wake gate (upstream, if present) to hold its command window open while a confirm is
+        pending — so the user's yes/no answer needs no fresh wake — and release it after. No-op when
+        there's no gate (the frame just flows to the transport)."""
+        from wake_word import WakeHoldFrame
+
+        await self.push_frame(WakeHoldFrame(hold=hold), FrameDirection.UPSTREAM)
 
     async def _process_context(self, context):
         user_text = self._latest_user_text(context)
@@ -199,6 +215,7 @@ class BrainLLMService(LLMService):
             if self._pending_confirm is not None:
                 pending = self._pending_confirm
                 self._pending_confirm = None
+                await self._hold_wake(False)  # confirm answered → release the wake-gate hold
                 approved = self._parse_yes_no(user_text)
                 _tlog(f"USER  | {user_text!r}  (confirm decision: approved={approved})")
                 stream = self._client.confirm(self._session_id, pending["id"], approved)
@@ -231,8 +248,10 @@ class BrainLLMService(LLMService):
                         _tlog(f"STATUS| (post-error fallback suppressed) {ev.text!r}")
                     elif ev.text and ev.text != self._last_status:
                         self._last_status = ev.text
+                        # Log-only: the user found the spoken filler ("Trying Jellyfin…") annoying, especially
+                        # on fast turns. We keep it in the transcript but never voice it; Aria stays quiet
+                        # during a tool call rather than narrating each step.
                         _tlog(f"STATUS| {ev.text!r}")
-                        await self._speak(ev.text)
                     elif ev.text:
                         _tlog(f"STATUS| (dupe suppressed) {ev.text!r}")
                 elif ev.type == "confirm":
@@ -259,6 +278,7 @@ class BrainLLMService(LLMService):
                         return
                     # spoken_yesno (Tier 2): two-turn — speak prompt, remember, end the turn.
                     self._pending_confirm = {"id": ev.id, "method": method}
+                    await self._hold_wake(True)  # hold the wake gate open for the yes/no answer
                     if ev.prompt_is_complete:
                         # summary is the ENTIRE spoken line (carries its own yes/no choice):
                         # speak verbatim, append nothing.

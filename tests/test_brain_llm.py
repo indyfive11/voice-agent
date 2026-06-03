@@ -45,6 +45,23 @@ def test_tokens_become_text_frames():
     assert client.respond_calls == [("sess-test", "hello")]
 
 
+def test_status_filler_logged_but_not_spoken():
+    # the user disliked the spoken filler ("Trying tidal…"). Status events are now LOG-ONLY: no TTSSpeakFrame
+    # and no LLMTextFrame for the status; only the token speaks.
+    from pipecat.frames.frames import TTSSpeakFrame
+
+    client = FakeBrainClient(respond_events=[
+        BrainEvent("status", text="Trying tidal…"),
+        BrainEvent("token", text="Done."),
+        BrainEvent("done"),
+    ])
+    svc, pushed = _service_with_recorder(client)
+    asyncio.run(svc._process_context(_ctx("play music")))
+
+    assert not any(isinstance(f, TTSSpeakFrame) for f in pushed)  # filler never voiced
+    assert _texts(pushed) == ["Done."]                           # only the token speaks
+
+
 def test_turn_based_confirmation_flow():
     client = FakeBrainClient(
         respond_events=[
@@ -68,6 +85,28 @@ def test_turn_based_confirmation_flow():
     assert client.confirm_calls == [("sess-test", "c1", True, None)]
     assert _texts(pushed) == ["Done."]
     assert svc._pending_confirm is None
+
+
+def test_confirm_pushes_wake_hold_then_release():
+    # A Tier-2 spoken confirm must push WakeHoldFrame(True) so the gate holds its window open for the
+    # yes/no answer, then WakeHoldFrame(False) once the answer resolves.
+    from wake_word import WakeHoldFrame
+
+    client = FakeBrainClient(
+        respond_events=[BrainEvent("confirm", id="c9", tier=2, method="spoken_yesno",
+                                   summary="do the thing")],
+        confirm_events=[BrainEvent("token", text="Done."), BrainEvent("done")],
+    )
+    svc, pushed = _service_with_recorder(client)
+
+    asyncio.run(svc._process_context(_ctx("do it")))          # turn 1 → hold ON
+    holds = [f.hold for f in pushed if isinstance(f, WakeHoldFrame)]
+    assert holds == [True]
+
+    pushed.clear()
+    asyncio.run(svc._process_context(_ctx("yes")))            # turn 2 → hold OFF
+    holds = [f.hold for f in pushed if isinstance(f, WakeHoldFrame)]
+    assert holds == [False]
 
 
 def test_confirmation_declined():
@@ -272,6 +311,19 @@ from pipecat.frames.frames import (  # noqa: E402
 def _duck(client, **kw):
     kw.setdefault("min_words", 2)
     kw.setdefault("restore_grace", 8.0)
+    # The shared provider fails OPEN (unset/empty media_state → NOT playing → skip duck). Duck-*timing*
+    # tests don't care about media state, so default it to "playing" here; gating tests set it explicitly.
+    if getattr(client, "media_state_value", None) is None:
+        client.media_state_value = {"playing": True, "state": "playing"}
+    if "media_status" not in kw:
+        # Wire the REAL shared media-state provider (the same one the wake gate uses) reading this
+        # client — so the duck tests exercise the actual divergence-free path, not a stub.
+        import types
+
+        from config import build_media_state_provider
+        kw["media_status"] = build_media_state_provider(
+            types.SimpleNamespace(brain_client=client, session_id="sess-test")
+        )
     return MediaDuckController(client, "sess-test", **kw)
 
 
@@ -459,7 +511,7 @@ def test_media_state_debounced_across_rapid_onsets():
     assert client.media_state_calls == 1     # but only one /media/state query (debounced + coalesced)
 
 
-def test_repeated_status_spoken_once():
+def test_status_never_spoken_only_token():
     client = FakeBrainClient(respond_events=[
         BrainEvent("status", text="Looking into it."),
         BrainEvent("status", text="Looking into it."),
@@ -469,7 +521,10 @@ def test_repeated_status_spoken_once():
     ])
     svc, pushed = _service_with_recorder(client)
     asyncio.run(svc._process_context(_ctx("what was the error")))
-    assert _texts(pushed) == ["Looking into it.", "Found it."]  # status spoken once, not ×3
+    from pipecat.frames.frames import TTSSpeakFrame
+    # status is log-only now — no status is ever voiced (TTSSpeakFrame or text); only the token speaks.
+    assert not any(isinstance(f, TTSSpeakFrame) for f in pushed)
+    assert _texts(pushed) == ["Found it."]
 
 
 def test_sleep_wake_gates_input():

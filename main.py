@@ -238,9 +238,27 @@ async def run() -> None:
     # word before audio reaches STT (sidesteps STT-over-music) and pre-ducks on wake. None when unset.
     wake_gate = config.build_wake_word_gate(llm)
 
+    # Input-stall watchdog: best-effort recovery for a frozen/silent mic capture. The restart "kicks"
+    # the PortAudio stream in place (stop→start) — the least-invasive revive that doesn't tear down the
+    # base-input task machinery. Goes FIRST so it times the rawest mic frames.
+    async def _restart_capture(_start_frame):
+        inp = transport.input()
+        stream = getattr(inp, "_in_stream", None)
+        if stream is None:
+            return False
+        stream.stop_stream()
+        stream.start_stream()
+        return True
+
+    input_watchdog = config.build_input_watchdog(
+        restart=_restart_capture,
+        gate_state=(wake_gate.hb_state if wake_gate else None),  # heartbeat shows gate state too
+    )
+
     pipeline = Pipeline(
         [
             transport.input(),     # mic (PipeWire → PyAudio)
+            *([input_watchdog] if input_watchdog else []),  # stall watchdog (times raw mic frames)
             config.build_input_resampler(),  # normalize capture → 16 kHz (AEC source is 48 kHz-only)
             *([wake_gate] if wake_gate else []),  # wake-word gate (opt-in; mutes until wake while media plays)
             stt,                   # Whisper (local)

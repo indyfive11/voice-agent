@@ -28,7 +28,6 @@ Design (the 2026-06-02 low-latency revision — supersedes the duck-on-confirmed
 from __future__ import annotations
 
 import asyncio
-import time
 from typing import Callable
 
 from loguru import logger
@@ -62,6 +61,7 @@ class MediaDuckController(FrameProcessor):
         restore_grace: float = 8.0,
         confirm_grace: float = 2.5,
         should_duck: Callable[[], bool] | None = None,
+        media_status: Callable[[], "dict|None"] | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -80,14 +80,12 @@ class MediaDuckController(FrameProcessor):
         self._confirmed = False  # got ≥min_words this duck episode (so it's not a false onset)
         self._restore_task: asyncio.Task | None = None
         self._confirm_task: asyncio.Task | None = None
-        # Short-TTL cache for the media-state gate. Onset-triggering can fire many duck attempts per
-        # spoken sentence (each VAD segment), and each would otherwise hit `GET /media/state`. Cache
-        # the answer for `_media_state_ttl`s so a talkative paused-media stretch doesn't spam the
-        # brain; ≤TTL staleness only delays a duck by that much when media (re)starts.
-        self._media_state_ttl = 1.0
-        self._media_state_cache: bool | None = None
-        self._media_state_at = 0.0
-        self._media_state_inflight: asyncio.Future | None = None
+        # Media-state — the SHARED provider (config.build_media_state_provider), the SAME callable the
+        # wake gate uses, so the gate and the duck can never disagree (they used to keep separate caches
+        # with opposite fail-modes). Returns {"playing": bool, "kind": …}; the duck only needs `playing`.
+        # It owns the 1s cache + coalescing. Default → always-duck if unwired (the brain's duck is a
+        # harmless no-op when nothing plays).
+        self._media_status = media_status or (lambda: {"playing": True})
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
@@ -157,46 +155,17 @@ class MediaDuckController(FrameProcessor):
                 await self._client.duck(self._session_id, on)
                 _tlog(f"DUCK  | /media/duck on={on} sent")
             except Exception as e:  # noqa: BLE001 - media control must never break audio
-                _tlog(f"DUCK  | /media/duck on={on} FAILED: {e}")
+                _tlog(f"DUCK  | /media/duck on={on} FAILED: {type(e).__name__}: {e}")
 
         asyncio.create_task(_go())
 
     async def _media_playing(self) -> bool:
-        """Best-effort: True unless the brain reports nothing is playing. Unknown/old brain → True
-        (the brain's own duck is a harmless no-op when there's no media). Debounced by a short TTL so
-        rapid onsets during a talkative stretch don't spam `GET /media/state`."""
-        now = time.monotonic()
-        if self._media_state_cache is not None and (now - self._media_state_at) < self._media_state_ttl:
-            return self._media_state_cache
-        # Coalesce concurrent queries (onset-fired duck attempts overlap) onto one in-flight call.
-        if self._media_state_inflight is not None:
-            return await self._media_state_inflight
-        fut: asyncio.Future = asyncio.get_event_loop().create_future()
-        self._media_state_inflight = fut
-        try:
-            result = await self._query_media_playing()
-            self._media_state_cache = result
-            self._media_state_at = time.monotonic()
-            fut.set_result(result)
-            return result
-        finally:
-            self._media_state_inflight = None
-
-    async def _query_media_playing(self) -> bool:
-        media_state = getattr(self._client, "media_state", None)
-        if media_state is None:
-            return True
-        try:
-            st = await media_state(self._session_id)
-        except Exception:  # noqa: BLE001
-            return True
-        if not st:
-            return True
-        # Neutral shape: {"playing": bool, "state": "playing|paused|idle"}. Fall back to a value scan
-        # for an older brain that might still return per-provider keys.
-        if "playing" in st:
-            return bool(st["playing"])
-        return any(str(v).lower() == "playing" for v in st.values())
+        """Delegate to the SHARED media-state provider (same callable the wake gate uses → no divergence).
+        Accepts a sync OR async callable returning {"playing": …}; the provider owns the cache/fail-mode."""
+        st = self._media_status()
+        if asyncio.iscoroutine(st) or asyncio.isfuture(st):
+            st = await st
+        return bool(st and st.get("playing"))
 
     # --- restore timer -----------------------------------------------------
     def _arm_restore(self) -> None:

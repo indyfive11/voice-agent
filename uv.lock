@@ -1577,6 +1577,15 @@ wheels = [
 ]
 
 [[package]]
+name = "speexdsp-ns"
+version = "0.1.2"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a0/7e/1b7f7f021736c671b18d69f6f561d5556fd3a5369c94d9c458b4a8fb2e13/speexdsp_ns-0.1.2-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:09cf0a8f9530fca1f203f53808b074d247b9083df323199bd9d150f70af08338", size = 158227, upload-time = "2023-08-07T20:34:52.144Z" },
+    { url = "https://files.pythonhosted.org/packages/7b/14/d9fd843472f82853643c4ae09835c76bfb19ce7e712586cfc1318030503f/speexdsp_ns-0.1.2-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:c2c73c2f132212fecfff52a689594f925453ff521fec336411149256aedcd819", size = 161569, upload-time = "2023-08-07T20:34:59.781Z" },
+]
+
+[[package]]
 name = "sympy"
 version = "1.14.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1776,6 +1785,7 @@ dependencies = [
     { name = "openwakeword" },
     { name = "pipecat-ai", extra = ["anthropic", "kokoro", "local", "local-smart-turn", "whisper"] },
     { name = "python-dotenv" },
+    { name = "speexdsp-ns" },
     { name = "websockets" },
 ]
 
@@ -1797,6 +1807,7 @@ requires-dist = [
     { name = "pipecat-ai", extras = ["anthropic", "silero", "whisper", "local", "kokoro", "local-smart-turn"], specifier = "==1.3.0" },
     { name = "pipecat-ai", extras = ["openai"], marker = "extra == 'swap'", specifier = "==1.3.0" },
     { name = "python-dotenv" },
+    { name = "speexdsp-ns", specifier = ">=0.1.2" },
     { name = "websockets", specifier = ">=16.0" },
 ]
 provides-extras = ["swap"]

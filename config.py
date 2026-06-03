@@ -364,6 +364,29 @@ def build_input_resampler():
     return InputResampler(target_rate=PIPELINE_AUDIO_RATE)
 
 
+def build_input_watchdog(restart=None, gate_state=None):
+    """Input-stall watchdog (goes first, right after transport.input()), or None if disabled.
+
+    Detects a mic-capture freeze — both 'no frames' and 'frames but silent' (the 2026-06-03 echo-cancel
+    stall) — logs it loudly, and calls `restart` (best-effort capture kick) instead of hanging silently.
+    Also emits a periodic heartbeat (with optional `gate_state`) so freeze vs lockout is one glance.
+    Default ON; set `INPUT_STALL_SECS=0` to disable. See input_watchdog.InputStallDetector.
+    """
+    stall_secs = float(_env("INPUT_STALL_SECS", "5.0"))
+    if stall_secs <= 0:
+        return None
+    silent_secs = float(_env("INPUT_SILENT_SECS", "8.0"))
+    heartbeat_secs = float(_env("INPUT_HEARTBEAT_SECS", "10.0"))
+    from input_watchdog import InputStallDetector
+
+    logger.info(f"Input watchdog: ON (stall={stall_secs}s, silent={silent_secs}s, "
+                f"heartbeat={heartbeat_secs}s, recover={'yes' if restart else 'log-only'})")
+    return InputStallDetector(
+        stall_secs=stall_secs, silent_secs=silent_secs, restart=restart,
+        heartbeat_secs=heartbeat_secs, gate_state=gate_state,
+    )
+
+
 def build_vad_analyzer(*, sample_rate, params):
     """Silero VAD analyzer, optionally wrapped with the near-miss diagnostic (VAD_DEBUG=1).
 
@@ -409,6 +432,7 @@ def build_media_duck(llm):
         restore_grace=restore_grace,
         confirm_grace=confirm_grace,
         should_duck=lambda: not llm.is_sleeping,
+        media_status=build_media_state_provider(llm),  # SHARED with the wake gate (no divergence)
     )
 
 
@@ -436,35 +460,61 @@ def _wake_model_paths(names: str) -> list[str]:
     return paths
 
 
-def _media_playing_check(llm):
-    """Async, 1s-cached 'is media playing?' for the wake gate. Fails OPEN (False → open-mic) on any
-    uncertainty so a brain hiccup never locks the user out behind the wake word."""
-    client = llm.brain_client
-    state = {"v": None, "t": 0.0}
+def build_media_state_provider(llm):
+    """ONE shared async media-state reader for BOTH the wake gate and the media duck.
 
-    async def is_playing() -> bool:
+    Returns an async callable → `{"playing": bool, "kind": "audio"|"video"|None}` (the brain's neutral
+    `/media/state` shape, with a value-scan fallback for an older brain).
+
+    Why shared: the gate and duck used to each keep a *separate* 1s cache with *opposite* fail-modes
+    (gate fail-open, duck fail-closed), so on a transient or cache-skew they disagreed live (gate gated
+    while the duck logged "nothing playing"). One cache + one fail-mode means they can never diverge.
+
+    Fails OPEN (`playing=False`) on any uncertainty: a transient must never lock the user out behind the
+    wake word; a missed duck on a transient is benign. 1s TTL cache + in-flight coalescing so a talkative
+    stretch can't spam `GET /media/state`. The duck reads `playing`; the gate also reads `kind` (so it can
+    skip gating active *video* the user is watching).
+    """
+    import asyncio
+
+    client = getattr(llm, "brain_client", None)
+    session_id = getattr(llm, "session_id", "")
+    debug = _env("WAKE_WORD_DEBUG", "0") not in ("0", "false", "False")
+    state = {"v": None, "t": 0.0, "fut": None}
+
+    async def media_status() -> dict:
         import time as _t
 
         now = _t.monotonic()
         if state["v"] is not None and now - state["t"] < 1.0:
             return state["v"]
-        ms = getattr(client, "media_state", None)
+        if state["fut"] is not None:  # coalesce concurrent queries onto one in-flight call
+            return await state["fut"]
+        ms = getattr(client, "media_state", None) if client is not None else None
         if ms is None:
-            return False
+            return {"playing": False, "kind": None}
+        fut = asyncio.get_event_loop().create_future()
+        state["fut"] = fut
         try:
-            st = await ms(llm.session_id)
-        except Exception:  # noqa: BLE001
-            return False  # don't cache transient errors
-        if not st:
-            v = False
-        elif "playing" in st:
-            v = bool(st["playing"])
-        else:
-            v = any(str(x).lower() == "playing" for x in st.values())
-        state["v"], state["t"] = v, now
-        return v
+            v = {"playing": False, "kind": None}
+            try:
+                st = await ms(session_id)
+                if st:
+                    playing = bool(st["playing"]) if "playing" in st \
+                        else any(str(x).lower() == "playing" for x in st.values())
+                    v = {"playing": playing, "kind": st.get("kind")}
+            except Exception as e:  # noqa: BLE001 - fail open (not playing) + surface the type
+                if debug:
+                    logger.debug(
+                        f"media-state: query failed (fail-open=not-playing): {type(e).__name__}: {e}"
+                    )
+            state["v"], state["t"] = v, _t.monotonic()
+            fut.set_result(v)
+            return v
+        finally:
+            state["fut"] = None
 
-    return is_playing
+    return media_status
 
 
 def build_wake_word_gate(llm):
@@ -490,16 +540,37 @@ def build_wake_word_gate(llm):
     vad_threshold = float(_env("WAKE_WORD_VAD_THRESHOLD", "0.5"))
     window_secs = float(_env("WAKE_WINDOW_SECS", "15"))
     media_only = _env("WAKE_WORD_MEDIA_ONLY", "1") not in ("0", "false", "False")
-    oww = Model(wakeword_model_paths=paths, vad_threshold=vad_threshold)
+    debug = _env("WAKE_WORD_DEBUG", "0") not in ("0", "false", "False")
+    debug_floor = float(_env("WAKE_WORD_DEBUG_FLOOR", "0.05"))  # low, to SEE sub-0.2 "Aria" over music
+    escape_floor = float(_env("WAKE_ESCAPE_FLOOR", "0.15"))
+    escape_count = int(_env("WAKE_ESCAPE_COUNT", "3"))  # 0 disables the lockout escape
+    escape_secs = float(_env("WAKE_ESCAPE_SECS", "12"))
+    gate_video = _env("WAKE_GATE_VIDEO", "0") not in ("0", "false", "False")  # default: don't gate video
+    # Speex noise suppression: openWakeWord pre-processes the audio to suppress *stationary* background
+    # (music) before the melspectrogram — its documented lever for hear-over-media false-rejects. Off by
+    # default (A/B it); graceful fallback if the speexdsp-ns wheel is missing/unsupported on this box.
+    speex_ns = _env("WAKE_WORD_SPEEX_NS", "0") not in ("0", "false", "False")
+    try:
+        oww = Model(wakeword_model_paths=paths, vad_threshold=vad_threshold,
+                    enable_speex_noise_suppression=speex_ns)
+    except Exception as e:  # noqa: BLE001 - speexdsp-ns unavailable → run without rather than crash
+        if not speex_ns:
+            raise
+        logger.warning(f"Wake word: Speex NS unavailable ({type(e).__name__}: {e}); running without it.")
+        speex_ns = False
+        oww = Model(wakeword_model_paths=paths, vad_threshold=vad_threshold)
 
-    brain_client = session_id = is_playing = None
+    brain_client = session_id = media_status = None
     if isinstance(llm, BrainLLMService):
         brain_client = llm.brain_client
         session_id = llm.session_id
-        is_playing = _media_playing_check(llm)
+        media_status = build_media_state_provider(llm)  # SHARED with the media duck (no divergence)
     logger.info(
         f"Wake word: gate ON models={list(oww.models.keys())} threshold={threshold} "
-        f"media_only={media_only and is_playing is not None} window={window_secs}s"
+        f"media_only={media_only and media_status is not None} gate_video={gate_video} window={window_secs}s"
+        + (f" escape={escape_count}@{escape_floor}/{escape_secs:.0f}s" if escape_count else " escape=off")
+        + (" speex_ns=on" if speex_ns else "")
+        + (f" debug=on floor={debug_floor}" if debug else "")
     )
     return WakeWordGate(
         oww,
@@ -507,8 +578,14 @@ def build_wake_word_gate(llm):
         window_secs=window_secs,
         brain_client=brain_client,
         session_id=session_id or "",
-        is_media_playing=is_playing,
+        media_status=media_status,
         media_only=media_only,
+        gate_video=gate_video,
+        debug=debug,
+        debug_floor=debug_floor,
+        escape_floor=escape_floor,
+        escape_count=escape_count,
+        escape_secs=escape_secs,
     )
 
 
