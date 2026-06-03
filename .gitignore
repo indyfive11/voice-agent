@@ -25,3 +25,5 @@ vendor/
 models/
 *.onnx
 *.bin
+# ...but DO version our own small, self-trained wake-word models (e.g. hey_aria.onnx).
+!wakewords/*.onnx
