@@ -380,12 +380,17 @@ def build_media_duck(llm):
 
     min_words = int(_env("DUCK_MIN_WORDS", "2"))
     restore_grace = float(_env("DUCK_RESTORE_GRACE", "8.0"))
-    logger.info(f"Media ducking: on confirmed speech (min_words={min_words}, restore_grace={restore_grace}s)")
+    confirm_grace = float(_env("DUCK_CONFIRM_GRACE", "2.5"))
+    logger.info(
+        f"Media ducking: on VAD speech onset (min_words={min_words}, "
+        f"confirm_grace={confirm_grace}s, restore_grace={restore_grace}s)"
+    )
     return MediaDuckController(
         llm.brain_client,
         llm.session_id,
         min_words=min_words,
         restore_grace=restore_grace,
+        confirm_grace=confirm_grace,
         should_duck=lambda: not llm.is_sleeping,
     )
 

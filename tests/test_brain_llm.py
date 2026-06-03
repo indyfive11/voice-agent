@@ -182,6 +182,33 @@ def test_shutdown_close_variant_fires():
     assert any(isinstance(f, EndTaskFrame) for f in pushed)
 
 
+def test_shutdown_survives_stt_voice_mishear():
+    # Live regression (session 99462a1f): Whisper heard "shut down voice mode" as "shut down boys
+    # mode" → missed the gate → brain falsely claimed to shut down while the process kept running.
+    # The soundalike repair canonicalizes "<soundalike> mode/agent" → "voice mode/agent".
+    from pipecat.frames.frames import EndTaskFrame
+
+    for misheard in ("shut down boys mode", "Shut down boyce mode.", "close down voice mode",
+                     "shut down boys agent"):
+        client = FakeBrainClient(respond_events=[BrainEvent("token", text="Hi!"), BrainEvent("done")])
+        svc, pushed = _service_with_recorder(client)
+        asyncio.run(svc._process_context(_ctx(misheard)))
+        assert client.respond_calls == [], f"reached brain for {misheard!r}"
+        assert any(isinstance(f, EndTaskFrame) for f in pushed), f"no shutdown for {misheard!r}"
+
+
+def test_bare_soundalike_does_not_shut_down():
+    # The repair must only fire in the "<soundalike> mode/agent" frame — a bare soundalike elsewhere
+    # ("the boys are loud") must reach the brain, never trigger a false shutdown.
+    from pipecat.frames.frames import EndTaskFrame
+
+    client = FakeBrainClient(respond_events=[BrainEvent("token", text="Sure."), BrainEvent("done")])
+    svc, pushed = _service_with_recorder(client)
+    asyncio.run(svc._process_context(_ctx("the boys are being loud, can you turn it down")))
+    assert client.respond_calls == [("sess-test", "the boys are being loud, can you turn it down")]
+    assert not any(isinstance(f, EndTaskFrame) for f in pushed)
+
+
 def test_meta_question_about_shutdown_does_not_exit():
     # "Do you know how to turn yourself off yet?" is a QUESTION about the control — must not exit;
     # it should reach the brain so Aria can explain (regression from live session 3ba40222…).
@@ -237,6 +264,8 @@ from pipecat.frames.frames import (  # noqa: E402
     BotStoppedSpeakingFrame,
     InterimTranscriptionFrame,
     TranscriptionFrame,
+    VADUserStartedSpeakingFrame,
+    VADUserStoppedSpeakingFrame,
 )
 
 
@@ -341,6 +370,93 @@ def test_media_duck_skipped_while_asleep():
 
     asyncio.run(go())
     assert client.duck_calls == []
+
+
+def _onset():
+    return VADUserStartedSpeakingFrame()
+
+
+def _offset():
+    return VADUserStoppedSpeakingFrame()
+
+
+def test_media_duck_on_vad_onset_immediately():
+    # The latency fix: duck fires on speech *onset*, before any transcription.
+    client = FakeBrainClient()
+    ctl = _duck(client)
+
+    async def go():
+        ctl._handle(_onset())
+        await asyncio.sleep(0)
+
+    asyncio.run(go())
+    assert client.duck_calls == [("sess-test", True)]  # ducked with no transcription yet
+
+
+def test_media_duck_onset_confirmed_then_restores_on_bot():
+    client = FakeBrainClient()
+    ctl = _duck(client)
+
+    async def go():
+        ctl._handle(_onset())                          # duck on (fast)
+        await asyncio.sleep(0)
+        ctl._handle(_offset())                         # arm false-onset confirm timer
+        ctl._handle(_spoken("play the next track"))    # real words → confirmed, cancels confirm timer
+        await asyncio.sleep(0)
+        ctl._handle(BotStartedSpeakingFrame())
+        ctl._handle(BotStoppedSpeakingFrame())         # restore
+        await asyncio.sleep(0)
+
+    asyncio.run(go())
+    assert client.duck_calls == [("sess-test", True), ("sess-test", False)]
+
+
+def test_media_duck_false_onset_restores_after_confirm_grace():
+    # Onset with no qualifying transcription (a cough / stray VAD blip) restores quickly.
+    client = FakeBrainClient()
+    ctl = _duck(client, confirm_grace=0.01)
+
+    async def go():
+        ctl._handle(_onset())                          # duck on
+        await asyncio.sleep(0)
+        ctl._handle(_offset())                         # speech stopped, no words → arm confirm timer
+        await asyncio.sleep(0.05)                      # grace elapses → restore
+
+    asyncio.run(go())
+    assert client.duck_calls == [("sess-test", True), ("sess-test", False)]
+
+
+def test_media_duck_continued_speech_cancels_false_onset_restore():
+    # A pause mid-utterance (offset) then resumed speech (onset) must NOT flap-restore.
+    client = FakeBrainClient()
+    ctl = _duck(client, confirm_grace=0.02)
+
+    async def go():
+        ctl._handle(_onset())
+        await asyncio.sleep(0)
+        ctl._handle(_offset())                         # arm confirm timer
+        ctl._handle(_onset())                          # resumed within grace → cancels it
+        await asyncio.sleep(0.05)                      # would have fired if not cancelled
+
+    asyncio.run(go())
+    assert client.duck_calls == [("sess-test", True)]  # still ducked, no restore
+
+
+def test_media_state_debounced_across_rapid_onsets():
+    # With onset-triggering, a talkative paused-media stretch fires many duck attempts; the media_state
+    # gate must be debounced so it doesn't re-query the brain on each one.
+    client = FakeBrainClient()
+    client.media_state_value = {"playing": False, "state": "idle"}  # nothing playing → all skip
+    ctl = _duck(client)  # default 1.0s TTL
+
+    async def go():
+        for _ in range(6):
+            ctl._handle(_onset())
+        await asyncio.sleep(0.05)  # drain the fire-and-forget duck tasks
+
+    asyncio.run(go())
+    assert client.duck_calls == []           # all skipped (nothing playing)
+    assert client.media_state_calls == 1     # but only one /media/state query (debounced + coalesced)
 
 
 def test_repeated_status_spoken_once():

@@ -103,6 +103,7 @@ class FakeBrainClient:
         self.duck_calls: list[tuple[str, bool]] = []
         # Tests set this to drive media_state(); None → capability absent (callers assume "playing").
         self.media_state_value: dict | None = None
+        self.media_state_calls = 0  # how many times media_state() was queried (debounce tests)
 
     async def respond(self, session_id: str, text: str) -> AsyncIterator[BrainEvent]:
         self.respond_calls.append((session_id, text))
@@ -127,6 +128,7 @@ class FakeBrainClient:
         self.duck_calls.append((session_id, on))
 
     async def media_state(self, session_id: str) -> dict | None:
+        self.media_state_calls += 1
         return self.media_state_value
 
     async def aclose(self) -> None:

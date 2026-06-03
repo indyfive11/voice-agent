@@ -53,6 +53,15 @@ _SHUTDOWN_PHRASES = (
     "close voice agent", "close down the voice agent",
 )
 
+# STT regularly mishears the safety-critical keyword "voice" (live: "shut down voice mode" →
+# "shut down boys mode"), which silently misses the shutdown gate — the brain then can't exit and
+# the agent keeps running. Canonicalize a soundalike → "voice" *only* when it directly precedes
+# "mode"/"agent" (the exact shutdown/exit frame), so a bare soundalike elsewhere ("the boys are
+# loud") can never trigger a false shutdown. Applied to the punctuation-normalized text.
+_VOICE_SOUNDALIKE_RE = re.compile(
+    r"\b(?:boys|boyce|boy s|voys|vois|voce|boise|voiced|boyz)\s+(mode|agent)\b"
+)
+
 # If the user is ASKING ABOUT a control rather than issuing it ("what's the command to make you
 # stop listening?", "do you know how to turn yourself off?"), don't fire the gate — let it reach
 # the brain so Aria can explain. Only guards the destructive gates (shutdown/sleep); wake stays
@@ -141,6 +150,9 @@ class BrainLLMService(LLMService):
         # phrases ("shut down voice mode") — which is exactly how a live shutdown failed. Strip
         # non-word chars to spaces and collapse whitespace, then match the gates against this.
         low_norm = re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", low)).strip()
+        # Repair STT mishears of the keyword "voice" in the "… mode/agent" frame (boys→voice etc.)
+        # so a misheard but unambiguous shutdown phrase still fires the gate.
+        low_norm = _VOICE_SOUNDALIKE_RE.sub(r"voice \1", low_norm)
         # A question *about* the controls, not a command — don't fire the destructive gates.
         is_meta = any(m in low_norm for m in _META_COMMAND_MARKERS)
         try:
