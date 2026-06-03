@@ -38,7 +38,14 @@ from brains.brain_client import BrainClient, BrainEvent
 _YES_WORDS = ("yes", "yeah", "yep", "yup", "confirm", "proceed", "go ahead", "do it", "affirmative", "sure")
 
 # Multi-word phrases only (single words like "sleep"/"wake" cause false hits, e.g. "otters sleep").
-_SLEEP_PHRASES = ("go to sleep", "stop listening", "pause listening", "stop responding")
+# "mute"-style requests map here too — live, the user asked to "mute voice mode" repeatedly and got
+# pointed at *shutdown*; muting/"stop until I call you" IS this sleep gate. Deliberately NOT a bare
+# "mute" — that collides with "mute the music" (a media command); require the voice-mode framing.
+_SLEEP_PHRASES = (
+    "go to sleep", "stop listening", "pause listening", "stop responding",
+    "mute voice mode", "mute yourself", "mute your voice",
+    "unless i call your name", "only respond when i call",
+)
 _WAKE_PHRASES = ("wake up", "i'm back", "are you awake", "you awake", "start listening")
 
 # Clean exit of the whole voice agent. Deliberately specific to *this process* — never bare

@@ -364,6 +364,23 @@ def build_input_resampler():
     return InputResampler(target_rate=PIPELINE_AUDIO_RATE)
 
 
+def build_vad_analyzer(*, sample_rate, params):
+    """Silero VAD analyzer, optionally wrapped with the near-miss diagnostic (VAD_DEBUG=1).
+
+    The diagnostic logs *why* an onset was missed (volume- vs confidence-gated) while tuning the
+    "hear me over the music" knobs — off by default so there's no logging cost in normal runs.
+    """
+    if _env("VAD_DEBUG", "0") not in ("0", "false", "False", ""):
+        from vad_diag import LoggingSileroVADAnalyzer
+
+        logger.info("VAD diagnostic ON (VAD_DEBUG=1): logging near-misses to the transcript log.")
+        return LoggingSileroVADAnalyzer(sample_rate=sample_rate, params=params)
+
+    from pipecat.audio.vad.silero import SileroVADAnalyzer
+
+    return SileroVADAnalyzer(sample_rate=sample_rate, params=params)
+
+
 # --------------------------------------------------------------------------- media ducking
 def build_media_duck(llm):
     """Build the MediaDuckController for an external brain, or None for a raw LLM.

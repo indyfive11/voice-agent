@@ -30,7 +30,6 @@ from loguru import logger
 
 from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
 from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
-from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.frames.frames import LLMRunFrame
 from pipecat.pipeline.pipeline import Pipeline
@@ -171,8 +170,16 @@ async def run() -> None:
     #     the turn; SmartTurn still ends the turn promptly once it judges the user is done.
     vad_stop_secs = float(os.environ.get("VAD_STOP_SECS", "0.2"))
     smart_turn_stop_secs = float(os.environ.get("SMART_TURN_STOP_SECS", "4.0"))
+    # VAD sensitivity (the "hear me over the music" ruler). Silero AND-gates on confidence AND volume
+    # (pipecat vad_analyzer.py: speaking = confidence>=VAD_CONFIDENCE and volume>=VAD_MIN_VOLUME), so a
+    # voice partly masked by playing media can fail *either* gate and never start a turn. We start more
+    # sensitive than pipecat's defaults (0.7/0.6) and pair it with a gentle brain-side ambient duck;
+    # tune live: lower = hears you over louder music but risks false triggers, raise = the reverse.
+    vad_confidence = float(os.environ.get("VAD_CONFIDENCE", "0.6"))
+    vad_min_volume = float(os.environ.get("VAD_MIN_VOLUME", "0.4"))
     logger.info(
-        f"Turn detection: VAD stop_secs={vad_stop_secs}s → SmartTurn v3 "
+        f"Turn detection: VAD stop_secs={vad_stop_secs}s confidence={vad_confidence} "
+        f"min_volume={vad_min_volume} → SmartTurn v3 "
         f"(stop_secs={smart_turn_stop_secs}s max-silence fallback)"
     )
     turn_analyzer = LocalSmartTurnAnalyzerV3(
@@ -197,9 +204,13 @@ async def run() -> None:
         user_params=LLMUserAggregatorParams(
             # Pinned to the pipeline rate: the mic is resampled to PIPELINE_AUDIO_RATE up front
             # (InputResampler), so the VAD must not adopt the device's native capture rate.
-            vad_analyzer=SileroVADAnalyzer(
+            vad_analyzer=config.build_vad_analyzer(
                 sample_rate=config.PIPELINE_AUDIO_RATE,
-                params=VADParams(stop_secs=vad_stop_secs),
+                params=VADParams(
+                    confidence=vad_confidence,
+                    min_volume=vad_min_volume,
+                    stop_secs=vad_stop_secs,
+                ),
             ),
             user_mute_strategies=[AlwaysUserMuteStrategy()] if half_duplex else [],
             user_turn_strategies=UserTurnStrategies(

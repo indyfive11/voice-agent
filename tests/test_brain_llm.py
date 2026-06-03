@@ -501,6 +501,28 @@ def test_sleep_wake_gates_input():
     assert _texts(pushed) == ["Hi!"]
 
 
+def test_mute_phrases_trigger_sleep():
+    # Live regression (session 064099d2): the user said "mute voice mode" 4x and got pointed at SHUTDOWN.
+    # Muting / "stop until I call you" IS the sleep gate — these phrasings must put it to sleep.
+    for phrase in ("Aria, mute voice mode unless I call your name.",
+                   "Mute voice mode.", "mute yourself", "only respond when I call"):
+        client = FakeBrainClient(respond_events=[BrainEvent("token", text="Hi!"), BrainEvent("done")])
+        svc, pushed = _service_with_recorder(client)
+        asyncio.run(svc._process_context(_ctx(phrase)))
+        assert svc._sleeping is True, f"did not sleep for {phrase!r}"
+        assert client.respond_calls == [], f"reached brain for {phrase!r}"
+
+
+def test_mute_the_music_does_not_sleep():
+    # Guard: "mute the music" is a MEDIA command, not a request to stop listening — must reach the
+    # brain, never trigger sleep (why bare "mute" is deliberately not a sleep phrase).
+    client = FakeBrainClient(respond_events=[BrainEvent("token", text="OK."), BrainEvent("done")])
+    svc, pushed = _service_with_recorder(client)
+    asyncio.run(svc._process_context(_ctx("mute the music")))
+    assert svc._sleeping is False
+    assert client.respond_calls == [("sess-test", "mute the music")]
+
+
 def test_blocked_is_spoken_then_turn_continues():
     # blocked is NOT a stream boundary — reason is spoken, then consuming continues to done.
     client = FakeBrainClient(respond_events=[
