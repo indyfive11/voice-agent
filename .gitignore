@@ -10,6 +10,11 @@ __pycache__/
 # Session + transcript logs
 logs/
 
+# Inter-agent coordination drops (ephemeral message-passing with the gabagent brain, joined on
+# session_id — not project source; kept on disk locally but never tracked).
+GABAGENT_*.md
+VOICE_MODE_*.md
+
 # uv
 # (uv.lock IS committed for reproducibility — do not ignore it)
 
