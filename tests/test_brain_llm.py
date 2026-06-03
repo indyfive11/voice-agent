@@ -513,6 +513,15 @@ def test_mute_phrases_trigger_sleep():
         assert client.respond_calls == [], f"reached brain for {phrase!r}"
 
 
+def test_empty_user_turn_skipped():
+    # A force-completed runaway turn (or stray VAD blip) with no words must NOT reach the brain.
+    client = FakeBrainClient(respond_events=[BrainEvent("token", text="x"), BrainEvent("done")])
+    svc, pushed = _service_with_recorder(client)
+    asyncio.run(svc._process_context(_ctx("   ")))
+    assert client.respond_calls == []
+    assert _texts(pushed) == []
+
+
 def test_mute_the_music_does_not_sleep():
     # Guard: "mute the music" is a MEDIA command, not a request to stop listening — must reach the
     # brain, never trigger sleep (why bare "mute" is deliberately not a sleep phrase).

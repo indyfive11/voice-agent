@@ -42,6 +42,8 @@ from pipecat.processors.aggregators.llm_response_universal import (
 from pipecat.turns.user_mute import AlwaysUserMuteStrategy
 from pipecat.turns.user_start import MinWordsUserTurnStartStrategy
 from pipecat.turns.user_stop import TurnAnalyzerUserTurnStopStrategy
+
+from turn_cap import MaxTurnDurationUserTurnStopStrategy
 from pipecat.turns.user_turn_strategies import (
     UserTurnStrategies,
     default_user_turn_start_strategies,
@@ -177,10 +179,13 @@ async def run() -> None:
     # tune live: lower = hears you over louder music but risks false triggers, raise = the reverse.
     vad_confidence = float(os.environ.get("VAD_CONFIDENCE", "0.6"))
     vad_min_volume = float(os.environ.get("VAD_MIN_VOLUME", "0.4"))
+    # Wall-clock turn cap: SmartTurn has none (max_duration_secs is just its model window), so a long
+    # continuous ramble can hang the turn — force-complete it past this many seconds (with transcript).
+    max_turn_secs = float(os.environ.get("MAX_TURN_SECS", "15"))
     logger.info(
         f"Turn detection: VAD stop_secs={vad_stop_secs}s confidence={vad_confidence} "
         f"min_volume={vad_min_volume} → SmartTurn v3 "
-        f"(stop_secs={smart_turn_stop_secs}s max-silence fallback)"
+        f"(stop_secs={smart_turn_stop_secs}s max-silence fallback, max_turn={max_turn_secs}s cap)"
     )
     turn_analyzer = LocalSmartTurnAnalyzerV3(
         params=SmartTurnParams(
@@ -215,7 +220,12 @@ async def run() -> None:
             user_mute_strategies=[AlwaysUserMuteStrategy()] if half_duplex else [],
             user_turn_strategies=UserTurnStrategies(
                 start=start_strategies,
-                stop=[TurnAnalyzerUserTurnStopStrategy(turn_analyzer=turn_analyzer)],
+                stop=[
+                    TurnAnalyzerUserTurnStopStrategy(turn_analyzer=turn_analyzer),
+                    # Safety cap so a long continuous ramble can't hang the turn (SmartTurn won't
+                    # end it; this force-completes past max_turn_secs when there's transcribed text).
+                    MaxTurnDurationUserTurnStopStrategy(max_turn_secs=max_turn_secs),
+                ],
             ),
         ),
     )

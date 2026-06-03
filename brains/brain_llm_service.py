@@ -189,6 +189,12 @@ class BrainLLMService(LLMService):
                 await self._speak("Going to sleep. Say 'wake up' when you need me.")
                 return
 
+            # Empty/near-empty turn (e.g. a force-completed runaway turn that captured no words, or a
+            # stray VAD blip) → don't spend a brain turn on it. Pending confirms still resolve below.
+            if self._pending_confirm is None and not user_text.strip():
+                _tlog("SKIP  | empty user turn ignored")
+                return
+
             # --- normal turn / confirm resume ---
             if self._pending_confirm is not None:
                 pending = self._pending_confirm
