@@ -353,6 +353,69 @@ def build_transport():
     )
 
 
+async def pin_output_stream_volume(poll_secs: float = 5.0, floor_pct: int = 60, target_pct: int = 100):
+    """Keep the app's TTS output stream from being stranded silent/low by PipeWire module-stream-restore.
+
+    The PipeWire ALSA playback sink-input (our TTS output) can come up at a STALE low/muted level —
+    stream-restore replays a prior value onto it — which silences Aria. That's not just quiet audio: the
+    half-duplex mic-mute keys off "bot is speaking", so a silently-stranded TTS turn leaves the user muted
+    and their speech dropped (`VADController: no audio while speaking`) → the conversation breaks. We watch
+    OUR sink-input (matched by this process's pid) and raise it to 100%/unmute whenever it's stranded below
+    `floor_pct`. In-app (dies with the app — unlike the old /tmp watcher that orphaned then hit its loop
+    limit). Best-effort: no pactl → quiet no-op. Setting it also teaches stream-restore the good value.
+    """
+    import asyncio
+    import shutil
+
+    if not shutil.which("pactl"):
+        logger.info("Output-volume pin: pactl not found — skipping (TTS stranding guard inactive).")
+        return
+    pid = str(os.getpid())
+
+    async def _pactl(*args) -> str:
+        p = await asyncio.create_subprocess_exec(
+            "pactl", *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL
+        )
+        out, _ = await p.communicate()
+        return out.decode("utf-8", "replace")
+
+    logged = False
+    while True:
+        try:
+            listing = await _pactl("list", "sink-inputs")
+            # Walk the blocks; capture vol/mute per block, lock them in when the block's
+            # application.process.id matches ours (Volume/Mute appear before the property block).
+            cur_idx = cur_vol = cur_mute = None
+            our_idx = our_vol = our_mute = None
+            for line in listing.splitlines():
+                s = line.strip()
+                if s.startswith("Sink Input #"):
+                    cur_idx = s.split("#", 1)[1].strip()
+                    cur_vol = cur_mute = None
+                elif s.startswith("Mute:"):
+                    cur_mute = s.split(":", 1)[1].strip()
+                elif s.startswith("Volume:") and "%" in s:
+                    try:
+                        cur_vol = int(s.split("/")[1].strip().rstrip("%"))
+                    except (IndexError, ValueError):
+                        cur_vol = None
+                elif s == f'application.process.id = "{pid}"':
+                    our_idx, our_vol, our_mute = cur_idx, cur_vol, cur_mute
+            stranded = our_idx is not None and ((our_vol is not None and our_vol < floor_pct) or our_mute == "yes")
+            if stranded:
+                await _pactl("set-sink-input-mute", our_idx, "0")
+                await _pactl("set-sink-input-volume", our_idx, f"{target_pct}%")
+                if not logged:
+                    logger.info(
+                        f"Output-volume pin: un-stranded TTS stream #{our_idx} "
+                        f"(was vol={our_vol}% mute={our_mute}) -> {target_pct}% unmuted."
+                    )
+                    logged = True
+        except Exception as e:  # noqa: BLE001 - never let the guard crash the app
+            logger.debug(f"Output-volume pin: {type(e).__name__}: {e}")
+        await asyncio.sleep(poll_secs)
+
+
 def build_input_resampler():
     """Resampler that normalizes mic capture to PIPELINE_AUDIO_RATE. Goes first in the pipeline.
 
@@ -542,7 +605,16 @@ def build_wake_word_gate(llm):
     escape_floor = float(_env("WAKE_ESCAPE_FLOOR", "0.15"))
     escape_count = int(_env("WAKE_ESCAPE_COUNT", "3"))  # 0 disables the lockout escape
     escape_secs = float(_env("WAKE_ESCAPE_SECS", "12"))
+    # Sustained-wake: require N consecutive frames (~80ms each) >= threshold before opening. A spoken
+    # "hey aria" holds above threshold for 5-9 frames; music false-positives are isolated 1-frame spikes,
+    # so this rejects the blips without touching real wakes (2026-06-04, data-backed). 1 = old behaviour.
+    consec_frames = int(_env("WAKE_CONSEC_FRAMES", "3"))
     gate_video = _env("WAKE_GATE_VIDEO", "0") not in ("0", "false", "False")  # default: don't gate video
+    # F3 gate hardening (defense-in-depth): never clamp the mic mid-utterance, and require a media-state
+    # change to persist before flipping the gate so a transient blip can't truncate a command / leak the
+    # wake phrase. guard_inflight on by default; min_dwell 0 = old instant-flip behaviour.
+    guard_inflight = _env("WAKE_GATE_GUARD_INFLIGHT", "1") not in ("0", "false", "False")
+    min_dwell_secs = float(_env("WAKE_GATE_MIN_DWELL_SECS", "2.0"))
     speex_ns = False  # openWakeWord-only; set below when that engine is selected
     extra_log = ""
 
@@ -601,6 +673,9 @@ def build_wake_word_gate(llm):
         f"Wake word: gate ON engine={engine} models={list(oww.models.keys())} threshold={threshold} "
         f"media_only={media_only and media_status is not None} gate_video={gate_video} window={window_secs}s"
         + (f" escape={escape_count}@{escape_floor}/{escape_secs:.0f}s" if escape_count else " escape=off")
+        + (f" consec={consec_frames}" if consec_frames > 1 else "")
+        + (" inflight-guard=on" if guard_inflight else " inflight-guard=off")
+        + (f" min-dwell={min_dwell_secs:.1f}s" if min_dwell_secs > 0 else "")
         + (" speex_ns=on" if speex_ns else "")
         + extra_log
         + (f" debug=on floor={debug_floor}" if debug else "")
@@ -619,6 +694,9 @@ def build_wake_word_gate(llm):
         escape_floor=escape_floor,
         escape_count=escape_count,
         escape_secs=escape_secs,
+        consec_frames=consec_frames,
+        guard_inflight=guard_inflight,
+        min_dwell_secs=min_dwell_secs,
     )
 
 

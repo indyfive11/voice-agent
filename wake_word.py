@@ -32,7 +32,14 @@ from typing import Callable
 import numpy as np
 from loguru import logger
 
-from pipecat.frames.frames import Frame, InputAudioRawFrame, SystemFrame, TranscriptionFrame
+from pipecat.frames.frames import (
+    Frame,
+    InputAudioRawFrame,
+    SystemFrame,
+    TranscriptionFrame,
+    VADUserStartedSpeakingFrame,
+    VADUserStoppedSpeakingFrame,
+)
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
 _CHUNK_SAMPLES = 1280  # 80ms @16k — openWakeWord's preferred frame
@@ -73,6 +80,10 @@ class WakeWordGate(FrameProcessor):
         escape_floor: float = 0.15,
         escape_count: int = 3,
         escape_secs: float = 12.0,
+        consec_frames: int = 1,
+        guard_inflight: bool = True,
+        min_dwell_secs: float = 2.0,
+        time_source: Callable[[], float] | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -100,7 +111,27 @@ class WakeWordGate(FrameProcessor):
         self._escape_count = escape_count
         self._escape_secs = escape_secs
         self._escape_peak = 0.0
+        self._escape_run = 0  # consecutive frames in the current escape burst (must sustain to count)
         self._escape_hits: list[float] = []
+        # Sustained-wake: require N consecutive frames (~80ms each) >= threshold before firing. A spoken
+        # "hey aria" holds for 5-9 frames; music false-positives are isolated 1-frame spikes (2026-06-04).
+        self._consec_required = max(1, consec_frames)
+        self._consec = 0
+        # F3 gate hardening (defense-in-depth; GA's Phase-1 already kills the remote-video kind-flap):
+        #   (a) in-flight guard — never START gating (pass-through → gating) while a user utterance is in
+        #       flight, so a media-state flip can't swallow a command mid-stream and starve the VAD. Tracked
+        #       via the VAD start/stop frames (the same ones brains/media_duck consumes), which propagate
+        #       UPSTREAM through this gate. Degrades to old behaviour if VAD frames don't flow on a transport.
+        #   (b) min-dwell hysteresis — once committed to a gated state, require the opposite raw decision to
+        #       persist for min_dwell_secs before flipping, so a single transient media-state blip can't toggle
+        #       the gate (the flaps span the media-state 1s cache, so this is time-based, not frame-count).
+        self._guard_inflight = guard_inflight
+        self._speech_in_flight = False
+        self._min_dwell_secs = max(0.0, min_dwell_secs)
+        self._now = time_source or time.monotonic
+        self._gated_committed: bool | None = None  # effective (debounced) gating state; None until 1st frame
+        self._gated_pending: bool | None = None     # a raw decision awaiting the dwell to elapse
+        self._gated_pending_since = 0.0
 
         self._buf = bytearray()
         self._open = False
@@ -118,7 +149,7 @@ class WakeWordGate(FrameProcessor):
         await super().process_frame(frame, direction)
 
         if isinstance(frame, InputAudioRawFrame):
-            gated = await self._gated_now()
+            gated = self._effective_gated(await self._gated_now())
             if self._debug and gated != self._last_gated:
                 self._last_gated = gated
                 _tlog(
@@ -131,6 +162,14 @@ class WakeWordGate(FrameProcessor):
                     return  # swallow: muted until the wake word
             await self.push_frame(frame, direction)
             return
+
+        # Track whether a user utterance is in flight (VAD onset→stop). These frames originate in the
+        # user-aggregator DOWNSTREAM and are pushed UPSTREAM through this gate; the in-flight guard in
+        # _effective_gated uses them to avoid clamping the mic mid-command. Always pass them through.
+        if isinstance(frame, VADUserStartedSpeakingFrame):
+            self._speech_in_flight = True
+        elif isinstance(frame, VADUserStoppedSpeakingFrame):
+            self._speech_in_flight = False
 
         # Confirm pending (from the brain): hold the window open so the yes/no answer needs no re-wake.
         if isinstance(frame, WakeHoldFrame):
@@ -167,6 +206,42 @@ class WakeWordGate(FrameProcessor):
         return {"gated": self._last_gated, "open": self._open, "wake_peak": peak}
 
     # --- gating mode -------------------------------------------------------
+    def _effective_gated(self, raw: bool) -> bool:
+        """Map the raw per-frame `_gated_now()` decision to the EFFECTIVE gating state, applying the F3
+        in-flight guard + min-dwell hysteresis. Pure/synchronous + clock-injected so it's unit-testable."""
+        # First frame seeds the committed state — no smoothing to apply yet.
+        if self._gated_committed is None:
+            self._gated_committed = raw
+            self._gated_pending = None
+            return raw
+        committed = self._gated_committed
+
+        # (a) In-flight guard: never flip pass-through → gating while an utterance is mid-flight (it would
+        # swallow the command and starve the VAD). Only guards the →gating direction; →pass-through is fine.
+        # An OPEN window already passes audio regardless, so this only matters with the window closed.
+        if self._guard_inflight and self._speech_in_flight and raw and not committed:
+            self._gated_pending = None  # also don't let the dwell commit a gating flip mid-utterance
+            return committed
+
+        # (b) Min-dwell hysteresis: a change must persist for min_dwell_secs before it commits.
+        if raw == committed:
+            self._gated_pending = None
+            return committed
+        if self._min_dwell_secs <= 0:
+            self._gated_committed = raw
+            self._gated_pending = None
+            return raw
+        now = self._now()
+        if self._gated_pending != raw:
+            self._gated_pending = raw
+            self._gated_pending_since = now
+            return committed
+        if now - self._gated_pending_since >= self._min_dwell_secs:
+            self._gated_committed = raw
+            self._gated_pending = None
+            return raw
+        return committed
+
     async def _gated_now(self) -> bool:
         """True when the wake word is currently required (always, or — media_only — while media plays).
         Active *video* is not gated (unless gate_video): the user is watching it and can pause by hand."""
@@ -195,8 +270,11 @@ class WakeWordGate(FrameProcessor):
             if score > self._hb_peak:
                 self._hb_peak = score  # for the heartbeat (was "Aria" even scoring, over music?)
             now = time.monotonic()
-            if score >= self._threshold and (now - self._last_wake) > self._refractory:
+            # Count consecutive over-threshold frames; a single music blip won't reach _consec_required.
+            self._consec = self._consec + 1 if score >= self._threshold else 0
+            if self._consec >= self._consec_required and (now - self._last_wake) > self._refractory:
                 self._last_wake = now
+                self._consec = 0
                 self._reset_nearmiss()
                 self._on_wake(score)
             else:
@@ -226,10 +304,12 @@ class WakeWordGate(FrameProcessor):
                 self._nearmiss_peak = score
                 self._nearmiss_key = key
         elif self._nearmiss_peak > 0.0:
-            _tlog(
-                f"WAKE  | near-miss {self._nearmiss_key}={self._nearmiss_peak:.2f} "
-                f"(< threshold {self._threshold:.2f})"
+            reason = (
+                f"spike — didn't sustain {self._consec_required} frames"
+                if self._nearmiss_peak >= self._threshold
+                else f"< threshold {self._threshold:.2f}"
             )
+            _tlog(f"WAKE  | near-miss {self._nearmiss_key}={self._nearmiss_peak:.2f} ({reason})")
             self._reset_nearmiss()
 
     def _reset_nearmiss(self) -> None:
@@ -238,22 +318,28 @@ class WakeWordGate(FrameProcessor):
 
     # --- lockout escape hatch ----------------------------------------------
     def _track_escape(self, score: float, now: float) -> None:
-        """Count sub-threshold bursts (burst-peak, like the near-miss log but at a lower floor); after
-        `escape_count` of them within `escape_secs`, open the gate anyway — the user is clearly trying."""
+        """Count *sustained* sub-threshold bursts; after `escape_count` of them within `escape_secs`, open
+        the gate anyway — the user is clearly trying. A burst must last >= `_consec_required` frames to
+        count: a clamped "hey aria" holds several frames at 0.3-0.5, but a music false-positive is a 1-frame
+        spike (the same blip the sustained-wake gate rejects), so music never trips the escape (2026-06-04)."""
         if score >= self._escape_floor:
             self._escape_peak = max(self._escape_peak, score)
+            self._escape_run += 1
             return
         if self._escape_peak <= 0.0:
             return
-        # burst ended → record it, prune old, maybe escape
-        peak = self._escape_peak
+        # burst ended → count it only if it sustained (else it's a brief spike, likely music)
+        peak, run = self._escape_peak, self._escape_run
         self._escape_peak = 0.0
+        self._escape_run = 0
+        if run < self._consec_required:
+            return  # too brief to be a genuine attempt — ignore (this is what stops music tripping escape)
         self._escape_hits.append(now)
         self._escape_hits = [t for t in self._escape_hits if now - t <= self._escape_secs]
-        _tlog(f"GATE  | escape-hit {len(self._escape_hits)}/{self._escape_count} (peak={peak:.2f})")
+        _tlog(f"GATE  | escape-hit {len(self._escape_hits)}/{self._escape_count} (peak={peak:.2f}, {run} frames)")
         if len(self._escape_hits) >= self._escape_count:
             self._open_window(
-                f"GATE  | escape — {len(self._escape_hits)} near-misses in "
+                f"GATE  | escape — {len(self._escape_hits)} sustained near-misses in "
                 f"{self._escape_secs:.0f}s, opening despite sub-threshold"
             )
 
@@ -267,6 +353,7 @@ class WakeWordGate(FrameProcessor):
             _tlog(log_msg)
             self._fire_duck(True)  # pre-duck so the command lands on already-ducked media
         self._escape_peak = 0.0
+        self._escape_run = 0
         self._escape_hits.clear()  # fresh start once we're open
         self._arm_window()
 

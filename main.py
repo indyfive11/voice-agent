@@ -25,6 +25,16 @@ os.makedirs(_EXEC_TMP, exist_ok=True)
 os.environ["TMPDIR"] = _EXEC_TMP
 tempfile.tempdir = None  # drop any cached value so TMPDIR is re-read
 
+# Stamp a stable, collision-proof property on every PipeWire stream this process opens (mic + TTS output)
+# so the gabagent brain's universal local-media duck can EXCLUDE Aria's own TTS output exactly (vs a
+# node-name heuristic) and never mute her. PipeWire reads PIPEWIRE_PROPS at stream-connect, so — like
+# TMPDIR above — it must be set BEFORE any audio stream opens. The brain skips any sink-input whose
+# `pactl list sink-inputs` Properties block contains gabagent.duck_exclude = "1". NB: the ALSA→PipeWire
+# path (our PyAudio output, node alsa_playback.python3.12) honours PIPEWIRE_PROPS, NOT PULSE_PROP —
+# verified on this box 2026-06-04. The mic source-output also gets it (harmless: the duck only scans
+# sink-inputs). setdefault so an explicit override wins.
+os.environ.setdefault("PIPEWIRE_PROPS", "{ gabagent.duck_exclude = 1 }")
+
 from dotenv import load_dotenv
 from loguru import logger
 
@@ -288,11 +298,15 @@ async def run() -> None:
         await worker.queue_frames([LLMRunFrame()])
 
     logger.info("Voice agent ready — start speaking. (Ctrl-C to quit.)")
+    # Guard the TTS output stream against PipeWire module-stream-restore stranding it silent (which would
+    # leave the user muted under half-duplex and break the conversation). In-app, dies with the app.
+    pin_task = asyncio.create_task(config.pin_output_stream_volume())
     runner = WorkerRunner(handle_sigint=(sys.platform != "win32"))
     try:
         await runner.add_workers(worker)
         await runner.run()
     finally:
+        pin_task.cancel()
         # Tear down an external brain (stop `gab --voice-serve`); no-op for local brains.
         await config.stop_brain(llm)
 

@@ -64,6 +64,41 @@ def test_wake_is_debounced_within_refractory():
     assert client.duck_calls == [("sess-test", True)]  # exactly one
 
 
+def test_sustained_wake_needs_consecutive_frames():
+    # consec_frames=3: a single over-threshold frame must NOT open; three in a row must.
+    client = FakeBrainClient()
+    g = _gate(client, consec_frames=3)
+    g._oww.score = 0.9
+
+    async def go():
+        await g._feed(_CHUNK)          # consec=1
+        assert g._open is False
+        await g._feed(_CHUNK)          # consec=2
+        assert g._open is False
+        await g._feed(_CHUNK)          # consec=3 → wake
+
+    asyncio.run(go())
+    assert g._open is True
+    assert client.duck_calls == [("sess-test", True)]
+
+
+def test_brief_spike_rejected_and_consec_resets_on_gap():
+    # A 1-frame music spike (then a sub-threshold frame) never reaches the requirement.
+    client = FakeBrainClient()
+    g = _gate(client, consec_frames=3)
+
+    async def go():
+        g._oww.score = 0.9; await g._feed(_CHUNK)   # consec=1
+        g._oww.score = 0.9; await g._feed(_CHUNK)   # consec=2
+        g._oww.score = 0.1; await g._feed(_CHUNK)   # below → resets to 0
+        g._oww.score = 0.9; await g._feed(_CHUNK)   # consec=1
+        g._oww.score = 0.9; await g._feed(_CHUNK)   # consec=2 (never 3 in a row)
+
+    asyncio.run(go())
+    assert g._open is False
+    assert client.duck_calls == []
+
+
 def test_window_closes_and_restores():
     client = FakeBrainClient()
     g = _gate(client, window_secs=0.01)
@@ -127,6 +162,32 @@ def test_escape_hatch_opens_after_repeated_near_misses():
     assert client.duck_calls == [("sess-test", True)]  # escape pre-ducks like a real wake
 
 
+def test_escape_ignores_single_frame_spikes_when_sustain_required():
+    # consec_frames=2 → an escape-hit needs a burst of >=2 frames. A 1-frame music spike (even at 0.99)
+    # must NOT count; only a sustained sub-threshold burst (a real clamped "hey aria") does.
+    client = FakeBrainClient()
+    g = _gate(client, escape_count=2, escape_floor=0.15, consec_frames=2)
+
+    async def spike(peak):           # 1 frame above floor → 1-frame burst (music blip)
+        g._oww.score = peak; await g._feed(_CHUNK)
+        g._oww.score = 0.0;  await g._feed(_CHUNK)
+
+    async def sustained(peak):       # 2 frames above floor → 2-frame burst (genuine attempt)
+        g._oww.score = peak; await g._feed(_CHUNK)
+        g._oww.score = peak; await g._feed(_CHUNK)
+        g._oww.score = 0.0;  await g._feed(_CHUNK)
+
+    async def go():
+        await spike(0.99); await spike(0.99); await spike(0.99)  # 3 music blips → zero hits
+        assert g._open is False
+        await sustained(0.40)        # 1 sustained hit
+        assert g._open is False
+        await sustained(0.40)        # 2nd → escape opens
+
+    asyncio.run(go())
+    assert g._open is True
+
+
 def test_speex_ns_falls_back_when_unavailable(monkeypatch, tmp_path):
     # WAKE_WORD_SPEEX_NS=1 but the speexdsp-ns wheel is missing → build the gate WITHOUT it, don't crash.
     import openwakeword.model as owm
@@ -142,6 +203,10 @@ def test_speex_ns_falls_back_when_unavailable(monkeypatch, tmp_path):
     model_path = tmp_path / "aria.onnx"
     model_path.write_bytes(b"stub")
     monkeypatch.setenv("WAKE_WORD", str(model_path))
+    # Pin the engine: speex fallback is openWakeWord-only. Without this the ambient .env
+    # (WAKE_WORD_ENGINE=nano) hijacks the build down the nano path → loads the stub as a nano
+    # model → InvalidProtobuf. Pinning makes the test deterministic regardless of .env / ordering.
+    monkeypatch.setenv("WAKE_WORD_ENGINE", "oww")
     monkeypatch.setenv("WAKE_WORD_SPEEX_NS", "1")
 
     gate = config.build_wake_word_gate(object())  # non-brain llm
@@ -224,6 +289,79 @@ def test_escape_count_zero_disables_hatch():
 
     asyncio.run(go())
     assert g._open is False
+
+
+# --- F3 gate hardening: in-flight guard + min-dwell hysteresis ---------------
+class _FakeClock:
+    """Injectable monotonic clock so the dwell timer is deterministic (no real sleeps)."""
+
+    def __init__(self):
+        self.t = 0.0
+
+    def __call__(self):
+        return self.t
+
+    def advance(self, dt):
+        self.t += dt
+
+
+def test_inflight_guard_blocks_gating_flip_midutterance():
+    # Gate is pass-through; media flips to "playing" WHILE an utterance is in flight → the gate must NOT
+    # start gating (that would swallow the command). It flips only once the utterance ends.
+    clk = _FakeClock()
+    g = _gate(min_dwell_secs=0.0, guard_inflight=True, time_source=clk)
+    assert g._effective_gated(False) is False        # seed committed = pass-through
+    g._speech_in_flight = True
+    assert g._effective_gated(True) is False          # guarded — stays pass-through
+    assert g._effective_gated(True) is False
+    g._speech_in_flight = False                       # VADUserStoppedSpeaking
+    assert g._effective_gated(True) is True            # now it may gate (min_dwell=0 → instant)
+
+
+def test_inflight_guard_off_allows_midutterance_flip():
+    clk = _FakeClock()
+    g = _gate(min_dwell_secs=0.0, guard_inflight=False, time_source=clk)
+    assert g._effective_gated(False) is False
+    g._speech_in_flight = True
+    assert g._effective_gated(True) is True             # not guarded
+
+
+def test_no_vad_frames_behaves_like_today():
+    # If VAD frames never flow (some transports), _speech_in_flight stays False → no regression: the gate
+    # flips on the raw decision exactly as before.
+    clk = _FakeClock()
+    g = _gate(min_dwell_secs=0.0, guard_inflight=True, time_source=clk)
+    assert g._effective_gated(False) is False
+    assert g._effective_gated(True) is True
+
+
+def test_min_dwell_blocks_transient_blip():
+    # A media-state blip shorter than the dwell must NOT toggle the effective gate.
+    clk = _FakeClock()
+    g = _gate(min_dwell_secs=2.0, guard_inflight=False, time_source=clk)
+    assert g._effective_gated(False) is False          # seed
+    assert g._effective_gated(True) is False            # t=0: pending, not committed
+    clk.advance(1.0)
+    assert g._effective_gated(True) is False            # t=1 < 2: still pending
+    assert g._effective_gated(False) is False           # blip ends before dwell → pending cleared
+    clk.advance(5.0)
+    assert g._effective_gated(False) is False           # never flipped
+
+
+def test_min_dwell_commits_after_persistence():
+    clk = _FakeClock()
+    g = _gate(min_dwell_secs=2.0, guard_inflight=False, time_source=clk)
+    assert g._effective_gated(False) is False
+    assert g._effective_gated(True) is False            # t=0 pending
+    clk.advance(2.0)
+    assert g._effective_gated(True) is True              # dwell elapsed → commit
+
+
+def test_min_dwell_zero_is_instant_flip():
+    clk = _FakeClock()
+    g = _gate(min_dwell_secs=0.0, guard_inflight=False, time_source=clk)
+    assert g._effective_gated(False) is False
+    assert g._effective_gated(True) is True              # old instant behaviour
 
 
 def _capture_transcript():

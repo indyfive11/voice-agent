@@ -21,6 +21,17 @@ VOICE_MODE_*.md
 # Local Pipecat fork (escape hatch — see pyproject.toml [tool.uv.sources])
 vendor/
 
+# Wake-word training (isolated venv + multi-GB datasets/clips/features — never tracked).
+# The config.yaml + fetch_data.sh + RUN.md under wake-train/ ARE worth keeping; the rest isn't.
+train-env/
+wake-train/data/
+wake-train/features/
+wake-train/trained_models/
+wake-train/music/
+wake-train/SonicWeave-v2/
+wake-train/SonicWeave-v2.zip
+wake-train/NwwResourcesModel/
+
 # Model caches downloaded on first run (Whisper / Kokoro / Silero / SmartTurn)
 models/
 *.onnx
