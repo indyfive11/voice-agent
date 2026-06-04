@@ -38,3 +38,6 @@ models/
 *.bin
 # ...but DO version our own small, self-trained wake-word models (e.g. hey_aria.onnx).
 !wakewords/*.onnx
+# ...EXCEPT speaker-specific voice models (trained on a real user's voice) — keep those local.
+# Train your own per wake-train/RUN.md; the bare openWakeWord aria.onnx ships as a starting point.
+wakewords/aria_nano*.onnx
