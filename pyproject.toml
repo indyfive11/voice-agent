@@ -14,6 +14,8 @@ dependencies = [
     "websockets>=16.0",
     "openwakeword>=0.4.0",
     "speexdsp-ns>=0.1.2",
+    "nanowakeword>=2.1.3",  # alt wake engine (WAKE_WORD_ENGINE=nano); durable wake-over-music model
+    "pvporcupine>=4.0.0",   # alt wake engine (WAKE_WORD_ENGINE=porcupine); instant robust custom keyword
 ]
 
 [project.optional-dependencies]

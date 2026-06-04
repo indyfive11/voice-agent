@@ -526,16 +526,13 @@ def build_wake_word_gate(llm):
     names = _env("WAKE_WORD", "")
     if not names:
         return None  # not configured → open-mic as before
-    paths = _wake_model_paths(names)
-    if not paths:
-        logger.warning("Wake word: no valid models resolved; gate disabled.")
-        return None
-
-    from openwakeword.model import Model
 
     from wake_word import WakeWordGate
     from brains.brain_llm_service import BrainLLMService
 
+    # Engine: openWakeWord (default), nanowakeword, or Porcupine. nano/porcupine are the wake-over-music
+    # paths (the AEC double-talk clamp crushes the bare oww "Aria"); see wake_nano / wake_porcupine.
+    engine = _env("WAKE_WORD_ENGINE", "oww").lower()
     threshold = float(_env("WAKE_WORD_THRESHOLD", "0.5"))
     vad_threshold = float(_env("WAKE_WORD_VAD_THRESHOLD", "0.5"))
     window_secs = float(_env("WAKE_WINDOW_SECS", "15"))
@@ -546,19 +543,54 @@ def build_wake_word_gate(llm):
     escape_count = int(_env("WAKE_ESCAPE_COUNT", "3"))  # 0 disables the lockout escape
     escape_secs = float(_env("WAKE_ESCAPE_SECS", "12"))
     gate_video = _env("WAKE_GATE_VIDEO", "0") not in ("0", "false", "False")  # default: don't gate video
-    # Speex noise suppression: openWakeWord pre-processes the audio to suppress *stationary* background
-    # (music) before the melspectrogram — its documented lever for hear-over-media false-rejects. Off by
-    # default (A/B it); graceful fallback if the speexdsp-ns wheel is missing/unsupported on this box.
-    speex_ns = _env("WAKE_WORD_SPEEX_NS", "0") not in ("0", "false", "False")
-    try:
-        oww = Model(wakeword_model_paths=paths, vad_threshold=vad_threshold,
-                    enable_speex_noise_suppression=speex_ns)
-    except Exception as e:  # noqa: BLE001 - speexdsp-ns unavailable → run without rather than crash
-        if not speex_ns:
-            raise
-        logger.warning(f"Wake word: Speex NS unavailable ({type(e).__name__}: {e}); running without it.")
-        speex_ns = False
-        oww = Model(wakeword_model_paths=paths, vad_threshold=vad_threshold)
+    speex_ns = False  # openWakeWord-only; set below when that engine is selected
+    extra_log = ""
+
+    if engine in ("porcupine", "pv"):
+        from wake_porcupine import PorcupineModel
+
+        # Porcupine keyword is a platform-specific .ppn (NOT an .onnx) → resolve straight from WAKE_WORD.
+        kw = os.path.expanduser(names.strip())
+        if not (kw.endswith(".ppn") and os.path.exists(kw)):
+            logger.warning(f"Wake word: Porcupine needs a .ppn path in WAKE_WORD; {names!r} not found; gate disabled.")
+            return None
+        access_key = _env("PORCUPINE_ACCESS_KEY", "")
+        sensitivity = float(_env("WAKE_WORD_SENSITIVITY", "0.7"))
+        key = (os.path.basename(kw).split("_")[0].replace("-", " ").strip() or "wake")
+        try:
+            oww = PorcupineModel([kw], access_key=access_key, sensitivity=sensitivity, key=key)
+        except Exception as e:  # noqa: BLE001 - bad key / expired .ppn / platform mismatch → disable, don't crash
+            logger.warning(f"Wake word: Porcupine init failed ({type(e).__name__}: {e}); gate disabled.")
+            return None
+        extra_log = f" sensitivity={sensitivity}"
+    elif engine in ("nano", "nanowakeword"):
+        paths = _wake_model_paths(names)
+        if not paths:
+            logger.warning("Wake word: no valid models resolved; gate disabled.")
+            return None
+        from wake_nano import NanoWakeWordModel
+
+        oww = NanoWakeWordModel(paths)  # same audio contract (int16/16k/1280); same .models/.predict shape
+    else:
+        paths = _wake_model_paths(names)
+        if not paths:
+            logger.warning("Wake word: no valid models resolved; gate disabled.")
+            return None
+        from openwakeword.model import Model
+
+        # Speex noise suppression: openWakeWord pre-processes the audio to suppress *stationary* background
+        # (music) before the melspectrogram — its documented lever for hear-over-media false-rejects. Off by
+        # default (A/B it); graceful fallback if the speexdsp-ns wheel is missing/unsupported on this box.
+        speex_ns = _env("WAKE_WORD_SPEEX_NS", "0") not in ("0", "false", "False")
+        try:
+            oww = Model(wakeword_model_paths=paths, vad_threshold=vad_threshold,
+                        enable_speex_noise_suppression=speex_ns)
+        except Exception as e:  # noqa: BLE001 - speexdsp-ns unavailable → run without rather than crash
+            if not speex_ns:
+                raise
+            logger.warning(f"Wake word: Speex NS unavailable ({type(e).__name__}: {e}); running without it.")
+            speex_ns = False
+            oww = Model(wakeword_model_paths=paths, vad_threshold=vad_threshold)
 
     brain_client = session_id = media_status = None
     if isinstance(llm, BrainLLMService):
@@ -566,10 +598,11 @@ def build_wake_word_gate(llm):
         session_id = llm.session_id
         media_status = build_media_state_provider(llm)  # SHARED with the media duck (no divergence)
     logger.info(
-        f"Wake word: gate ON models={list(oww.models.keys())} threshold={threshold} "
+        f"Wake word: gate ON engine={engine} models={list(oww.models.keys())} threshold={threshold} "
         f"media_only={media_only and media_status is not None} gate_video={gate_video} window={window_secs}s"
         + (f" escape={escape_count}@{escape_floor}/{escape_secs:.0f}s" if escape_count else " escape=off")
         + (" speex_ns=on" if speex_ns else "")
+        + extra_log
         + (f" debug=on floor={debug_floor}" if debug else "")
     )
     return WakeWordGate(
