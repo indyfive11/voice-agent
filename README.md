@@ -13,7 +13,8 @@ full tool-using agent. There is no code dependency on any particular brain.
 [`gabagent`](https://github.com/indyfive11/gabagent) is the reference **brain** — a tool-using
 coding/desktop agent with an escalating-tier safety model. The two are **loosely coupled — docs and
 protocol only, no code dependency** in either direction. The brain↔shell contract lives in gabagent's
-`docs/VOICE_PROTOCOL.md`. Run voice-agent with `BRAIN=local` and never touch gabagent, or wire them
+[`docs/VOICE_PROTOCOL.md`](https://github.com/indyfive11/gabagent/blob/master/docs/VOICE_PROTOCOL.md).
+Run voice-agent with `BRAIN=local` and never touch gabagent, or wire them
 together for a full voice-driven agent.
 
 > **Brain-agnostic, with known rough edges.** The design is brain-agnostic (the `brains/` seam,
