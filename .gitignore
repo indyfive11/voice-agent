@@ -49,3 +49,10 @@ models/
 # ...EXCEPT speaker-specific voice models (trained on a real user's voice) — keep those local.
 # Train your own per wake-train/RUN.md; the bare openWakeWord aria.onnx ships as a starting point.
 wakewords/aria_nano*.onnx
+
+# AUR packaging build artifacts (the PKGBUILD/.SRCINFO/.install ARE tracked; build output is not)
+aur/src/
+aur/pkg/
+aur/*.pkg.tar.zst
+aur/*.log
+aur/voice-agent-git/
