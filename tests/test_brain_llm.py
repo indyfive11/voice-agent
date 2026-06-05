@@ -494,6 +494,39 @@ def test_media_duck_continued_speech_cancels_false_onset_restore():
     assert client.duck_calls == [("sess-test", True)]  # still ducked, no restore
 
 
+def test_media_duck_no_restore_while_speech_in_flight():
+    # A long monologue (onset → confirmed → STILL speaking) must NOT restore the bed mid-utterance
+    # even after the idle grace elapses — the "music interjects during a long monologue" bug. The
+    # idle-restore is guarded on an active VAD segment; it re-arms instead of yanking the bed.
+    client = FakeBrainClient()
+    ctl = _duck(client, restore_grace=0.01)
+
+    async def go():
+        ctl._handle(_onset())                              # duck on, speech in flight
+        ctl._handle(_spoken("let me tell you a long story"))  # confirmed → arms idle restore
+        await asyncio.sleep(0.05)                          # grace elapses while STILL speaking
+        await asyncio.sleep(0.05)                          # second grace window — still no restore
+
+    asyncio.run(go())
+    assert client.duck_calls == [("sess-test", True)]      # never restored mid-monologue
+
+
+def test_media_duck_restores_after_speech_stops():
+    # Idle grace is measured from the actual speech *stop*: once the user stops, the bed restores.
+    client = FakeBrainClient()
+    ctl = _duck(client, restore_grace=0.01)
+
+    async def go():
+        ctl._handle(_onset())
+        ctl._handle(_spoken("let me tell you a long story"))  # confirmed
+        await asyncio.sleep(0.05)                          # in flight → no restore yet
+        ctl._handle(_offset())                             # speech stops → idle grace starts here
+        await asyncio.sleep(0.05)                          # idle grace elapses → restore
+
+    asyncio.run(go())
+    assert client.duck_calls == [("sess-test", True), ("sess-test", False)]
+
+
 def test_media_state_debounced_across_rapid_onsets():
     # With onset-triggering, a talkative paused-media stretch fires many duck attempts; the media_state
     # gate must be debounced so it doesn't re-query the brain on each one.

@@ -78,6 +78,11 @@ class MediaDuckController(FrameProcessor):
         self._ducked = False
         self._bot_spoke = False  # did the bot speak during the current duck?
         self._confirmed = False  # got ≥min_words this duck episode (so it's not a false onset)
+        # Is the user currently inside an active VAD speech segment (onset seen, no stop yet)? The
+        # idle-restore must never fire while this is True — yanking the bed out mid-sentence is the
+        # "music interjects during a long monologue" bug. Idle is measured from speech *stop*, not
+        # from the last transcription chunk (which can lag / fall under min_words mid-utterance).
+        self._speech_in_flight = False
         self._restore_task: asyncio.Task | None = None
         self._confirm_task: asyncio.Task | None = None
         # Media-state — the SHARED provider (config.build_media_state_provider), the SAME callable the
@@ -96,14 +101,20 @@ class MediaDuckController(FrameProcessor):
     def _handle(self, frame: Frame) -> None:
         if isinstance(frame, VADUserStartedSpeakingFrame):
             # Speech onset — duck immediately. Cancel any pending false-onset restore (still talking).
+            self._speech_in_flight = True
             self._cancel_confirm()
             self._duck_on("speech onset")
         elif isinstance(frame, VADUserStoppedSpeakingFrame):
             # Speech segment ended. If this onset hasn't been confirmed by real words yet, start the
             # short countdown that restores it as a false trigger (cancelled if a transcription
             # confirms, or if the user resumes speaking).
+            self._speech_in_flight = False
             if self._ducked and not self._confirmed:
                 self._arm_confirm()
+            elif self._ducked and self._confirmed:
+                # Confirmed turn just paused — (re)start the idle grace from the actual stop point so
+                # the bed only restores after a genuine silence, never mid-monologue.
+                self._arm_restore()
         elif isinstance(frame, (TranscriptionFrame, InterimTranscriptionFrame)):
             text = getattr(frame, "text", "") or ""
             if len(text.split()) >= self._min_words:
@@ -175,6 +186,11 @@ class MediaDuckController(FrameProcessor):
             try:
                 await asyncio.sleep(self._restore_grace)
                 if self._ducked and not self._bot_spoke:
+                    if self._speech_in_flight:
+                        # User is still mid-utterance — don't restore the bed under them. Re-arm and
+                        # let the next stop (VADUserStoppedSpeaking) measure the idle window cleanly.
+                        self._arm_restore()
+                        return
                     self._restore("idle-grace")
             except asyncio.CancelledError:
                 pass
