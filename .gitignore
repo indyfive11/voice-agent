@@ -33,6 +33,7 @@ wake-train/music/
 wake-train/voice_pos/
 wake-train/aec_neg/
 wake-train/selfneg/
+wake-train/voiceid/
 wake-train/SonicWeave-v2/
 wake-train/SonicWeave-v2.zip
 wake-train/NwwResourcesModel/
