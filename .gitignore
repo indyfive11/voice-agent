@@ -22,15 +22,22 @@ VOICE_MODE_*.md
 vendor/
 
 # Wake-word training (isolated venv + multi-GB datasets/clips/features — never tracked).
-# The config.yaml + fetch_data.sh + RUN.md under wake-train/ ARE worth keeping; the rest isn't.
+# Keep the tooling + docs (config.yaml, *.sh, RUN*.md); IGNORE all audio/data/logs. The captured
+# clips (voice_pos/, aec_neg/, selfneg/, raw_*.wav) contain the user's REAL VOICE — never push to the
+# public repo (same reason as wakewords/aria_nano*.onnx below).
 train-env/
 wake-train/data/
 wake-train/features/
 wake-train/trained_models/
 wake-train/music/
+wake-train/voice_pos/
+wake-train/aec_neg/
+wake-train/selfneg/
 wake-train/SonicWeave-v2/
 wake-train/SonicWeave-v2.zip
 wake-train/NwwResourcesModel/
+wake-train/*.wav
+wake-train/*.log
 
 # Model caches downloaded on first run (Whisper / Kokoro / Silero / SmartTurn)
 models/
