@@ -458,3 +458,29 @@ def test_real_wake_emits_no_nearmiss():
 
     assert g._open is True
     assert not any("near-miss" in ln for ln in lines)
+
+
+def test_post_wake_duplicate_labeled_refractory_not_sustain():
+    # The exact 2026-06-05 log pattern: a wake fires (0.9), then a SECOND >=threshold frame lands inside the
+    # refractory window. With _consec_required=1 it can't be a sustain failure — it's a refractory-swallowed
+    # duplicate, and the near-miss reason must say so (not the misleading "didn't sustain 1 frames").
+    g = _gate(debug=True, debug_floor=0.2, refractory_secs=2.0)
+    lines, remove = _capture_transcript()
+
+    async def go():
+        g._oww.score = 0.9
+        await g._feed(_CHUNK)   # real wake fires, opens window
+        g._oww.score = 0.9
+        await g._feed(_CHUNK)   # duplicate within refractory → near-miss burst
+        g._oww.score = 0.0
+        await g._feed(_CHUNK)   # burst ends → emit the line
+
+    try:
+        asyncio.run(go())
+    finally:
+        remove()
+
+    nearmiss = [ln for ln in lines if "near-miss" in ln]
+    assert len(nearmiss) == 1
+    assert "duplicate within refractory" in nearmiss[0]
+    assert "didn't sustain" not in nearmiss[0]

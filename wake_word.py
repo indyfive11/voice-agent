@@ -150,6 +150,9 @@ class WakeWordGate(FrameProcessor):
         # Peak score within the current sub-threshold burst (one line emitted per utterance, not per frame).
         self._nearmiss_peak = 0.0
         self._nearmiss_key = ""
+        # Whether the burst's peak frame was suppressed by the post-wake refractory window (a real wake had
+        # just fired) rather than by failing to sustain. Drives an accurate near-miss reason label.
+        self._nearmiss_refractory = False
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
@@ -285,7 +288,11 @@ class WakeWordGate(FrameProcessor):
                 self._on_wake(score)
             else:
                 if self._debug:
-                    self._track_nearmiss(key, score)
+                    # A >=threshold frame can land here for two very different reasons: it failed to sustain
+                    # _consec_required frames, OR a real wake just fired and this frame is inside the refractory
+                    # window (a duplicate, not a recall failure). Capture which, for an accurate near-miss label.
+                    in_refractory = (now - self._last_wake) <= self._refractory
+                    self._track_nearmiss(key, score, in_refractory)
                 if not self._open and self._escape_count > 0:
                     self._track_escape(score, now)  # lockout escape (independent of debug)
 
@@ -299,7 +306,7 @@ class WakeWordGate(FrameProcessor):
         return best_k, best_s
 
     # --- near-miss diagnostic (WAKE_WORD_DEBUG) -----------------------------
-    def _track_nearmiss(self, key: str, score: float) -> None:
+    def _track_nearmiss(self, key: str, score: float, in_refractory: bool = False) -> None:
         """Track the peak of a sub-threshold burst; emit one line when the burst ends.
 
         Frames arrive ~12.5/s, so a single spoken "Aria" spans several — logging each would spam. Instead
@@ -309,18 +316,23 @@ class WakeWordGate(FrameProcessor):
             if score >= self._nearmiss_peak:
                 self._nearmiss_peak = score
                 self._nearmiss_key = key
+                self._nearmiss_refractory = in_refractory
         elif self._nearmiss_peak > 0.0:
-            reason = (
-                f"spike — didn't sustain {self._consec_required} frames"
-                if self._nearmiss_peak >= self._threshold
-                else f"< threshold {self._threshold:.2f}"
-            )
+            if self._nearmiss_peak < self._threshold:
+                reason = f"< threshold {self._threshold:.2f}"
+            elif self._nearmiss_refractory:
+                # Hit threshold but a real wake just fired — this is a duplicate the refractory swallowed,
+                # NOT a recall miss. (With _consec_required=1 every post-wake threshold frame lands here.)
+                reason = "duplicate within refractory of last wake"
+            else:
+                reason = f"spike — didn't sustain {self._consec_required} frames"
             _tlog(f"WAKE  | near-miss {self._nearmiss_key}={self._nearmiss_peak:.2f} ({reason})")
             self._reset_nearmiss()
 
     def _reset_nearmiss(self) -> None:
         self._nearmiss_peak = 0.0
         self._nearmiss_key = ""
+        self._nearmiss_refractory = False
 
     # --- lockout escape hatch ----------------------------------------------
     def _track_escape(self, score: float, now: float) -> None:
