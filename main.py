@@ -56,6 +56,7 @@ from pipecat.turns.user_stop import TurnAnalyzerUserTurnStopStrategy
 
 from turn_cap import MaxTurnDurationUserTurnStopStrategy
 from response_latency import ResponseLatencyObserver
+from tts_gain import TTSGainProcessor
 from pipecat.turns.user_turn_strategies import (
     UserTurnStrategies,
     default_user_turn_start_strategies,
@@ -139,6 +140,13 @@ async def run() -> None:
     transport = config.build_transport()
     stt = config.build_stt()
     tts = config.build_tts()
+    # Attenuate Aria's TTS so her (duck-excluded) voice isn't louder than the ducked music. TTS_GAIN
+    # (0..1, default 0.55; 1.0 = no change) — tune live to taste. Keeps duck-exclude; just lowers her level.
+    # 0.55: the user judged 0.6 "about right, a teeny bit down" on the 2026-06-04 live tune.
+    tts_gain = float(os.environ.get("TTS_GAIN", "0.55"))
+    tts_gain_proc = TTSGainProcessor(gain=tts_gain)
+    if tts_gain < 1.0:
+        logger.info(f"TTS gain: attenuating Aria's output to {tts_gain:.2f} (TTS_GAIN; keeps duck-exclude).")
     llm = config.build_llm()
     # Start an external brain (BRAIN=gabagent) — spawn `gab --voice-serve` + wait for /health.
     # No-op for local LLM brains.
@@ -278,6 +286,7 @@ async def run() -> None:
             user_aggregator,       # VAD + SmartTurn v3 + user-side context
             llm,                   # Claude / OpenAI-compatible / local Ollama
             tts,                   # Kokoro (local)
+            tts_gain_proc,         # attenuate Aria's voice (TTS_GAIN) so she's not louder than ducked music
             transport.output(),    # speaker
             assistant_aggregator,  # assistant-side context (after output, so it logs spoken text)
         ]
