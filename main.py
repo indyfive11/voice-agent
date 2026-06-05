@@ -305,10 +305,26 @@ async def run() -> None:
         from pipecat_tail.observer import TailObserver  # lazy: pulls textual/plotext only when enabled
         _observers.append(TailObserver())
         logger.info("Tail observer on ws://localhost:9292 — run `pipecat tail` in another terminal.")
+    # Idle timeout: pipecat's PipelineWorker defaults to idle_timeout_secs=300 and
+    # cancel_on_idle_timeout=True, and its idle clock ONLY resets on Bot/UserSpeakingFrame.
+    # For an ambient wake-word listener that is fatal: while music plays the gate mutes the mic
+    # (no UserSpeakingFrame) and nobody triggers a reply (no BotSpeakingFrame), so after 5 min of
+    # silence pipecat decides the pipeline is hung and cancels the whole worker — the agent "crashes"
+    # for just sitting and listening. Sitting muted waiting for "hey aria" IS the intended steady
+    # state here, so disable the idle-cancel by default. input_watchdog.py already monitors liveness
+    # independently. PIPELINE_IDLE_TIMEOUT_SECS>0 re-enables pipecat's timer if ever wanted.
+    idle_secs = float(os.environ.get("PIPELINE_IDLE_TIMEOUT_SECS", "0")) or None
     worker = PipelineWorker(
         pipeline,
         params=PipelineParams(enable_metrics=True, enable_usage_metrics=True),
         observers=_observers,
+        idle_timeout_secs=idle_secs,
+        cancel_on_idle_timeout=idle_secs is not None,
+    )
+    logger.info(
+        "Idle timeout: "
+        + (f"{idle_secs:.0f}s (pipecat cancel-on-idle ON)" if idle_secs
+           else "disabled — ambient listener stays up while idle/muted")
     )
     if observe and worker.turn_tracking_observer:
         @worker.turn_tracking_observer.event_handler("on_turn_ended")
