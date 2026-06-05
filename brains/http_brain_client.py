@@ -129,12 +129,13 @@ class HttpBrainClient:
         except Exception as e:  # noqa: BLE001
             logger.debug(f"Brain: /cancel failed (already done?): {type(e).__name__}: {e}")
 
-    async def duck(self, session_id: str, on: bool) -> None:
-        """Duck/pause (on=True) or restore (on=False) the brain's active media. Best-effort:
-        a brain without `/media/duck` (404) or no active media is a harmless no-op."""
+    async def duck(self, session_id: str, on: bool, mute: bool = False) -> None:
+        """Duck/pause (on=True) or restore (on=False) the brain's active media. `mute=True` deepens to
+        a full mute (volume 0) for an open wake/command window (VOICE_PROTOCOL `/media/duck {on,mute?}`).
+        Best-effort: a brain without `/media/duck` (404) or no active media is a harmless no-op."""
         try:
             await self._http.post(
-                "/media/duck", json={"session_id": session_id, "on": on},
+                "/media/duck", json={"session_id": session_id, "on": on, "mute": mute},
                 timeout=httpx.Timeout(5.0),
             )
         except Exception as e:  # noqa: BLE001

@@ -61,10 +61,12 @@ class BrainClient(Protocol):
         """Abort the in-flight turn (barge-in) without tearing the client down."""
         ...
 
-    async def duck(self, session_id: str, on: bool) -> None:
+    async def duck(self, session_id: str, on: bool, mute: bool = False) -> None:
         """Best-effort: tell the brain to lower (on=True) or restore (on=False) the volume of its
-        active media while the user is speaking, so playback doesn't drown out the mic. No-op if the
-        brain controls no media; must never raise."""
+        active media while the user is speaking, so playback doesn't drown out the mic. `mute=True`
+        deepens the duck to a full mute (volume 0) for an open wake/command window, so a music vocal
+        can't bleed into the transcription (per VOICE_PROTOCOL `/media/duck {on,mute?}`; defaults to a
+        plain duck). No-op if the brain controls no media; must never raise."""
         ...
 
     async def media_state(self, session_id: str) -> dict | None:
@@ -101,6 +103,7 @@ class FakeBrainClient:
         self.confirm_calls: list[tuple[str, str, bool, str | None]] = []
         self.cancel_calls: list[str] = []
         self.duck_calls: list[tuple[str, bool]] = []
+        self.duck_mute_calls: list[tuple[str, bool, bool]] = []  # (session, on, mute)
         # Tests set this to drive media_state(); None → capability absent (callers assume "playing").
         self.media_state_value: dict | None = None
         self.media_state_calls = 0  # how many times media_state() was queried (debounce tests)
@@ -124,8 +127,9 @@ class FakeBrainClient:
     async def cancel(self, session_id: str) -> None:
         self.cancel_calls.append(session_id)
 
-    async def duck(self, session_id: str, on: bool) -> None:
-        self.duck_calls.append((session_id, on))
+    async def duck(self, session_id: str, on: bool, mute: bool = False) -> None:
+        self.duck_calls.append((session_id, on))          # back-compat shape for existing tests
+        self.duck_mute_calls.append((session_id, on, mute))  # full shape incl. mute
 
     async def media_state(self, session_id: str) -> dict | None:
         self.media_state_calls += 1

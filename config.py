@@ -615,6 +615,9 @@ def build_wake_word_gate(llm):
     # wake phrase. guard_inflight on by default; min_dwell 0 = old instant-flip behaviour.
     guard_inflight = _env("WAKE_GATE_GUARD_INFLIGHT", "1") not in ("0", "false", "False")
     min_dwell_secs = float(_env("WAKE_GATE_MIN_DWELL_SECS", "2.0"))
+    # On wake-window-open, send /media/duck {mute:true} → media to full 0% for the window (vs a partial
+    # duck) so no music vocal bleeds into the command's STT. On by default; 0 = plain pre-duck.
+    window_mute = _env("WAKE_WINDOW_MUTE", "1") not in ("0", "false", "False")
     speex_ns = False  # openWakeWord-only; set below when that engine is selected
     extra_log = ""
 
@@ -676,6 +679,7 @@ def build_wake_word_gate(llm):
         + (f" consec={consec_frames}" if consec_frames > 1 else "")
         + (" inflight-guard=on" if guard_inflight else " inflight-guard=off")
         + (f" min-dwell={min_dwell_secs:.1f}s" if min_dwell_secs > 0 else "")
+        + (" window-mute=on" if window_mute else " window-mute=off")
         + (" speex_ns=on" if speex_ns else "")
         + extra_log
         + (f" debug=on floor={debug_floor}" if debug else "")
@@ -697,6 +701,7 @@ def build_wake_word_gate(llm):
         consec_frames=consec_frames,
         guard_inflight=guard_inflight,
         min_dwell_secs=min_dwell_secs,
+        window_mute=window_mute,
     )
 
 

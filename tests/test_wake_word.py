@@ -41,6 +41,28 @@ def test_wake_opens_and_preducks():
     assert client.duck_calls == [("sess-test", True)]  # pre-duck fired on wake
 
 
+def test_wake_window_mutes_media_by_default():
+    # On wake-window-open the gate sends /media/duck {mute:true} → full 0% for the command window.
+    client = FakeBrainClient()
+    g = _gate(client)
+    g._oww.score = 0.9
+
+    asyncio.run(g._feed(_CHUNK))
+    assert g._open is True
+    assert client.duck_mute_calls == [("sess-test", True, True)]  # on=True, mute=True
+
+
+def test_wake_window_mute_off_when_disabled():
+    # WAKE_WINDOW_MUTE off → a plain pre-duck (mute=False), not a full mute.
+    client = FakeBrainClient()
+    g = _gate(client, window_mute=False)
+    g._oww.score = 0.9
+
+    asyncio.run(g._feed(_CHUNK))
+    assert g._open is True
+    assert client.duck_mute_calls == [("sess-test", True, False)]
+
+
 def test_no_wake_stays_closed():
     client = FakeBrainClient()
     g = _gate(client)

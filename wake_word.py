@@ -83,6 +83,7 @@ class WakeWordGate(FrameProcessor):
         consec_frames: int = 1,
         guard_inflight: bool = True,
         min_dwell_secs: float = 2.0,
+        window_mute: bool = True,
         time_source: Callable[[], float] | None = None,
         **kwargs,
     ):
@@ -132,6 +133,11 @@ class WakeWordGate(FrameProcessor):
         self._gated_committed: bool | None = None  # effective (debounced) gating state; None until 1st frame
         self._gated_pending: bool | None = None     # a raw decision awaiting the dwell to elapse
         self._gated_pending_since = 0.0
+
+        # When the wake/command window opens, send /media/duck {mute:true} so media drops to a full 0%
+        # (not just a partial duck) for the window → no music vocal bleeds into the command's STT. The
+        # plain speech-duck (brains/media_duck) stays mute:false. Env: WAKE_WINDOW_MUTE (default on).
+        self._window_mute = window_mute
 
         self._buf = bytearray()
         self._open = False
@@ -386,10 +392,12 @@ class WakeWordGate(FrameProcessor):
             return
         self._ducked = on
 
+        mute = on and self._window_mute  # full-mute the window on open; restore is a plain on=False
+
         async def _go():
             try:
-                await self._client.duck(self._session_id, on)
+                await self._client.duck(self._session_id, on, mute=mute)
             except Exception as e:  # noqa: BLE001 - media control must never break audio
-                _tlog(f"WAKE  | duck on={on} FAILED: {type(e).__name__}: {e}")
+                _tlog(f"WAKE  | duck on={on} mute={mute} FAILED: {type(e).__name__}: {e}")
 
         asyncio.create_task(_go())
