@@ -2,7 +2,10 @@
 name = "voice-agent"
 version = "0.1.0"
 description = "Real-time spoken assistant for Claude (Pipecat, local-first, tool-enabled)"
-requires-python = ">=3.12,<3.13"
+# 3.13 OK: torch/onnxruntime/ctranslate2 all ship cp313 wheels. The old <3.13 cap was solely
+# `speexdsp-ns` (cp312-only wheel) — now an optional [speex] extra (off-by-default feature, graceful
+# fallback). 3.14 resolves too but is unverified; revisit the cap once 3.14 is install-tested.
+requires-python = ">=3.12,<3.14"
 
 # Pipecat is PINNED so the local-fork escape hatch below has a stable base and the
 # SmartTurn V2->V3 / extras-rename drift can't recur silently. Bump deliberately.
@@ -13,7 +16,6 @@ dependencies = [
     "loguru",
     "websockets>=13.1,<16.0",  # relaxed from >=16.0 (vestigial — nothing imports it) for pipecat-ai-tail compat
     "openwakeword>=0.4.0",
-    "speexdsp-ns>=0.1.2",
     "nanowakeword>=2.1.3",  # alt wake engine (WAKE_WORD_ENGINE=nano); durable wake-over-music model
     "pvporcupine>=4.0.0",   # alt wake engine (WAKE_WORD_ENGINE=porcupine); instant robust custom keyword
     "pipecat-ai-tail>=0.0.5",
@@ -25,6 +27,12 @@ dependencies = [
 # (it just points an OpenAI-compatible client at the Ollama base_url).
 swap = [
     "pipecat-ai[openai]==1.3.0",
+]
+# Speex noise suppression (openWakeWord pre-filter). OFF by default in code (WAKE_WORD_SPEEX_NS=1 to
+# enable; config.py falls back gracefully if absent). Its only wheel is cp312 → kept OUT of core so the
+# project isn't pinned to 3.12. Install with `uv sync --extra speex` on 3.12 (builds from sdist elsewhere).
+speex = [
+    "speexdsp-ns>=0.1.2",
 ]
 
 [dependency-groups]

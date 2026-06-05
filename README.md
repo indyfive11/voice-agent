@@ -35,11 +35,16 @@ Everything is selected by environment variables — see [`.env.example`](.env.ex
 
 ## Quick start
 
-Requires **Python 3.12** (via [`uv`](https://github.com/astral-sh/uv)), system `portaudio` and
-`espeak-ng`, and an `ANTHROPIC_API_KEY` for the default brain.
+Requires **Python 3.12 or 3.13** (provisioned automatically by [`uv`](https://github.com/astral-sh/uv)) and
+system `portaudio` + `espeak-ng`. The **brain is pluggable**, so the API-key requirement depends on which one
+you run:
+
+- **Default** (`BRAIN=local`, `LLM_PROVIDER=anthropic`) → needs `ANTHROPIC_API_KEY`.
+- **Fully local** (`BRAIN=local`, `LLM_PROVIDER=ollama`) → no cloud key.
+- **External brain** (`BRAIN=gabagent`) → the brain owns cognition; the voice shell needs **no LLM key at all**.
 
 ```bash
-cp .env.example .env        # set ANTHROPIC_API_KEY, then pick STT / TTS / LLM / brain
+cp .env.example .env        # pick STT / TTS / LLM / brain (+ a key only if your brain needs one)
 uv sync
 ./run.sh                    # or: uv run python main.py
 ```
