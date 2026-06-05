@@ -42,6 +42,7 @@ from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
 from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
 from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.frames.frames import LLMRunFrame
+from pipecat.observers.loggers.metrics_log_observer import MetricsLogObserver
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 from pipecat.processors.aggregators.llm_context import LLMContext
@@ -54,6 +55,7 @@ from pipecat.turns.user_start import MinWordsUserTurnStartStrategy
 from pipecat.turns.user_stop import TurnAnalyzerUserTurnStopStrategy
 
 from turn_cap import MaxTurnDurationUserTurnStopStrategy
+from response_latency import ResponseLatencyObserver
 from pipecat.turns.user_turn_strategies import (
     UserTurnStrategies,
     default_user_turn_start_strategies,
@@ -281,10 +283,33 @@ async def run() -> None:
         ]
     )
 
+    # Instrumentation (PIPELINE_OBSERVERS=1 default; 0 to silence) — stops the live-test log-grep loop.
+    # MetricsLogObserver = per-service TTFB/usage; ResponseLatencyObserver = real user-perceived latency
+    # (user-stop → bot-start). The on_turn_ended handler below logs the conversation-turn SPAN (which
+    # includes idle/false-starts — NOT latency; labeled "span" so a big number doesn't read as a hang)
+    # plus the was_interrupted half-duplex signal. All already in pipecat 1.3.0.
+    observe = os.environ.get("PIPELINE_OBSERVERS", "1") not in ("0", "false", "False")
+    _observers = [MetricsLogObserver(), ResponseLatencyObserver()] if observe else []
+    # Tail (PIPELINE_TAIL=1) — live terminal dashboard: binds a ws server on :9292; run `pipecat tail`
+    # in a second terminal to view logs/transcript/audio-levels/metrics. Off by default (binds a port).
+    if os.environ.get("PIPELINE_TAIL", "0") not in ("0", "false", "False"):
+        from pipecat_tail.observer import TailObserver  # lazy: pulls textual/plotext only when enabled
+        _observers.append(TailObserver())
+        logger.info("Tail observer on ws://localhost:9292 — run `pipecat tail` in another terminal.")
     worker = PipelineWorker(
         pipeline,
         params=PipelineParams(enable_metrics=True, enable_usage_metrics=True),
+        observers=_observers,
     )
+    if observe and worker.turn_tracking_observer:
+        @worker.turn_tracking_observer.event_handler("on_turn_ended")
+        async def _on_turn_ended(_obs, turn_count, duration, was_interrupted):  # noqa: ANN001
+            # `duration` is the conversation-turn SPAN (incl. idle + transcript-less false-starts), not
+            # latency — see RESPONSE | … for the real response time.
+            logger.bind(transcript=True).info(
+                f"TURN  | #{turn_count} span={duration:.2f}s"
+                + (" INTERRUPTED" if was_interrupted else "")
+            )
 
     # Optional spoken greeting on start (confirms the TTS path end-to-end). GREET_ON_START=0
     # to disable. Uses a transient developer message — only meaningful for a raw-LLM brain;
