@@ -134,6 +134,12 @@ async def run() -> None:
     _setup_logging()
     _check_runtime_env()
 
+    # On a cold boot/login WirePlumber brings the AEC echo-cancel mic up asynchronously, so it may
+    # not be in the PipeWire graph yet. Wait for it here (owns the device contract; lets the autostart
+    # wrapper stay "wait for PipeWire, exec") before enumerating — on timeout we fall over to the default
+    # mic, which build_transport's name-resolve does for us. Runtime AEC death is input_watchdog's job.
+    await config.wait_for_aec_mic()
+
     # Enumerate audio devices so the chosen mic/speaker indices are visible in the log.
     config.list_audio_devices()
 

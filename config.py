@@ -313,6 +313,76 @@ def _supported_input_rate(index: int | None, prefer: int = PIPELINE_AUDIO_RATE) 
         pa.terminate()
 
 
+async def wait_for_input_device(name: str | None, *, timeout: float, poll: float = 1.0) -> bool:
+    """Block startup until an input device whose name contains `name` is enumerable, or `timeout` elapses.
+
+    The AEC mic (`echo-cancel-source`, matched by AUDIO_INPUT_DEVICE_NAME, e.g. "AEC Mic") is created
+    *asynchronously* by WirePlumber — on a cold boot/login it often isn't in the graph yet when we start.
+    Plain systemd ordering can't see it (it's a PipeWire node, not a unit), so the boot-readiness wait
+    belongs HERE, in the code that knows the device contract, rather than in a launch wrapper. Runtime
+    death/recreation of the source is a separate concern already owned by input_watchdog.py; this is only
+    the one-time cold-start wait.
+
+    PortAudio snapshots the device list at init, so each poll uses a FRESH PyAudio instance to pick up a
+    node that appeared after the previous check. Returns True as soon as a matching input device is present;
+    False on timeout — the caller then falls through to build_transport, whose name-resolve simply misses and
+    uses the OS default (the same graceful fail-over to the default mic the wrapper used to do, logged here).
+
+    No-ops (returns True) when `name` is unset (nothing to wait for), `timeout` <= 0 (disabled), or PyAudio
+    can't be imported (can't probe → don't block startup).
+    """
+    if not name or timeout <= 0:
+        return True
+    try:
+        import pyaudio
+    except Exception as e:  # pragma: no cover - diagnostic only
+        logger.warning(f"AEC-mic wait: PyAudio unavailable ({e}); skipping readiness wait.")
+        return True
+
+    import asyncio
+    import time
+
+    nlow = name.lower()
+
+    def _present() -> bool:
+        pa = pyaudio.PyAudio()
+        try:
+            for i in range(pa.get_device_count()):
+                d = pa.get_device_info_by_index(i)
+                if (d.get("maxInputChannels") or 0) > 0 and nlow in str(d.get("name", "")).lower():
+                    return True
+        finally:
+            pa.terminate()
+        return False
+
+    if _present():
+        return True
+    logger.info(f"AEC-mic wait: input device ~={name!r} not present yet — waiting up to {timeout:.0f}s …")
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        await asyncio.sleep(poll)
+        if _present():
+            logger.info(f"AEC-mic wait: input device ~={name!r} is now present.")
+            return True
+    logger.warning(
+        f"AEC-mic wait: input device ~={name!r} did not appear within {timeout:.0f}s — falling over to "
+        f"the system default mic (degraded; no echo cancellation until the AEC source returns)."
+    )
+    return False
+
+
+async def wait_for_aec_mic() -> bool:
+    """Env-driven boot wait for the AEC mic (entrypoint for main.py). Reads AUDIO_INPUT_* + AUDIO_INPUT_WAIT_SECS.
+
+    No wait when the input is pinned by numeric index (AUDIO_INPUT_DEVICE_INDEX) — there's no name to poll for.
+    Otherwise wait for AUDIO_INPUT_DEVICE_NAME up to AUDIO_INPUT_WAIT_SECS (default 60s; 0 disables the wait).
+    """
+    if _env_int("AUDIO_INPUT_DEVICE_INDEX") is not None:
+        return True
+    timeout = float(_env("AUDIO_INPUT_WAIT_SECS", "60") or 60)
+    return await wait_for_input_device(_env("AUDIO_INPUT_DEVICE_NAME"), timeout=timeout)
+
+
 def build_transport():
     """LocalAudioTransport bound to the mic/speaker (PipeWire via PyAudio).
 
