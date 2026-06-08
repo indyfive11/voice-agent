@@ -160,6 +160,24 @@ def test_always_gated_when_not_media_only():
     assert asyncio.run(g._gated_now()) is True
 
 
+def test_force_gated_while_asleep_overrides_media_state():
+    # While asleep the gate is FORCED active even with nothing playing, so ambient TV never reaches STT
+    # and only an acoustic "hey aria" can wake her. A WakeSleepFrame(asleep=True) flips it; (False) clears.
+    from pipecat.processors.frame_processor import FrameDirection
+    from wake_word import WakeSleepFrame
+
+    g = _gate(media_only=True, media_status=lambda: {"playing": False, "kind": None})
+    assert asyncio.run(g._gated_now()) is False                  # quiet room → open mic normally
+
+    asyncio.run(g.process_frame(WakeSleepFrame(asleep=True), FrameDirection.UPSTREAM))
+    assert g._force_gated is True
+    assert asyncio.run(g._gated_now()) is True                   # forced gated despite nothing playing
+
+    asyncio.run(g.process_frame(WakeSleepFrame(asleep=False), FrameDirection.UPSTREAM))
+    assert g._force_gated is False
+    assert asyncio.run(g._gated_now()) is False                  # awake → media-aware gating restored
+
+
 def test_escape_hatch_opens_after_repeated_near_misses():
     # Over loud media the weak model peaks 0.22-0.43 (< threshold) — the user is clearly trying but
     # locked out. After escape_count sub-threshold bursts the gate must open anyway.

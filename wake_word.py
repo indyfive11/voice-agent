@@ -55,6 +55,17 @@ class WakeHoldFrame(SystemFrame):
     hold: bool = True
 
 
+@dataclass
+class WakeSleepFrame(SystemFrame):
+    """Pushed UPSTREAM by the brain when its sleep state changes. While asleep the gate is FORCED active
+    (mic muted, wake word required) regardless of media, so ambient TV/movie audio never reaches STT and
+    only an acoustic wake ("hey aria") can wake her — closing the text-match false-wake hole where a movie
+    line like "we can wake up very early" woke her. No-op when no gate is present. SystemFrame so it
+    propagates promptly regardless of queueing."""
+
+    asleep: bool = False
+
+
 def _tlog(message: str) -> None:
     """One line to the transcript log (greppable alongside USER/BOT/DUCK/WAKE)."""
     logger.bind(transcript=True).info(message)
@@ -144,6 +155,9 @@ class WakeWordGate(FrameProcessor):
         self._last_gated: bool | None = None  # last gate decision (for debug transition logging)
         self._hb_peak = 0.0  # max wake score since the last heartbeat (lockout-vs-freeze diagnosis)
         self._hold = False  # brain holds the window open while a confirm is pending (WakeHoldFrame)
+        # While the brain is asleep, force the gate active (require an acoustic wake) regardless of media,
+        # so ambient TV never reaches STT and only "hey aria" can wake her (WakeSleepFrame). See _gated_now.
+        self._force_gated = False
         self._last_wake = 0.0
         self._ducked = False
         self._window_task: asyncio.Task | None = None
@@ -183,6 +197,18 @@ class WakeWordGate(FrameProcessor):
         # Confirm pending (from the brain): hold the window open so the yes/no answer needs no re-wake.
         if isinstance(frame, WakeHoldFrame):
             self._set_hold(frame.hold)
+            await self.push_frame(frame, direction)
+            return
+
+        # Sleep state (from the brain): while asleep, force acoustic gating regardless of media so STT
+        # never runs on ambient TV and only "hey aria" can wake her (see _gated_now / _force_gated).
+        if isinstance(frame, WakeSleepFrame):
+            self._force_gated = frame.asleep
+            if self._debug:
+                _tlog(
+                    "GATE  | asleep — forcing wake-word gate active (acoustic wake only)" if frame.asleep
+                    else "GATE  | awake — restoring media-aware gating"
+                )
             await self.push_frame(frame, direction)
             return
 
@@ -254,6 +280,8 @@ class WakeWordGate(FrameProcessor):
     async def _gated_now(self) -> bool:
         """True when the wake word is currently required (always, or — media_only — while media plays).
         Active *video* is not gated (unless gate_video): the user is watching it and can pause by hand."""
+        if self._force_gated:
+            return True  # brain is asleep → require an acoustic wake regardless of media state
         if not self._media_only:
             return True
         st = self._media_status()

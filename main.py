@@ -55,6 +55,7 @@ from pipecat.turns.user_start import MinWordsUserTurnStartStrategy
 from pipecat.turns.user_stop import TurnAnalyzerUserTurnStopStrategy
 
 from turn_cap import MaxTurnDurationUserTurnStopStrategy
+from turn_mute import BotThinkingMuteStrategy
 from response_latency import ResponseLatencyObserver
 from tts_gain import TTSGainProcessor
 from pipecat.turns.user_turn_strategies import (
@@ -181,10 +182,20 @@ async def run() -> None:
     # the cost of barge-in. Default ON (works on speakers); set HALF_DUPLEX=0 with headphones
     # or a PipeWire echo-cancel source to restore full-duplex barge-in.
     half_duplex = os.environ.get("HALF_DUPLEX", "1") not in ("0", "false", "False")
+    # AlwaysUserMuteStrategy only mutes while the bot is *speaking* — it leaves the brain's "thinking"
+    # gap (turn opened, no audio yet) unmuted, so a stray VAD onset there cancels the silent in-flight
+    # turn (the 91% empty `said so far: ''` barge-ins on the higher-latency Claude backend). Add a second
+    # strategy that also mutes through that gap (the aggregator OR-combines them). Half-duplex only — it's
+    # the "no barge-in" mode anyway; default on, MUTE_DURING_THINKING=0 reverts to speaking-only muting.
+    mute_during_thinking = half_duplex and os.environ.get(
+        "MUTE_DURING_THINKING", "1"
+    ) not in ("0", "false", "False")
     logger.info(
         "Turn-taking: "
         + ("half-duplex — mic muted while speaking, no barge-in (HALF_DUPLEX=0 for barge-in)"
            if half_duplex else "full-duplex — barge-in on (needs headphones or echo-cancel)")
+        + (" + muting through the brain's thinking gap (MUTE_DURING_THINKING=0 to disable)"
+           if mute_during_thinking else "")
     )
     # Turn-detection tuning. TWO distinct `stop_secs` knobs — don't conflate them:
     #   * VAD `stop_secs` — silence before the VAD says "user stopped", which *triggers*
@@ -243,7 +254,10 @@ async def run() -> None:
                     stop_secs=vad_stop_secs,
                 ),
             ),
-            user_mute_strategies=[AlwaysUserMuteStrategy()] if half_duplex else [],
+            user_mute_strategies=(
+                [AlwaysUserMuteStrategy()]
+                + ([BotThinkingMuteStrategy()] if mute_during_thinking else [])
+            ) if half_duplex else [],
             user_turn_strategies=UserTurnStrategies(
                 start=start_strategies,
                 stop=[
@@ -263,6 +277,10 @@ async def run() -> None:
     # Wake-word gate (opt-in via WAKE_WORD) sits before STT — while media plays it requires the wake
     # word before audio reaches STT (sidesteps STT-over-music) and pre-ducks on wake. None when unset.
     wake_gate = config.build_wake_word_gate(llm)
+    # Tell the brain whether an acoustic gate exists: with one, going to sleep forces it active so only
+    # "hey aria" can wake her (no STT on ambient TV); without one, sleep falls back to text-phrase wake.
+    if hasattr(llm, "set_acoustic_wake_gated"):
+        llm.set_acoustic_wake_gated(wake_gate is not None)
 
     # Input-stall watchdog: best-effort recovery for a frozen/silent mic capture. The restart "kicks"
     # the PortAudio stream in place (stop→start) — the least-invasive revive that doesn't tear down the

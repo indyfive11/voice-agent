@@ -655,6 +655,115 @@ def test_barge_in_cancels_and_closes_stream():
     assert client.closed is False  # client/subprocess stay up for the next turn
 
 
+# --- P1: mute through the brain's "thinking" gap (empty-barge-in fix) -----------------
+from pipecat.frames.frames import LLMContextFrame  # noqa: E402
+from pipecat.processors.frame_processor import FrameDirection  # noqa: E402
+from turn_mute import BotThinkingFrame  # noqa: E402
+
+
+def _thinking(frames):
+    return [f.active for f in frames if isinstance(f, BotThinkingFrame)]
+
+
+def test_thinking_frame_brackets_a_normal_turn():
+    # The bot turn must be bracketed by BotThinkingFrame(True) … (False), with True pushed BEFORE any
+    # spoken text (so the user is muted through the first-token gap) and False after — covering the
+    # whole turn for BotThinkingMuteStrategy.
+    client = FakeBrainClient(respond_events=[BrainEvent("token", text="Hi "), BrainEvent("done")])
+    svc, pushed = _service_with_recorder(client)
+    asyncio.run(svc.process_frame(LLMContextFrame(_ctx("hello")), FrameDirection.DOWNSTREAM))
+    assert _thinking(pushed) == [True, False]
+    # active=True is emitted before the first LLMTextFrame.
+    kinds = [type(f).__name__ for f in pushed]
+    assert kinds.index("BotThinkingFrame") < kinds.index("LLMTextFrame")
+
+
+def test_thinking_frame_cleared_on_barge_in():
+    # On a barge-in (CancelledError mid-stream) the finally must still push BotThinkingFrame(False), or
+    # the user would stay muted forever after an interrupted turn.
+    client = FakeBrainClient(
+        respond_events=[BrainEvent("token", text=f"c{i} ") for i in range(20)], delay=0.02,
+    )
+    svc, pushed = _service_with_recorder(client)
+
+    async def run_and_cancel():
+        task = asyncio.create_task(
+            svc.process_frame(LLMContextFrame(_ctx("tell me a story")), FrameDirection.DOWNSTREAM)
+        )
+        await asyncio.sleep(0.05)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(run_and_cancel())
+    assert _thinking(pushed)[-1] is False           # released despite the cancel
+    assert _thinking(pushed).count(True) == _thinking(pushed).count(False)
+
+
+def test_thinking_frame_cleared_when_turn_speaks_nothing():
+    # An empty/sleep/skip turn that never produces a token must still release the mute (True then False).
+    client = FakeBrainClient(respond_events=[BrainEvent("token", text="x"), BrainEvent("done")])
+    svc, pushed = _service_with_recorder(client)
+    asyncio.run(svc.process_frame(LLMContextFrame(_ctx("   ")), FrameDirection.DOWNSTREAM))
+    assert _thinking(pushed) == [True, False]
+    assert _texts(pushed) == []                      # nothing spoken, but mute still cleared
+    assert client.respond_calls == []                # empty turn never hit the brain
+
+
+# --- P2: acoustic-wake-while-asleep (WakeSleepFrame + gate force) ----------------------
+def _sleep_frames(frames):
+    from wake_word import WakeSleepFrame
+    return [f.asleep for f in frames if isinstance(f, WakeSleepFrame)]
+
+
+def test_going_to_sleep_forces_the_gate():
+    # Entering sleep must push WakeSleepFrame(asleep=True) UPSTREAM so the gate forces acoustic gating.
+    client = FakeBrainClient(respond_events=[BrainEvent("token", text="Hi!"), BrainEvent("done")])
+    svc, pushed = _service_with_recorder(client)
+    asyncio.run(svc._process_context(_ctx("go to sleep please")))
+    assert svc._sleeping is True
+    assert _sleep_frames(pushed) == [True]
+
+
+def test_acoustic_gated_wakes_on_any_transcript():
+    # With an upstream gate, ANY transcript arriving while asleep means "hey aria" already fired → wake
+    # (no text match needed); waking releases the gate force via WakeSleepFrame(asleep=False).
+    client = FakeBrainClient(respond_events=[BrainEvent("token", text="Hi!"), BrainEvent("done")])
+    svc, pushed = _service_with_recorder(client)
+    svc.set_acoustic_wake_gated(True)
+
+    asyncio.run(svc._process_context(_ctx("go to sleep")))
+    assert svc._sleeping is True
+
+    pushed.clear()
+    # A bare command (no wake phrase) wakes her, because the gate only lets sound through after "hey aria".
+    asyncio.run(svc._process_context(_ctx("what time is it")))
+    assert svc._sleeping is False
+    assert _sleep_frames(pushed) == [False]
+    assert "awake" in " ".join(_texts(pushed)).lower()
+    assert client.respond_calls == []                # the wake turn itself doesn't hit the brain
+
+
+def test_gateless_fallback_uses_text_match():
+    # Without a gate (_acoustic_wake_gated stays False), sleep falls back to the text wake-phrase match:
+    # a non-wake transcript is ignored; a wake phrase wakes. (This is the degraded, gate-less mode where a
+    # movie "wake up" line could still trip it — which is exactly why the gated path above is preferred.)
+    client = FakeBrainClient(respond_events=[BrainEvent("token", text="Hi!"), BrainEvent("done")])
+    svc, pushed = _service_with_recorder(client)
+    asyncio.run(svc._process_context(_ctx("go to sleep")))
+
+    pushed.clear()
+    asyncio.run(svc._process_context(_ctx("what time is it")))   # no wake phrase → ignored
+    assert svc._sleeping is True
+    assert _texts(pushed) == []
+
+    pushed.clear()
+    asyncio.run(svc._process_context(_ctx("we can wake up very early")))  # movie line trips the fallback
+    assert svc._sleeping is False                                          # (the bug the gate prevents)
+
+
 def test_keyboard_confirm_resolves_in_turn():
     client = FakeBrainClient(
         respond_events=[BrainEvent("confirm", id="k1", tier=3, method="keyboard",

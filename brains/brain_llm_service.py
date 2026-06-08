@@ -106,8 +106,18 @@ class BrainLLMService(LLMService):
         self._pending_confirm: dict | None = None  # {"id":…, "method":…}
         self._reply_buf: list[str] = []  # accumulates this turn's spoken text (transcript log)
         self._sleeping = False  # when True, ignore all input except a wake phrase
+        # Whether an acoustic wake-word gate sits upstream (set by main.py once the gate is built). When
+        # True, going to sleep forces that gate active so ambient TV never reaches STT and ANY transcript
+        # arriving while asleep means "hey aria" already fired → wake. When False (no gate), fall back to
+        # the text-phrase wake match (which a movie line can still trip — the degraded, gate-less mode).
+        self._acoustic_wake_gated = False
         # Log the correlation key so the transcript can be lined up with the brain's own logs.
         _tlog(f"BRAIN | gabagent session_id={self._session_id}")
+
+    def set_acoustic_wake_gated(self, gated: bool) -> None:
+        """Tell the brain whether an upstream wake-word gate exists (called from main.py after the gate is
+        built). Drives acoustic-only wake-from-sleep vs the text-phrase fallback."""
+        self._acoustic_wake_gated = gated
 
     @property
     def brain_client(self):
@@ -131,11 +141,16 @@ class BrainLLMService(LLMService):
         if isinstance(frame, LLMContextFrame):
             try:
                 await self.push_frame(LLMFullResponseStartFrame())
+                # Mute the user through the whole bot turn (not just while speaking): a SystemFrame
+                # pushed UPSTREAM that BotThinkingMuteStrategy honors, closing the first-token latency
+                # gap where an empty barge-in cancels the silent in-flight turn. Released in `finally`.
+                await self._set_thinking(True)
                 await self.start_processing_metrics()
                 await self._process_context(frame.context)
             except Exception as e:  # noqa: BLE001 - surface as a pipeline error frame
                 await self.push_error(error_msg=f"Brain error: {e}", exception=e)
             finally:
+                await self._set_thinking(False)
                 await self.stop_processing_metrics()
                 await self.push_frame(LLMFullResponseEndFrame())
         else:
@@ -161,6 +176,21 @@ class BrainLLMService(LLMService):
         from wake_word import WakeHoldFrame
 
         await self.push_frame(WakeHoldFrame(hold=hold), FrameDirection.UPSTREAM)
+
+    async def _set_thinking(self, active: bool) -> None:
+        """Bracket the bot turn for the user-mute strategy: push BotThinkingFrame UPSTREAM so the user is
+        muted from turn start (before any TTS) until it ends. No-op effect when the strategy isn't wired
+        (full-duplex / MUTE_DURING_THINKING=0); the frame just flows to the transport."""
+        from turn_mute import BotThinkingFrame
+
+        await self.push_frame(BotThinkingFrame(active=active), FrameDirection.UPSTREAM)
+
+    async def _set_sleep_gate(self, asleep: bool) -> None:
+        """Tell the wake gate the sleep state changed: while asleep it forces acoustic gating (mic muted,
+        STT starved on ambient TV). Pushed UPSTREAM; no-op when no gate is present (frame flows on)."""
+        from wake_word import WakeSleepFrame
+
+        await self.push_frame(WakeSleepFrame(asleep=asleep), FrameDirection.UPSTREAM)
 
     async def _process_context(self, context):
         user_text = self._latest_user_text(context)
@@ -189,11 +219,15 @@ class BrainLLMService(LLMService):
                 await self.push_frame(EndTaskFrame(), FrameDirection.UPSTREAM)
                 return
 
-            # --- sleep/wake gate (the mic stays on; while asleep we ignore all but a wake
-            # phrase, and never call the brain). This is the real "stop listening" control.
+            # --- sleep/wake gate. When an acoustic wake gate is upstream (the normal config), going to
+            # sleep FORCES it active, so ambient TV never reaches STT and a transcript can only arrive
+            # here if "hey aria" already fired — so ANY transcript while asleep is the wake (no text
+            # match against TV dialogue, which used to false-wake on lines like "we can wake up early").
+            # Without a gate we degrade to the old text-phrase match. This is the real "stop listening".
             if self._sleeping:
-                if any(p in low_norm for p in _WAKE_PHRASES):
+                if self._acoustic_wake_gated or any(p in low_norm for p in _WAKE_PHRASES):
                     self._sleeping = False
+                    await self._set_sleep_gate(False)
                     _tlog(f"WAKE  | {user_text!r}")
                     await self._speak("I'm awake. What do you need?")
                 else:
@@ -201,6 +235,7 @@ class BrainLLMService(LLMService):
                 return
             if not is_meta and any(p in low_norm for p in _SLEEP_PHRASES):
                 self._sleeping = True
+                await self._set_sleep_gate(True)
                 _tlog(f"SLEEP | {user_text!r}")
                 await self._speak("Going to sleep. Say 'wake up' when you need me.")
                 return
