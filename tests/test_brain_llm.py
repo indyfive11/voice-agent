@@ -280,6 +280,58 @@ def test_bare_shutdown_passes_through_to_brain():
     assert not any(isinstance(f, EndTaskFrame) for f in pushed)
 
 
+def test_dictation_blob_does_not_shut_down():
+    # Live leak (2026-06-10, session ffa503ef): the maintainer dictated "Dictating. The last time we told you...
+    # shut down voice mode" — narration swept into one 15s runaway-turn blob whose tail hit the shutdown
+    # gate and KILLED the session. The dictation-lead guard (and the standalone guard) must let it reach
+    # the brain as an ordinary turn instead of exiting.
+    from pipecat.frames.frames import EndTaskFrame
+
+    client = FakeBrainClient(respond_events=[BrainEvent("token", text="Noted."), BrainEvent("done")])
+    svc, pushed = _service_with_recorder(client)
+    text = "Dictating. The last time we told you to shut down voice mode."
+    asyncio.run(svc._process_context(_ctx(text)))
+    assert not any(isinstance(f, EndTaskFrame) for f in pushed)   # session survives
+    assert client.respond_calls == [("sess-test", text)]          # narration reaches the brain
+
+
+def test_buried_shutdown_phrase_does_not_fire_without_label():
+    # Even WITHOUT a dictation self-label, a shutdown phrase buried at the end of a long blob (the
+    # runaway-turn signature) must not exit — the standalone guard blocks it on residual length alone.
+    from pipecat.frames.frames import EndTaskFrame
+
+    client = FakeBrainClient(respond_events=[BrainEvent("token", text="Sure."), BrainEvent("done")])
+    svc, pushed = _service_with_recorder(client)
+    text = "earlier we were chatting about whether the kids should shut down voice mode"
+    asyncio.run(svc._process_context(_ctx(text)))
+    assert not any(isinstance(f, EndTaskFrame) for f in pushed)
+    assert client.respond_calls == [("sess-test", text)]
+
+
+def test_dictation_blob_does_not_sleep():
+    # Same narration guard protects the sleep gate: "Just dictating — go to sleep was what I said" must
+    # not actually put her to sleep.
+    client = FakeBrainClient(respond_events=[BrainEvent("token", text="Noted."), BrainEvent("done")])
+    svc, pushed = _service_with_recorder(client)
+    asyncio.run(svc._process_context(_ctx("Just dictating, go to sleep was the phrase we used earlier")))
+    assert svc._sleeping is False
+    assert client.respond_calls and "go to sleep" in client.respond_calls[0][1].lower()
+
+
+def test_deliberate_shutdown_still_fires_with_politeness():
+    # The guards must NOT break a real, deliberate shutdown — a short vocative/polite command reduces to
+    # ~nothing after fillers and still exits cleanly.
+    from pipecat.frames.frames import EndTaskFrame
+
+    for text in ("shut down voice mode", "Aria, shut down voice mode please",
+                 "okay please shut down voice mode now"):
+        client = FakeBrainClient(respond_events=[BrainEvent("token", text="Hi!"), BrainEvent("done")])
+        svc, pushed = _service_with_recorder(client)
+        asyncio.run(svc._process_context(_ctx(text)))
+        assert client.respond_calls == [], f"reached brain for {text!r}"
+        assert any(isinstance(f, EndTaskFrame) for f in pushed), f"no shutdown for {text!r}"
+
+
 def test_confirm_prompt_is_complete_spoken_verbatim():
     # prompt_is_complete → summary is the whole line (own yes/no), append nothing.
     line = "Play The Matrix on your open Chrome? Say yes to play there, or no to open a new window."

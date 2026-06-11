@@ -15,6 +15,7 @@ whose continuation is streamed normally.
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import shutil
 import uuid
@@ -79,6 +80,48 @@ _META_COMMAND_MARKERS = (
     "the command to", "the command for", "which command", "what command",
     "do you know how", "how do i", "how do you", "how can i", "how would i",
 )
+
+# The user is NARRATING, not commanding — a self-labelled dictation/aside. Live (2026-06-10) the maintainer
+# dictated "Dictating. The last time we told you… shut down voice mode" and the trailing phrase, swept
+# into one 15s runaway-turn blob, hit the shutdown gate and killed the session. The brain's intent
+# filter classified the same utterance as an aside (no action), but the destructive gates run here,
+# ahead of /respond, so they need their own narration guard. Markers checked against the leading clause.
+_DICTATION_MARKERS = (
+    "dictating", "just dictating", "dictation", "note for", "note to",
+    "for the record", "transcribe", "take a note", "you don't need to respond",
+    "no action needed", "don't respond to this", "ignore this",
+)
+
+# Filler/politeness/vocative tokens stripped before measuring how much of an utterance is "left over"
+# around a destructive phrase. A deliberate command ("Aria, shut down voice mode please") reduces to
+# ~nothing; a narration that merely CONTAINS the phrase keeps its content words ("the last time we told").
+_COMMAND_FILLERS = frozenset((
+    "okay", "ok", "alright", "please", "now", "then", "just", "ahead", "yeah", "yep", "yes",
+    "thanks", "thank", "you", "can", "could", "would", "will", "and", "so", "hey", "aria",
+    "the", "a", "to", "for", "me", "us", "it", "um", "uh",
+))
+
+# A destructive phrase buried in a long utterance fires only if the residual (after removing the matched
+# phrase + fillers) is at most this many words. Tunable: raise it to allow wordier commands, lower to be
+# stricter. Default 3 keeps "Aria please shut down voice mode, I'm done" firing while blocking a blob.
+_DESTRUCTIVE_CMD_MAX_RESIDUAL_WORDS = int(os.environ.get("DESTRUCTIVE_CMD_MAX_RESIDUAL_WORDS", "3"))
+
+
+def _matched_phrase(low_norm: str, phrases: tuple[str, ...]) -> str | None:
+    """Return the first control phrase that appears in `low_norm`, else None."""
+    return next((p for p in phrases if p in low_norm), None)
+
+
+def _command_is_standalone(low_norm: str, phrase: str) -> bool:
+    """True when `phrase` is the substance of the utterance, not buried in a longer narration blob.
+
+    Removes the matched phrase, then strips filler/politeness/vocative tokens, and counts what's left.
+    A deliberate destructive command leaves ~nothing; a dictation/runaway blob keeps its content words.
+    Guards the shutdown gate so a phrase swept into a 15s force-completed turn can't kill the session.
+    (Not applied to sleep, whose commands legitimately carry qualifiers — see the call site.)
+    """
+    residual = [w for w in low_norm.replace(phrase, " ").split() if w not in _COMMAND_FILLERS]
+    return len(residual) <= _DESTRUCTIVE_CMD_MAX_RESIDUAL_WORDS
 
 
 def _tlog(message: str) -> None:
@@ -208,12 +251,22 @@ class BrainLLMService(LLMService):
         low_norm = _VOICE_SOUNDALIKE_RE.sub(r"voice \1", low_norm)
         # A question *about* the controls, not a command — don't fire the destructive gates.
         is_meta = any(m in low_norm for m in _META_COMMAND_MARKERS)
+        # NARRATION guard for the destructive gates: a dictation self-label in the leading clause means
+        # the user is narrating, not commanding (the brain's intent filter agrees, but it runs after these
+        # gates). Checked against the first few words so a marker mid-sentence ("…transcribe it") doesn't
+        # over-suppress a real command.
+        lead = " ".join(low_norm.split()[:4])
+        is_dictation = any(m in lead for m in _DICTATION_MARKERS)
         try:
             # --- shutdown: a clean voice exit of the whole agent. Works in any state
             # (even asleep). Speak a goodbye, then request graceful pipeline closure by
             # pushing EndTaskFrame UPSTREAM — the task flushes queued frames (so the
             # goodbye is spoken) then ends; main.py's finally tears the brain down.
-            if not is_meta and any(p in low_norm for p in _SHUTDOWN_PHRASES):
+            # Gated against narration (is_dictation) and against a phrase buried in a longer blob
+            # (_command_is_standalone) so a 15s runaway-turn that merely ENDS with the phrase can't exit.
+            shutdown_phrase = _matched_phrase(low_norm, _SHUTDOWN_PHRASES)
+            if (not is_meta and not is_dictation and shutdown_phrase is not None
+                    and _command_is_standalone(low_norm, shutdown_phrase)):
                 _tlog(f"SHUTDOWN| {user_text!r}")
                 await self._speak("Shutting down voice mode. Goodbye.")
                 await self.push_frame(EndTaskFrame(), FrameDirection.UPSTREAM)
@@ -233,7 +286,11 @@ class BrainLLMService(LLMService):
                 else:
                     _tlog(f"ASLEEP| ignoring: {user_text!r}")
                 return
-            if not is_meta and any(p in low_norm for p in _SLEEP_PHRASES):
+            # Sleep gets only the narration guard (is_dictation), NOT the standalone/residual one:
+            # sleep phrasings legitimately carry qualifiers ("mute voice mode unless I call your name" —
+            # the qualifier is itself a sleep phrase), which a residual-length test would wrongly reject.
+            # A stray sleep is self-correcting (wake up); the session-killing risk was shutdown-only.
+            if not is_meta and not is_dictation and any(p in low_norm for p in _SLEEP_PHRASES):
                 self._sleeping = True
                 await self._set_sleep_gate(True)
                 _tlog(f"SLEEP | {user_text!r}")
