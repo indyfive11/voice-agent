@@ -235,6 +235,14 @@ class BrainLLMService(LLMService):
 
         await self.push_frame(WakeSleepFrame(asleep=asleep), FrameDirection.UPSTREAM)
 
+    async def _release_duck_for_aside(self) -> None:
+        """Tell the media-duck controller (upstream) to drop the VAD-onset pre-duck: this turn was an aside,
+        so no reply is coming and there's nothing to make room for. Pushed UPSTREAM; no-op when no duck
+        controller is present (frame flows on). See DuckReleaseFrame for the contract."""
+        from brains.media_duck import DuckReleaseFrame
+
+        await self.push_frame(DuckReleaseFrame(), FrameDirection.UPSTREAM)
+
     async def _process_context(self, context):
         user_text = self._latest_user_text(context)
         self._reply_buf = []
@@ -383,6 +391,14 @@ class BrainLLMService(LLMService):
                     # more frames and eventually `done` follow on the same stream.
                     _tlog(f"BLOCKED| action={ev.action!r} {ev.reason!r}")
                     await self._speak(ev.reason or "That action is blocked.")
+                elif ev.type == "addressed":
+                    # The brain's intent filter classified this turn as an aside (not addressed to Aria).
+                    # The brain only ever emits this event on suppression, so its ARRIVAL — not the
+                    # `addressed` bool, which a brain-side serializer could drop (False == 0) — is the
+                    # signal. Release the VAD-onset pre-duck now; no reply is coming. NOT a stream
+                    # boundary: keep consuming (a `done` still follows).
+                    _tlog(f"ASIDE | not addressed (addressed={ev.addressed!r}) → release duck")
+                    await self._release_duck_for_aside()
                 elif ev.type == "done":
                     return
         except asyncio.CancelledError:

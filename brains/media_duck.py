@@ -28,6 +28,7 @@ Design (the 2026-06-02 low-latency revision — supersedes the duck-on-confirmed
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 from typing import Callable
 
 from loguru import logger
@@ -37,11 +38,21 @@ from pipecat.frames.frames import (
     BotStoppedSpeakingFrame,
     Frame,
     InterimTranscriptionFrame,
+    SystemFrame,
     TranscriptionFrame,
     VADUserStartedSpeakingFrame,
     VADUserStoppedSpeakingFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+
+
+@dataclass
+class DuckReleaseFrame(SystemFrame):
+    """Pushed UPSTREAM by the brain (BrainLLMService) when it classifies a turn as NOT addressed to Aria
+    (an aside). The VAD-onset pre-duck has already engaged for the utterance — but an aside yields no reply,
+    so there's nothing to make room for. This releases that duck immediately instead of waiting out the
+    idle-restore grace (~8s). A SystemFrame so it reaches this controller through the user aggregator the
+    same way WakeSleepFrame/BotThinkingFrame reach the wake gate."""
 
 
 def _tlog(message: str) -> None:
@@ -127,6 +138,14 @@ class MediaDuckController(FrameProcessor):
             _tlog(f"DUCK  | bot-stopped (ducked={self._ducked})")
             if self._ducked:
                 self._restore("bot-stopped")
+        elif isinstance(frame, DuckReleaseFrame):
+            # Brain says this turn was an aside (not addressed) → no reply is coming. Release the
+            # pre-duck now rather than holding it for the idle grace. Keyed on the frame TYPE, which the
+            # brain only ever sends on suppression (no bool to be dropped by a serializer). Guarded by
+            # `not self._bot_spoke` so a stale aside-verdict can never cut the bed out from under live TTS
+            # (e.g. an aside-then-command race where Aria is already replying).
+            if self._ducked and not self._bot_spoke:
+                self._restore("aside")
 
     def _duck_on(self, reason: str) -> None:
         if not self._should_duck() or self._ducked:

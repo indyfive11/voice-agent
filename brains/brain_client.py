@@ -21,12 +21,18 @@ class BrainEvent:
     """One event from a brain's response/confirm stream.
 
     type:
-      - "token"   : a chunk of assistant text to speak (`text`)
-      - "status"  : optional short narration to speak (`text`)
-      - "confirm" : a gated action awaiting a decision (`id`, `tier`, `method`, `summary`, `reason`)
-      - "blocked" : a refused action to announce (`reason`, `action`)
-      - "error"   : a turn-level failure to speak (`text` speakable, `summary` structured cause)
-      - "done"    : end of this turn
+      - "token"     : a chunk of assistant text to speak (`text`)
+      - "status"    : optional short narration to speak (`text`)
+      - "confirm"   : a gated action awaiting a decision (`id`, `tier`, `method`, `summary`, `reason`)
+      - "blocked"   : a refused action to announce (`reason`, `action`)
+      - "error"     : a turn-level failure to speak (`text` speakable, `summary` structured cause)
+      - "addressed" : the brain's "was this turn addressed to me?" verdict (`addressed`). Emitted by the
+                      brain ONLY on suppression (an aside, `addressed:false`), the instant its intent
+                      classifier returns — before any token/`done`. Lets voice-agent release a media duck
+                      that the VAD-onset pre-duck engaged for an utterance that turns out not to be a
+                      command (no reply → nothing to make room for). `addressed:true` is never emitted, so
+                      the mere ARRIVAL of this event means "not addressed" — see brain_llm_service.
+      - "done"      : end of this turn
     """
 
     type: str
@@ -41,6 +47,10 @@ class BrainEvent:
     # yes/no choice) — speak it verbatim and append no proceed/cancel tail. Omitted (None)
     # = normal Option A: `summary` is a bare action and voice-agent owns the yes/no tail.
     prompt_is_complete: bool | None = None
+    # "addressed" event only: the verdict bool (always False on the wire — the brain emits the event
+    # solely on suppression). Carried for logging; the handler keys on the event TYPE, not this value,
+    # so a brain-side serializer that drops a literal `False` (Python `False == 0`) can't disarm it.
+    addressed: bool | None = None
 
 
 @runtime_checkable

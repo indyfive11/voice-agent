@@ -109,6 +109,48 @@ def test_confirm_pushes_wake_hold_then_release():
     assert holds == [False]
 
 
+def test_addressed_aside_event_pushes_duck_release():
+    # The brain emits an "addressed" event ONLY on suppression (an aside). Its arrival must push a
+    # DuckReleaseFrame upstream so the media-duck controller drops the VAD-onset pre-duck early, and it
+    # must NOT be a stream boundary — the following token/done still flow.
+    from brains.media_duck import DuckReleaseFrame
+
+    client = FakeBrainClient(respond_events=[
+        BrainEvent("addressed", addressed=False),
+        BrainEvent("done"),
+    ])
+    svc, pushed = _service_with_recorder(client)
+    asyncio.run(svc._process_context(_ctx("she's in the back")))
+    assert sum(isinstance(f, DuckReleaseFrame) for f in pushed) == 1
+
+
+def test_addressed_event_keys_on_type_not_bool():
+    # Robustness: the handler keys on the event TYPE, not the `addressed` value — a brain-side serializer
+    # that drops a literal False (Python False == 0) leaves `addressed=None`, and the duck must STILL release.
+    from brains.media_duck import DuckReleaseFrame
+
+    client = FakeBrainClient(respond_events=[
+        BrainEvent("addressed"),  # bool absent on the wire → parsed as None
+        BrainEvent("done"),
+    ])
+    svc, pushed = _service_with_recorder(client)
+    asyncio.run(svc._process_context(_ctx("parks and things every time")))
+    assert sum(isinstance(f, DuckReleaseFrame) for f in pushed) == 1
+
+
+def test_addressed_event_is_not_a_stream_boundary():
+    # An aside that the brain answers anyway (addressed event THEN a token) keeps consuming: the token
+    # after the addressed event must still be spoken.
+    client = FakeBrainClient(respond_events=[
+        BrainEvent("addressed", addressed=False),
+        BrainEvent("token", text="Actually, here you go."),
+        BrainEvent("done"),
+    ])
+    svc, pushed = _service_with_recorder(client)
+    asyncio.run(svc._process_context(_ctx("whatever")))
+    assert _texts(pushed) == ["Actually, here you go."]
+
+
 def test_confirmation_declined():
     # Tier-2 spoken_yesno, declined on the second turn.
     client = FakeBrainClient(
@@ -577,6 +619,59 @@ def test_media_duck_restores_after_speech_stops():
 
     asyncio.run(go())
     assert client.duck_calls == [("sess-test", True), ("sess-test", False)]
+
+
+def test_media_duck_aside_release_restores_immediately():
+    # A1: the brain classifies the turn as an aside → DuckReleaseFrame → restore now, not after the idle
+    # grace. Use a LONG grace so a passing test can only be the aside-release path, not the timer.
+    from brains.media_duck import DuckReleaseFrame
+
+    client = FakeBrainClient()
+    ctl = _duck(client, restore_grace=100.0)
+
+    async def go():
+        ctl._handle(_onset())                              # pre-duck on
+        ctl._handle(_spoken("she's in the back"))          # confirmed words (an aside, but we don't know yet)
+        await asyncio.sleep(0)
+        ctl._handle(_offset())                             # speech stops → idle grace armed (100s)
+        ctl._handle(DuckReleaseFrame())                    # brain: not addressed → release now
+        await asyncio.sleep(0)
+
+    asyncio.run(go())
+    assert client.duck_calls == [("sess-test", True), ("sess-test", False)]
+
+
+def test_media_duck_aside_release_does_not_cut_live_tts():
+    # Guard: a DuckReleaseFrame that arrives while Aria is already speaking (an aside-then-command race,
+    # or a stale verdict) must NOT restore — BotStopped owns the restore in that case.
+    from brains.media_duck import DuckReleaseFrame
+
+    client = FakeBrainClient()
+    ctl = _duck(client)
+
+    async def go():
+        ctl._handle(_onset())                              # pre-duck on
+        ctl._handle(BotStartedSpeakingFrame())             # Aria is replying → _bot_spoke=True
+        ctl._handle(DuckReleaseFrame())                    # stale aside verdict → must be ignored
+        await asyncio.sleep(0)
+
+    asyncio.run(go())
+    assert client.duck_calls == [("sess-test", True)]      # still ducked under live TTS
+
+
+def test_media_duck_aside_release_noop_when_not_ducked():
+    # No duck engaged → a DuckReleaseFrame is a harmless no-op (no spurious /media/duck off).
+    from brains.media_duck import DuckReleaseFrame
+
+    client = FakeBrainClient()
+    ctl = _duck(client)
+
+    async def go():
+        ctl._handle(DuckReleaseFrame())
+        await asyncio.sleep(0)
+
+    asyncio.run(go())
+    assert client.duck_calls == []
 
 
 def test_media_state_debounced_across_rapid_onsets():
