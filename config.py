@@ -688,6 +688,9 @@ def build_wake_word_gate(llm):
     # On wake-window-open, send /media/duck {mute:true} → media to full 0% for the window (vs a partial
     # duck) so no music vocal bleeds into the command's STT. On by default; 0 = plain pre-duck.
     window_mute = _env("WAKE_WINDOW_MUTE", "1") not in ("0", "false", "False")
+    # Release the wake pre-duck after this many seconds if no speech follows the wake (an unused/phantom
+    # wake), instead of holding media ducked for the whole window. Held while the user or Aria is speaking.
+    preduck_grace = float(_env("WAKE_PREDUCK_GRACE", "3.0"))
     speex_ns = False  # openWakeWord-only; set below when that engine is selected
     extra_log = ""
 
@@ -750,6 +753,7 @@ def build_wake_word_gate(llm):
         + (" inflight-guard=on" if guard_inflight else " inflight-guard=off")
         + (f" min-dwell={min_dwell_secs:.1f}s" if min_dwell_secs > 0 else "")
         + (" window-mute=on" if window_mute else " window-mute=off")
+        + (f" preduck-grace={preduck_grace:.1f}s" if preduck_grace > 0 else " preduck-grace=off")
         + (" speex_ns=on" if speex_ns else "")
         + extra_log
         + (f" debug=on floor={debug_floor}" if debug else "")
@@ -772,6 +776,7 @@ def build_wake_word_gate(llm):
         guard_inflight=guard_inflight,
         min_dwell_secs=min_dwell_secs,
         window_mute=window_mute,
+        preduck_grace=preduck_grace,
     )
 
 

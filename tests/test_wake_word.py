@@ -7,6 +7,15 @@ pipeline. asyncio.run drives the async bodies (plain pytest, no pytest-asyncio).
 
 import asyncio
 
+from pipecat.frames.frames import (
+    BotStartedSpeakingFrame,
+    BotStoppedSpeakingFrame,
+    TranscriptionFrame,
+    VADUserStartedSpeakingFrame,
+    VADUserStoppedSpeakingFrame,
+)
+from pipecat.processors.frame_processor import FrameDirection
+
 from brains.brain_client import FakeBrainClient
 from wake_word import WakeWordGate, _CHUNK_BYTES
 
@@ -502,3 +511,95 @@ def test_post_wake_duplicate_labeled_refractory_not_sustain():
     assert len(nearmiss) == 1
     assert "duplicate within refractory" in nearmiss[0]
     assert "didn't sustain" not in nearmiss[0]
+
+
+# --- pre-duck release grace: drop the wake pre-duck if no speech follows ------
+def test_preduck_releases_after_grace_without_speech():
+    # Wake, then no command → the pre-duck releases on the short grace (not held for the whole window),
+    # while the window stays OPEN (still listening for a late command).
+    client = FakeBrainClient()
+    g = _gate(client, window_secs=10.0, preduck_grace=0.02)
+    g._oww.score = 0.9
+
+    async def go():
+        await g._feed(_CHUNK)               # wake → open + pre-duck + arm the release grace
+        assert g._ducked is True
+        await asyncio.sleep(0.06)           # grace elapses with no speech
+
+    asyncio.run(go())
+    assert g._ducked is False               # pre-duck released early
+    assert g._open is True                  # but still listening
+    assert client.duck_calls == [("sess-test", True), ("sess-test", False)]
+
+
+def test_preduck_held_while_user_speaking():
+    # A VAD onset (user is speaking) keeps the pre-duck down past the grace — never restore mid-utterance.
+    client = FakeBrainClient()
+    g = _gate(client, window_secs=10.0, preduck_grace=0.02)
+    g._oww.score = 0.9
+
+    async def go():
+        await g._feed(_CHUNK)
+        await g.process_frame(VADUserStartedSpeakingFrame(), FrameDirection.DOWNSTREAM)
+        await asyncio.sleep(0.06)           # grace passes, but speech is in flight
+
+    asyncio.run(go())
+    assert g._ducked is True
+    assert client.duck_calls == [("sess-test", True)]
+
+
+def test_preduck_cancelled_by_real_command():
+    # A real transcription hands the duck to MediaDuckController → the gate stops its release timer and
+    # the duck is held (media-duck will restore when Aria finishes).
+    client = FakeBrainClient()
+    g = _gate(client, window_secs=10.0, preduck_grace=0.02)
+    g._oww.score = 0.9
+
+    async def go():
+        await g._feed(_CHUNK)
+        await g.process_frame(VADUserStartedSpeakingFrame(), FrameDirection.DOWNSTREAM)
+        await g.process_frame(VADUserStoppedSpeakingFrame(), FrameDirection.DOWNSTREAM)
+        await g.process_frame(TranscriptionFrame("play the movie", "user", "t"), FrameDirection.DOWNSTREAM)
+        await asyncio.sleep(0.06)
+
+    asyncio.run(go())
+    assert g._ducked is True
+    assert client.duck_calls == [("sess-test", True)]
+
+
+def test_preduck_held_while_bot_speaking_then_window_resumes():
+    # While Aria replies the pre-duck stays down AND the idle window is frozen; when she stops, the window
+    # resumes and closes normally (restoring).
+    client = FakeBrainClient()
+    g = _gate(client, window_secs=0.05, preduck_grace=0.02)
+    g._oww.score = 0.9
+
+    async def go():
+        await g._feed(_CHUNK)
+        await g.process_frame(BotStartedSpeakingFrame(), FrameDirection.DOWNSTREAM)
+        await asyncio.sleep(0.09)           # past both the grace and the window
+        assert g._ducked is True            # held — Aria is speaking
+        assert g._open is True              # window frozen, not closed
+        await g.process_frame(BotStoppedSpeakingFrame(), FrameDirection.DOWNSTREAM)
+        await asyncio.sleep(0.09)           # window resumes → closes
+
+    asyncio.run(go())
+    assert g._open is False
+    assert client.duck_calls == [("sess-test", True), ("sess-test", False)]
+
+
+def test_preduck_grace_zero_holds_until_window_close():
+    # preduck_grace=0 → old behaviour: the pre-duck holds for the full command window.
+    client = FakeBrainClient()
+    g = _gate(client, window_secs=0.05, preduck_grace=0.0)
+    g._oww.score = 0.9
+
+    async def go():
+        await g._feed(_CHUNK)
+        await asyncio.sleep(0.02)
+        assert g._ducked is True            # not released early (no grace)
+        await asyncio.sleep(0.06)           # window (0.05s) now elapses → close + restore
+
+    asyncio.run(go())
+    assert g._ducked is False               # released only at window close
+    assert client.duck_calls == [("sess-test", True), ("sess-test", False)]

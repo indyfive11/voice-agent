@@ -33,6 +33,8 @@ import numpy as np
 from loguru import logger
 
 from pipecat.frames.frames import (
+    BotStartedSpeakingFrame,
+    BotStoppedSpeakingFrame,
     Frame,
     InputAudioRawFrame,
     SystemFrame,
@@ -95,6 +97,7 @@ class WakeWordGate(FrameProcessor):
         guard_inflight: bool = True,
         min_dwell_secs: float = 2.0,
         window_mute: bool = True,
+        preduck_grace: float = 3.0,
         time_source: Callable[[], float] | None = None,
         **kwargs,
     ):
@@ -150,6 +153,15 @@ class WakeWordGate(FrameProcessor):
         # plain speech-duck (brains/media_duck) stays mute:false. Env: WAKE_WINDOW_MUTE (default on).
         self._window_mute = window_mute
 
+        # Pre-duck release grace: the wake pre-duck holds media down so the command lands on ducked audio,
+        # but if no speech actually follows the wake (an unused or phantom wake), release it after this many
+        # seconds instead of holding for the whole command window. Held while the user OR Aria is speaking;
+        # once a command is transcribed, MediaDuckController owns the duck lifecycle (restore on Aria-stops)
+        # and this is cancelled. 0 disables (the pre-duck then holds until the window closes — old behaviour).
+        self._preduck_grace = max(0.0, preduck_grace)
+        self._preduck_task: asyncio.Task | None = None
+        self._bot_speaking = False  # Aria is mid-reply → keep the pre-duck and freeze the idle close
+
         self._buf = bytearray()
         self._open = False
         self._last_gated: bool | None = None  # last gate decision (for debug transition logging)
@@ -191,8 +203,27 @@ class WakeWordGate(FrameProcessor):
         # _effective_gated uses them to avoid clamping the mic mid-command. Always pass them through.
         if isinstance(frame, VADUserStartedSpeakingFrame):
             self._speech_in_flight = True
+            if self._open:
+                self._arm_preduck()  # a speech attempt → give it the grace to produce words
         elif isinstance(frame, VADUserStoppedSpeakingFrame):
             self._speech_in_flight = False
+            if self._open:
+                self._arm_preduck()  # speech stopped; release the pre-duck unless words confirm it
+
+        # Aria's reply brackets: keep the pre-duck down and freeze the idle close while she speaks, so the
+        # media never restores out from under a reply, then resume the normal idle close when she finishes.
+        if isinstance(frame, BotStartedSpeakingFrame):
+            self._bot_speaking = True
+            self._cancel_preduck()
+            self._cancel_window()
+            await self.push_frame(frame, direction)
+            return
+        if isinstance(frame, BotStoppedSpeakingFrame):
+            self._bot_speaking = False
+            if self._open:
+                self._arm_window()
+            await self.push_frame(frame, direction)
+            return
 
         # Confirm pending (from the brain): hold the window open so the yes/no answer needs no re-wake.
         if isinstance(frame, WakeHoldFrame):
@@ -215,6 +246,9 @@ class WakeWordGate(FrameProcessor):
         # Keep the command window alive across a multi-turn exchange.
         if isinstance(frame, TranscriptionFrame) and self._open:
             if len((getattr(frame, "text", "") or "").split()) >= 1:
+                # Real words → this wake led to a command; MediaDuckController now owns the duck lifecycle
+                # (held while speaking, restored when Aria finishes), so stop the pre-duck release timer.
+                self._cancel_preduck()
                 self._arm_window()
 
         await self.push_frame(frame, direction)
@@ -223,6 +257,7 @@ class WakeWordGate(FrameProcessor):
         """Brain confirm pending → keep the window open (open it if needed); release → resume idle close."""
         self._hold = hold
         if hold:
+            self._cancel_preduck()  # a pending confirm must keep media ducked — never release on the grace
             if not self._open:
                 self._open_window("GATE  | hold — confirm pending, opening window")
             else:
@@ -398,6 +433,8 @@ class WakeWordGate(FrameProcessor):
             self._open = True
             _tlog(log_msg)
             self._fire_duck(True)  # pre-duck so the command lands on already-ducked media
+            if not self._hold:
+                self._arm_preduck()  # release the pre-duck if no speech follows (not while held for a confirm)
         self._escape_peak = 0.0
         self._escape_run = 0
         self._escape_hits.clear()  # fresh start once we're open
@@ -414,6 +451,7 @@ class WakeWordGate(FrameProcessor):
                 await asyncio.sleep(self._window_secs)
                 if self._open:
                     self._open = False
+                    self._cancel_preduck()
                     _tlog("WAKE  | window closed (idle) — muting until next wake word")
                     self._fire_duck(False)
             except asyncio.CancelledError:
@@ -425,6 +463,35 @@ class WakeWordGate(FrameProcessor):
         if self._window_task is not None and not self._window_task.done():
             self._window_task.cancel()
         self._window_task = None
+
+    # --- pre-duck release grace --------------------------------------------
+    def _arm_preduck(self) -> None:
+        """Release the wake pre-duck after `_preduck_grace` UNLESS speech (user or Aria) keeps it down.
+
+        The wake pre-ducks immediately so a command lands on already-ducked media — but an unused or phantom
+        wake would otherwise hold media down for the whole command window. Re-armed on each VAD onset/stop
+        (a cough that yields no words still releases), cancelled by a real transcription (the media-duck then
+        owns restore) and while Aria is speaking. Never fires mid-speech (`_speech_in_flight`)."""
+        if self._preduck_grace <= 0:
+            return
+        self._cancel_preduck()
+
+        async def _later():
+            try:
+                await asyncio.sleep(self._preduck_grace)
+                if (self._open and self._ducked and not self._bot_speaking
+                        and not self._hold and not self._speech_in_flight):
+                    _tlog("WAKE  | pre-duck released (no speech after wake)")
+                    self._fire_duck(False)
+            except asyncio.CancelledError:
+                pass
+
+        self._preduck_task = asyncio.create_task(_later())
+
+    def _cancel_preduck(self) -> None:
+        if self._preduck_task is not None and not self._preduck_task.done():
+            self._preduck_task.cancel()
+        self._preduck_task = None
 
     # --- pre-duck (idempotent with MediaDuckController via the brain's idempotent /media/duck) ------
     def _fire_duck(self, on: bool) -> None:
