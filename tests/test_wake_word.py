@@ -160,6 +160,43 @@ def test_consec_two_single_spike_rejected():
     assert client.duck_calls == []
 
 
+def test_asleep_requires_stricter_consec():
+    # While asleep (force-gated), the stricter asleep_consec_frames applies: a 2-frame burst that WOULD wake
+    # when awake must NOT wake asleep — it takes the full asleep run. This rejects the brief 2-frame ambient
+    # coincidences that opened the mic to room audio in the 2026-06-15 talk-radio self-wake.
+    client = FakeBrainClient()
+    g = _gate(client, consec_frames=2, asleep_consec_frames=3)
+    g._force_gated = True  # brain asleep
+
+    async def go():
+        g._oww.score = 0.9; await g._feed(_CHUNK)   # consec=1
+        g._oww.score = 0.9; await g._feed(_CHUNK)   # consec=2 — would wake AWAKE, must NOT while asleep
+        assert g._open is False
+        g._oww.score = 0.9; await g._feed(_CHUNK)   # consec=3 → wake
+
+    asyncio.run(go())
+    assert g._open is True
+
+
+def test_awake_uses_normal_consec_not_asleep_bar():
+    # The stricter bar applies ONLY while asleep: awake, consec_frames=2 still fires on two frames.
+    client = FakeBrainClient()
+    g = _gate(client, consec_frames=2, asleep_consec_frames=3)  # not force-gated → awake
+
+    async def go():
+        g._oww.score = 0.9; await g._feed(_CHUNK)   # consec=1
+        g._oww.score = 0.9; await g._feed(_CHUNK)   # consec=2 → wake (awake bar)
+
+    asyncio.run(go())
+    assert g._open is True
+
+
+def test_asleep_consec_never_weaker_than_awake():
+    # Defensive clamp: an asleep bar below the awake bar is raised to the awake bar.
+    g = _gate(consec_frames=3, asleep_consec_frames=2)
+    assert g._asleep_consec_required == 3
+
+
 def test_window_closes_and_restores():
     client = FakeBrainClient()
     g = _gate(client, window_secs=0.01)

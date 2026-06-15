@@ -94,6 +94,7 @@ class WakeWordGate(FrameProcessor):
         escape_count: int = 3,
         escape_secs: float = 12.0,
         consec_frames: int = 1,
+        asleep_consec_frames: int = 3,
         guard_inflight: bool = True,
         min_dwell_secs: float = 2.0,
         window_mute: bool = True,
@@ -131,6 +132,12 @@ class WakeWordGate(FrameProcessor):
         # Sustained-wake: require N consecutive frames (~80ms each) >= threshold before firing. A spoken
         # "hey aria" holds for 5-9 frames; music false-positives are isolated 1-frame spikes (2026-06-04).
         self._consec_required = max(1, consec_frames)
+        # While ASLEEP (force-gated) require a stricter sustain than awake. Asleep is the high-cost-of-
+        # false-positive state: a missed real wake just needs a repeat, but a false wake on un-AEC'd room
+        # audio (a radio/TV the echo-canceller can't remove, spiking the model to ceiling) is the whole
+        # "she won't stay asleep" bug (2026-06-15). A longer run rejects the brief 2-frame coincidences that
+        # would otherwise open the mic to ambient dialogue. Never weaker than the awake requirement.
+        self._asleep_consec_required = max(self._consec_required, asleep_consec_frames)
         self._consec = 0
         self._consec_max = 0  # best consecutive ≥threshold run in the current near-miss burst (diagnostic)
         # F3 gate hardening (defense-in-depth; GA's Phase-1 already kills the remote-video kind-flap):
@@ -330,6 +337,11 @@ class WakeWordGate(FrameProcessor):
         return True
 
     # --- wake detection ----------------------------------------------------
+    @property
+    def _consec_needed(self) -> int:
+        """Consecutive ≥threshold frames required to fire — stricter while asleep (force-gated)."""
+        return self._asleep_consec_required if self._force_gated else self._consec_required
+
     async def _feed(self, audio: bytes) -> None:
         self._buf.extend(audio)
         loop = asyncio.get_running_loop()
@@ -346,7 +358,7 @@ class WakeWordGate(FrameProcessor):
             # Count consecutive over-threshold frames; a single music blip won't reach _consec_required.
             self._consec = self._consec + 1 if score >= self._threshold else 0
             self._consec_max = max(self._consec_max, self._consec)  # for the near-miss "peaked N/M" label
-            if self._consec >= self._consec_required and (now - self._last_wake) > self._refractory:
+            if self._consec >= self._consec_needed and (now - self._last_wake) > self._refractory:
                 self._last_wake = now
                 self._consec = 0
                 self._reset_nearmiss()
@@ -393,7 +405,7 @@ class WakeWordGate(FrameProcessor):
                 # Report how close the burst came: "peaked 1/2" = never strung two ≥threshold frames
                 # together (real wake flickering → an M-of-N window is the next lever); "peaked 2/3" = a
                 # lower consec_required would have fired it. Drives data-backed retuning, not a blind guess.
-                reason = f"spike — peaked {self._consec_max}/{self._consec_required} frames"
+                reason = f"spike — peaked {self._consec_max}/{self._consec_needed} frames"
             _tlog(f"WAKE  | near-miss {self._nearmiss_key}={self._nearmiss_peak:.2f} ({reason})")
             self._reset_nearmiss()
 
@@ -419,7 +431,7 @@ class WakeWordGate(FrameProcessor):
         peak, run = self._escape_peak, self._escape_run
         self._escape_peak = 0.0
         self._escape_run = 0
-        if run < self._consec_required:
+        if run < self._consec_needed:
             return  # too brief to be a genuine attempt — ignore (this is what stops music tripping escape)
         self._escape_hits.append(now)
         self._escape_hits = [t for t in self._escape_hits if now - t <= self._escape_secs]

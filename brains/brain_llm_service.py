@@ -50,6 +50,16 @@ _SLEEP_PHRASES = (
 )
 _WAKE_PHRASES = ("wake up", "i'm back", "are you awake", "you awake", "start listening")
 
+# The assistant's spoken name — the PRIMARY wake while asleep. While asleep we leave sleep only on a
+# transcript that names her (this vocative) or carries a wake phrase, never on bare ambient speech. A
+# phantom acoustic spike on un-AEC'd room audio (a radio/TV the echo-canceller can't remove → wake_peak
+# hits ceiling, which consec can't always reject) opens the mic and lets the next line of dialogue through;
+# the old "any transcript while gated = wake" rule then woke her on it (2026-06-15: talk radio re-woke her
+# on "Hike through the wilderness…"). Matched as a WHOLE WORD against the punctuation-stripped transcript
+# (so "malaria" can't trip it). Conservative on purpose — a missed real wake costs one repeat, a false wake
+# while asleep is the whole bug — so risky soundalikes ("area") are deliberately excluded.
+_WAKE_VOCATIVES = ("aria", "arya", "ariya")
+
 # Clean exit of the whole voice agent. Deliberately specific to *this process* — never bare
 # "shut down"/"power off", which are the brain's job (system control) and must pass through.
 _SHUTDOWN_PHRASES = (
@@ -148,11 +158,12 @@ class BrainLLMService(LLMService):
         self._session_id = session_id or uuid.uuid4().hex
         self._pending_confirm: dict | None = None  # {"id":…, "method":…}
         self._reply_buf: list[str] = []  # accumulates this turn's spoken text (transcript log)
-        self._sleeping = False  # when True, ignore all input except a wake phrase
-        # Whether an acoustic wake-word gate sits upstream (set by main.py once the gate is built). When
-        # True, going to sleep forces that gate active so ambient TV never reaches STT and ANY transcript
-        # arriving while asleep means "hey aria" already fired → wake. When False (no gate), fall back to
-        # the text-phrase wake match (which a movie line can still trip — the degraded, gate-less mode).
+        self._sleeping = False  # when True, ignore all input except a naming/wake-phrase transcript
+        # Whether an acoustic wake-word gate sits upstream (set by main.py once the gate is built). Going to
+        # sleep still forces that gate active (so ambient audio is mostly held out of STT), but it no longer
+        # decides the wake: the wake-from-sleep transcript must name her / carry a wake phrase regardless,
+        # because a phantom acoustic spike on un-AEC'd room audio can open the gate without a real wake
+        # (2026-06-15). Kept for the main.py wiring and possible diagnostics; see the sleep branch below.
         self._acoustic_wake_gated = False
         # Log the correlation key so the transcript can be lined up with the brain's own logs.
         _tlog(f"BRAIN | gabagent session_id={self._session_id}")
@@ -280,13 +291,23 @@ class BrainLLMService(LLMService):
                 await self.push_frame(EndTaskFrame(), FrameDirection.UPSTREAM)
                 return
 
-            # --- sleep/wake gate. When an acoustic wake gate is upstream (the normal config), going to
-            # sleep FORCES it active, so ambient TV never reaches STT and a transcript can only arrive
-            # here if "hey aria" already fired — so ANY transcript while asleep is the wake (no text
-            # match against TV dialogue, which used to false-wake on lines like "we can wake up early").
-            # Without a gate we degrade to the old text-phrase match. This is the real "stop listening".
+            # --- sleep/wake gate. While asleep, LEAVE sleep only on a transcript that actually names her
+            # (a wake vocative) or carries a wake phrase, AND is not itself a sleep phrase. The old rule
+            # woke on ANY transcript whenever an acoustic gate was upstream — but a phantom acoustic spike
+            # on un-AEC'd room audio (a radio/TV the echo-canceller can't remove) opens the window and lets
+            # the next line of ambient dialogue through, which then "confirmed" the wake (2026-06-15: talk
+            # radio woke her repeatedly on non-wake lines; "Stop listening." — a sleep phrase arriving on an
+            # in-flight turn — also wrongly woke her). Requiring the name/phrase rejects both: radio chatter
+            # carries no "Aria", and a sleep phrase can never be a wake. Cost is deliberately asymmetric — a
+            # real wake lost to STT noise just needs a repeat; a false wake while asleep is the whole bug.
+            # (_acoustic_wake_gated no longer gates this decision; the text requirement applies in both the
+            # gated and the degraded gate-less configs.)
             if self._sleeping:
-                if self._acoustic_wake_gated or any(p in low_norm for p in _WAKE_PHRASES):
+                tokens = low_norm.split()
+                has_wake = (any(v in tokens for v in _WAKE_VOCATIVES)
+                            or any(p in low_norm for p in _WAKE_PHRASES))
+                is_sleep = any(p in low_norm for p in _SLEEP_PHRASES)
+                if has_wake and not is_sleep:
                     self._sleeping = False
                     await self._set_sleep_gate(False)
                     _tlog(f"WAKE  | {user_text!r}")

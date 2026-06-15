@@ -360,6 +360,62 @@ def test_dictation_blob_does_not_sleep():
     assert client.respond_calls and "go to sleep" in client.respond_calls[0][1].lower()
 
 
+def _sleeping_service(client, *, gated=True):
+    """A service already asleep, with the acoustic gate flag set as in the normal config."""
+    svc, pushed = _service_with_recorder(client)
+    svc.set_acoustic_wake_gated(gated)
+    svc._sleeping = True
+    return svc, pushed
+
+
+def test_asleep_ambient_dialogue_does_not_wake():
+    # 2026-06-15 regression: a phantom acoustic spike on un-AEC'd talk radio opened the mic and the next
+    # line of radio dialogue ("Hike through the wilderness…") "confirmed" the wake. The transcript names no
+    # wake word, so she must stay asleep and never reach the brain.
+    client = FakeBrainClient(respond_events=[BrainEvent("token", text="Hi!"), BrainEvent("done")])
+    svc, pushed = _sleeping_service(client)
+    asyncio.run(svc._process_context(_ctx("Hike through the wilderness with packs on")))
+    assert svc._sleeping is True
+    assert client.respond_calls == []
+    assert not any("awake" in t.lower() for t in _texts(pushed))
+
+
+def test_asleep_sleep_phrase_does_not_wake():
+    # "Stop listening." — a sleep phrase arriving on an in-flight turn right after sleep — used to short-
+    # circuit to a wake whenever the acoustic gate was up. A sleep phrase can never be a wake.
+    client = FakeBrainClient(respond_events=[BrainEvent("token", text="Hi!"), BrainEvent("done")])
+    svc, pushed = _sleeping_service(client)
+    asyncio.run(svc._process_context(_ctx("Stop listening.")))
+    assert svc._sleeping is True
+    assert client.respond_calls == []
+
+
+def test_asleep_vocative_wakes():
+    for text in ("Aria", "Aria, wake up", "Aria are you there"):
+        client = FakeBrainClient(respond_events=[BrainEvent("token", text="Hi!"), BrainEvent("done")])
+        svc, pushed = _sleeping_service(client)
+        asyncio.run(svc._process_context(_ctx(text)))
+        assert svc._sleeping is False, f"did not wake on {text!r}"
+        assert any("awake" in t.lower() for t in _texts(pushed)), f"no awake reply for {text!r}"
+
+
+def test_asleep_wake_phrase_wakes():
+    # A wake phrase with no vocative still wakes (covers the gate-less degraded mode too).
+    client = FakeBrainClient(respond_events=[BrainEvent("token", text="Hi!"), BrainEvent("done")])
+    svc, pushed = _sleeping_service(client)
+    asyncio.run(svc._process_context(_ctx("okay, wake up")))
+    assert svc._sleeping is False
+
+
+def test_asleep_substring_vocative_does_not_wake():
+    # Whole-word match: "malaria" embeds "aria" but must not wake.
+    client = FakeBrainClient(respond_events=[BrainEvent("token", text="Hi!"), BrainEvent("done")])
+    svc, pushed = _sleeping_service(client)
+    asyncio.run(svc._process_context(_ctx("the malaria outbreak spread quickly")))
+    assert svc._sleeping is True
+    assert client.respond_calls == []
+
+
 def test_deliberate_shutdown_still_fires_with_politeness():
     # The guards must NOT break a real, deliberate shutdown — a short vocative/polite command reduces to
     # ~nothing after fillers and still exits cleanly.
@@ -879,9 +935,10 @@ def test_going_to_sleep_forces_the_gate():
     assert _sleep_frames(pushed) == [True]
 
 
-def test_acoustic_gated_wakes_on_any_transcript():
-    # With an upstream gate, ANY transcript arriving while asleep means "hey aria" already fired → wake
-    # (no text match needed); waking releases the gate force via WakeSleepFrame(asleep=False).
+def test_acoustic_gated_still_requires_a_wake_token():
+    # Updated contract (2026-06-15): even with an upstream gate, a bare command arriving while asleep does
+    # NOT wake — a phantom acoustic spike on un-AEC'd room audio can open the gate without a real wake, so
+    # the transcript must name her / carry a wake phrase. The vocative does wake and releases the gate force.
     client = FakeBrainClient(respond_events=[BrainEvent("token", text="Hi!"), BrainEvent("done")])
     svc, pushed = _service_with_recorder(client)
     svc.set_acoustic_wake_gated(True)
@@ -890,8 +947,14 @@ def test_acoustic_gated_wakes_on_any_transcript():
     assert svc._sleeping is True
 
     pushed.clear()
-    # A bare command (no wake phrase) wakes her, because the gate only lets sound through after "hey aria".
+    # A bare command (no wake token) must NOT wake — this is the radio/TV self-wake the fix closes.
     asyncio.run(svc._process_context(_ctx("what time is it")))
+    assert svc._sleeping is True
+    assert _texts(pushed) == []
+
+    pushed.clear()
+    # Naming her wakes, and the wake turn releases the gate force and doesn't hit the brain.
+    asyncio.run(svc._process_context(_ctx("Aria")))
     assert svc._sleeping is False
     assert _sleep_frames(pushed) == [False]
     assert "awake" in " ".join(_texts(pushed)).lower()
@@ -899,21 +962,21 @@ def test_acoustic_gated_wakes_on_any_transcript():
 
 
 def test_gateless_fallback_uses_text_match():
-    # Without a gate (_acoustic_wake_gated stays False), sleep falls back to the text wake-phrase match:
-    # a non-wake transcript is ignored; a wake phrase wakes. (This is the degraded, gate-less mode where a
-    # movie "wake up" line could still trip it — which is exactly why the gated path above is preferred.)
+    # The text wake requirement applies in the gate-less config too (_acoustic_wake_gated stays False): a
+    # non-wake transcript is ignored; a wake phrase wakes. Note the loose wake-phrase match means an ambient
+    # "wake up" line can still trip it — which is why the vocative ("Aria") is the primary, tighter wake.
     client = FakeBrainClient(respond_events=[BrainEvent("token", text="Hi!"), BrainEvent("done")])
     svc, pushed = _service_with_recorder(client)
     asyncio.run(svc._process_context(_ctx("go to sleep")))
 
     pushed.clear()
-    asyncio.run(svc._process_context(_ctx("what time is it")))   # no wake phrase → ignored
+    asyncio.run(svc._process_context(_ctx("what time is it")))   # no wake token → ignored
     assert svc._sleeping is True
     assert _texts(pushed) == []
 
     pushed.clear()
-    asyncio.run(svc._process_context(_ctx("we can wake up very early")))  # movie line trips the fallback
-    assert svc._sleeping is False                                          # (the bug the gate prevents)
+    asyncio.run(svc._process_context(_ctx("we can wake up very early")))  # wake phrase present → wakes
+    assert svc._sleeping is False
 
 
 def test_keyboard_confirm_resolves_in_turn():

@@ -682,6 +682,14 @@ def build_wake_word_gate(llm):
     # the extra frame added detection lag). 2 still rejects the 1-frame phantom yet recovers those. 1 = old
     # behaviour (a single blip wakes). The near-miss log reports "peaked N/M frames" to retune from data.
     consec_frames = int(_env("WAKE_CONSEC_FRAMES", "2"))
+    # While ASLEEP, require more consecutive frames than awake before opening the window. Asleep is the
+    # high-cost-of-false-positive state: a missed real wake just needs a repeat, but a false wake (a radio/TV
+    # the AEC can't cancel spiking the model to ceiling) is the whole "she won't stay asleep" bug
+    # (2026-06-15: talk radio re-woke her repeatedly). A stricter sustain rejects the brief 2-frame
+    # coincidences that open the mic to ambient dialogue. The text wake-gate in brain_llm_service (the
+    # transcript must name her and can't be a sleep phrase) is the catch-all; this just cuts phantom opens.
+    # Clamped up to at least consec_frames in the gate. Drop to 2 if real wake-from-sleep recall suffers.
+    asleep_consec_frames = int(_env("WAKE_ASLEEP_CONSEC_FRAMES", "3"))
     # Default 1 = gate VIDEO behind the wake word too (a movie only ducks once you say "Aria"; no duck on
     # asides). Safe to default on because the AEC echo-cancel mic keeps the movie out of the mic, so the
     # wake word is heard cleanly over it (the old over-movie lockout that kept this off is gone). Set 0 on a
@@ -759,6 +767,7 @@ def build_wake_word_gate(llm):
         f"media_only={media_only and media_status is not None} gate_video={gate_video} window={window_secs}s"
         + (f" escape={escape_count}@{escape_floor}/{escape_secs:.0f}s" if escape_count else " escape=off")
         + (f" consec={consec_frames}" if consec_frames > 1 else "")
+        + (f" asleep-consec={asleep_consec_frames}" if asleep_consec_frames > consec_frames else "")
         + (" inflight-guard=on" if guard_inflight else " inflight-guard=off")
         + (f" min-dwell={min_dwell_secs:.1f}s" if min_dwell_secs > 0 else "")
         + (" window-mute=on" if window_mute else " window-mute=off")
@@ -782,6 +791,7 @@ def build_wake_word_gate(llm):
         escape_count=escape_count,
         escape_secs=escape_secs,
         consec_frames=consec_frames,
+        asleep_consec_frames=asleep_consec_frames,
         guard_inflight=guard_inflight,
         min_dwell_secs=min_dwell_secs,
         window_mute=window_mute,
