@@ -130,6 +130,36 @@ def test_brief_spike_rejected_and_consec_resets_on_gap():
     assert client.duck_calls == []
 
 
+def test_consec_two_recovers_real_wake_rejects_single_frame():
+    # The 2026-06-14 fix: consec_frames=2 must FIRE on two consecutive frames (real "Aria" over a movie
+    # flickered and missed the 3-in-a-row bar) while still rejecting an isolated 1-frame phantom.
+    client = FakeBrainClient()
+    g = _gate(client, consec_frames=2)
+
+    async def go():
+        g._oww.score = 0.9; await g._feed(_CHUNK)   # consec=1 — must NOT fire yet
+        assert g._open is False
+        g._oww.score = 0.9; await g._feed(_CHUNK)   # consec=2 → wake
+
+    asyncio.run(go())
+    assert g._open is True
+    assert client.duck_calls == [("sess-test", True)]
+
+
+def test_consec_two_single_spike_rejected():
+    # A lone 1-frame spike (the asleep phantom) followed by a sub-threshold frame never reaches 2.
+    client = FakeBrainClient()
+    g = _gate(client, consec_frames=2)
+
+    async def go():
+        g._oww.score = 0.9; await g._feed(_CHUNK)   # consec=1
+        g._oww.score = 0.0; await g._feed(_CHUNK)   # resets to 0
+
+    asyncio.run(go())
+    assert g._open is False
+    assert client.duck_calls == []
+
+
 def test_window_closes_and_restores():
     client = FakeBrainClient()
     g = _gate(client, window_secs=0.01)
@@ -511,6 +541,31 @@ def test_post_wake_duplicate_labeled_refractory_not_sustain():
     assert len(nearmiss) == 1
     assert "duplicate within refractory" in nearmiss[0]
     assert "didn't sustain" not in nearmiss[0]
+
+
+def test_nearmiss_reports_peaked_consec_count():
+    # 2026-06-14 instrumentation: a high-peak burst that fails to sustain reports the BEST consecutive run
+    # it achieved ("peaked N/M frames"), so the next session shows whether a lower consec would have fired
+    # it (peaked 2/3 → yes) or the wake is flickering 1-frame-at-a-time (peaked 1/3 → needs an M-of-N window).
+    g = _gate(debug=True, debug_floor=0.2, consec_frames=3)  # threshold 0.5 from _gate default
+    lines, remove = _capture_transcript()
+
+    async def go():
+        g._oww.score = 0.9; await g._feed(_CHUNK)   # consec=1
+        g._oww.score = 0.9; await g._feed(_CHUNK)   # consec=2 (best run — never reaches 3)
+        g._oww.score = 0.3; await g._feed(_CHUNK)   # ≥floor, <threshold → consec resets, burst alive
+        g._oww.score = 0.0; await g._feed(_CHUNK)   # <floor → burst ends, emit
+
+    try:
+        asyncio.run(go())
+    finally:
+        remove()
+
+    assert g._open is False
+    nearmiss = [ln for ln in lines if "near-miss" in ln]
+    assert len(nearmiss) == 1
+    assert "peaked 2/3 frames" in nearmiss[0]
+    assert g._consec_max == 0  # reset for the next burst
 
 
 # --- pre-duck release grace: drop the wake pre-duck if no speech follows ------

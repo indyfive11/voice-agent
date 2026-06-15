@@ -675,10 +675,13 @@ def build_wake_word_gate(llm):
     escape_floor = float(_env("WAKE_ESCAPE_FLOOR", "0.15"))
     escape_count = int(_env("WAKE_ESCAPE_COUNT", "3"))  # 0 disables the lockout escape
     escape_secs = float(_env("WAKE_ESCAPE_SECS", "12"))
-    # Sustained-wake: require N consecutive frames (~80ms each) >= threshold before opening. A spoken
-    # "hey aria" holds above threshold for 5-9 frames; music false-positives are isolated 1-frame spikes,
-    # so this rejects the blips without touching real wakes (2026-06-04, data-backed). 1 = old behaviour.
-    consec_frames = int(_env("WAKE_CONSEC_FRAMES", "3"))
+    # Sustained-wake: require N consecutive frames (~80ms each) >= threshold before opening. Music/asleep
+    # false-positives are isolated 1-frame spikes, so >=2 rejects the blips. 3 proved too strict for real
+    # wakes over a movie via the AEC mic — the score flickers above/below threshold so a clean "Aria" rarely
+    # holds 3 in a row (2026-06-14 log: real attempts peaked 0.75-0.99 but "didn't sustain 3 frames", and
+    # the extra frame added detection lag). 2 still rejects the 1-frame phantom yet recovers those. 1 = old
+    # behaviour (a single blip wakes). The near-miss log reports "peaked N/M frames" to retune from data.
+    consec_frames = int(_env("WAKE_CONSEC_FRAMES", "2"))
     # Default 1 = gate VIDEO behind the wake word too (a movie only ducks once you say "Aria"; no duck on
     # asides). Safe to default on because the AEC echo-cancel mic keeps the movie out of the mic, so the
     # wake word is heard cleanly over it (the old over-movie lockout that kept this off is gone). Set 0 on a

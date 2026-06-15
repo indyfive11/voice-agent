@@ -132,6 +132,7 @@ class WakeWordGate(FrameProcessor):
         # "hey aria" holds for 5-9 frames; music false-positives are isolated 1-frame spikes (2026-06-04).
         self._consec_required = max(1, consec_frames)
         self._consec = 0
+        self._consec_max = 0  # best consecutive ≥threshold run in the current near-miss burst (diagnostic)
         # F3 gate hardening (defense-in-depth; GA's Phase-1 already kills the remote-video kind-flap):
         #   (a) in-flight guard — never START gating (pass-through → gating) while a user utterance is in
         #       flight, so a media-state flip can't swallow a command mid-stream and starve the VAD. Tracked
@@ -344,6 +345,7 @@ class WakeWordGate(FrameProcessor):
             now = time.monotonic()
             # Count consecutive over-threshold frames; a single music blip won't reach _consec_required.
             self._consec = self._consec + 1 if score >= self._threshold else 0
+            self._consec_max = max(self._consec_max, self._consec)  # for the near-miss "peaked N/M" label
             if self._consec >= self._consec_required and (now - self._last_wake) > self._refractory:
                 self._last_wake = now
                 self._consec = 0
@@ -388,11 +390,15 @@ class WakeWordGate(FrameProcessor):
                 # NOT a recall miss. (With _consec_required=1 every post-wake threshold frame lands here.)
                 reason = "duplicate within refractory of last wake"
             else:
-                reason = f"spike — didn't sustain {self._consec_required} frames"
+                # Report how close the burst came: "peaked 1/2" = never strung two ≥threshold frames
+                # together (real wake flickering → an M-of-N window is the next lever); "peaked 2/3" = a
+                # lower consec_required would have fired it. Drives data-backed retuning, not a blind guess.
+                reason = f"spike — peaked {self._consec_max}/{self._consec_required} frames"
             _tlog(f"WAKE  | near-miss {self._nearmiss_key}={self._nearmiss_peak:.2f} ({reason})")
             self._reset_nearmiss()
 
     def _reset_nearmiss(self) -> None:
+        self._consec_max = 0
         self._nearmiss_peak = 0.0
         self._nearmiss_key = ""
         self._nearmiss_refractory = False
