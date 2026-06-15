@@ -557,16 +557,21 @@ def test_media_duck_onset_confirmed_then_restores_on_bot():
     assert client.duck_calls == [("sess-test", True), ("sess-test", False)]
 
 
-def test_media_duck_false_onset_restores_after_confirm_grace():
-    # Onset with no qualifying transcription (a cough / stray VAD blip) restores quickly.
+def test_media_duck_false_onset_no_flap_over_media_restores_via_idle_grace():
+    # 2026-06-14 flap fix: while media is PLAYING, an onset with no qualifying transcription does NOT snap
+    # back at confirm_grace — that flapped the bed down→up→re-duck and raced the confirmed `on` against a
+    # stale `off`. It holds through confirm_grace and restores on the longer idle grace instead. (When
+    # media is NOT playing the quick snap-back is preserved — see tests/test_media_duck.py.)
     client = FakeBrainClient()
-    ctl = _duck(client, confirm_grace=0.01)
+    ctl = _duck(client, confirm_grace=0.01, restore_grace=0.08)
 
     async def go():
-        ctl._handle(_onset())                          # duck on
+        ctl._handle(_onset())                          # duck on (media playing → real duck)
         await asyncio.sleep(0)
         ctl._handle(_offset())                         # speech stopped, no words → arm confirm timer
-        await asyncio.sleep(0.05)                      # grace elapses → restore
+        await asyncio.sleep(0.04)                      # confirm grace elapsed → NO snap-back
+        assert client.duck_calls == [("sess-test", True)]
+        await asyncio.sleep(0.10)                      # idle grace elapses → restore
 
     asyncio.run(go())
     assert client.duck_calls == [("sess-test", True), ("sess-test", False)]

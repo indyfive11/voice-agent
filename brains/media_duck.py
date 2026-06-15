@@ -15,7 +15,13 @@ Design (the 2026-06-02 low-latency revision — supersedes the duck-on-confirmed
 - **False-onset guard:** an onset that yields no real words (a cough, a stray VAD blip) restores
   quickly — on `VADUserStoppedSpeaking` we arm a short `confirm_grace` timer that restores unless a
   ≥`min_words` transcription confirms the onset was speech (which cancels it). Continued speech
-  (another onset) also cancels it, so a multi-clause utterance never flaps.
+  (another onset) also cancels it, so a multi-clause utterance never flaps. **Exception (2026-06-14):
+  while media is actually *playing*, the confirm timer does NOT snap the bed back — over a movie the mic
+  is gated behind the wake word, so an onset is almost always a real command whose transcript merely lags
+  `confirm_grace` (Whisper latency). Snapping back then flapped the bed down→up→re-duck and raced the
+  confirmed `on` against a stale `off` (full-volume mid-command). It falls back to the longer idle grace,
+  which a slow real command confirms within (the confirmed path then owns restore) and a genuine
+  non-speech onset still hits eventually.** The quick snap-back stands when nothing is playing.
 - **Confirmed transcription** (≥`min_words`) marks the turn real, cancels the confirm timer, and arms
   the slow idle-restore — and still *triggers* the duck itself if the onset frame never arrived
   (graceful fallback to the old behavior; no regression).
@@ -228,8 +234,19 @@ class MediaDuckController(FrameProcessor):
         async def _later():
             try:
                 await asyncio.sleep(self._confirm_grace)
-                # Speech stopped and no qualifying transcription arrived → it wasn't real speech.
+                # Speech stopped and no qualifying transcription arrived within confirm_grace.
                 if self._ducked and not self._confirmed and not self._bot_spoke:
+                    # While media is actually playing, do NOT snap the bed back now. Over a movie the mic
+                    # is gated behind the wake word, so an onset here is almost always a real command whose
+                    # transcript is merely slower than confirm_grace (Whisper latency over the AEC mic). The
+                    # immediate restore causes an audible flap — duck → up → re-duck — and a send-order race
+                    # where its `off` can land *after* the imminent confirmed-speech `on`, leaving the movie
+                    # at full volume mid-command (2026-06-14 log 19:36:34). Fall back to the longer idle
+                    # grace instead: a slow real command confirms within it (the confirmed path then owns
+                    # restore), while a genuine non-speech onset still restores once the idle window elapses.
+                    if await self._media_playing():
+                        self._arm_restore()
+                        return
                     self._restore("unconfirmed onset")
             except asyncio.CancelledError:
                 pass
