@@ -486,6 +486,29 @@ async def pin_output_stream_volume(poll_secs: float = 5.0, floor_pct: int = 60, 
         await asyncio.sleep(poll_secs)
 
 
+async def warn_if_output_muted() -> None:
+    """One-shot startup check: warn loudly if the default output SINK (the device, not our stream) is muted.
+
+    The app never force-unmutes the user's master volume (that would be invasive), but PipeWire/WirePlumber
+    can restore a muted device state across reboots — which silences Aria with NO obvious cause. On 2026-06-15
+    this looked like a wake-word regression but was a stale device mute. This surfaces it in the log instead of
+    leaving the user with silent dead air and no signal. Diagnostic only — never raises, never changes volume.
+    """
+    try:
+        p = await asyncio.create_subprocess_exec(
+            "pactl", "get-sink-mute", "@DEFAULT_SINK@",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        )
+        out, _ = await p.communicate()
+        if "yes" in out.decode("utf-8", "replace").lower():
+            logger.warning(
+                "Heads-up: the default output sink is MUTED at startup — Aria's speech and media will be "
+                "SILENT until you unmute it (system/master volume). The app does not touch your master mute."
+            )
+    except Exception:  # noqa: BLE001 - diagnostic only; never break startup
+        pass
+
+
 def build_input_resampler():
     """Resampler that normalizes mic capture to PIPELINE_AUDIO_RATE. Goes first in the pipeline.
 
@@ -554,9 +577,11 @@ def build_media_duck(llm):
     min_words = int(_env("DUCK_MIN_WORDS", "2"))
     restore_grace = float(_env("DUCK_RESTORE_GRACE", "8.0"))
     confirm_grace = float(_env("DUCK_CONFIRM_GRACE", "2.5"))
+    sustained_secs = float(_env("DUCK_SUSTAINED_SECS", "4.0"))
     logger.info(
         f"Media ducking: on VAD speech onset (min_words={min_words}, "
-        f"confirm_grace={confirm_grace}s, restore_grace={restore_grace}s)"
+        f"confirm_grace={confirm_grace}s, restore_grace={restore_grace}s, "
+        f"sustained={sustained_secs}s)"
     )
     return MediaDuckController(
         llm.brain_client,
@@ -564,6 +589,7 @@ def build_media_duck(llm):
         min_words=min_words,
         restore_grace=restore_grace,
         confirm_grace=confirm_grace,
+        sustained_secs=sustained_secs,
         should_duck=lambda: not llm.is_sleeping,
         media_status=build_media_state_provider(llm),  # SHARED with the wake gate (no divergence)
     )

@@ -34,6 +34,7 @@ Design (the 2026-06-02 low-latency revision — supersedes the duck-on-confirmed
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass
 from typing import Callable
 
@@ -77,8 +78,10 @@ class MediaDuckController(FrameProcessor):
         min_words: int = 2,
         restore_grace: float = 8.0,
         confirm_grace: float = 2.5,
+        sustained_secs: float = 4.0,
         should_duck: Callable[[], bool] | None = None,
         media_status: Callable[[], "dict|None"] | None = None,
+        time_source: Callable[[], float] | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -86,6 +89,14 @@ class MediaDuckController(FrameProcessor):
         self._session_id = session_id
         self._min_words = max(1, min_words)
         self._restore_grace = restore_grace
+        # An aside (DuckReleaseFrame) normally releases the duck immediately — but if the user is in a
+        # SUSTAINED utterance (still speaking, or the duck has been on this long), snapping the music back to
+        # full mid-sentence is the "it kept playing while I talked" bug. Past this duration we HOLD the duck on
+        # an aside and let the idle-grace restore own it (fires ~restore_grace after speech truly stops); the
+        # immediate aside-release then applies only to SHORT asides (the ambient-blip case it was built for).
+        self._sustained_secs = sustained_secs
+        self._time = time_source or time.monotonic
+        self._duck_started_at = 0.0
         # How long after speech *stops* to wait for a confirming transcription before treating the
         # onset as a false trigger and restoring. Must comfortably exceed Whisper's per-segment
         # latency so real speech confirms before it fires (else a slow transcribe would flap).
@@ -151,7 +162,17 @@ class MediaDuckController(FrameProcessor):
             # `not self._bot_spoke` so a stale aside-verdict can never cut the bed out from under live TTS
             # (e.g. an aside-then-command race where Aria is already replying).
             if self._ducked and not self._bot_spoke:
-                self._restore("aside")
+                sustained = (
+                    self._speech_in_flight
+                    or (self._time() - self._duck_started_at) >= self._sustained_secs
+                )
+                if sustained:
+                    # Sustained utterance (dictation / long aside) — don't snap the bed back mid-sentence.
+                    # Hold; the idle-grace restore (re-armed per transcription, gated on _speech_in_flight)
+                    # owns it and fires only after speech truly stops. This is the automatic duck-policy.
+                    _tlog("DUCK  | aside during sustained speech — holding (idle-grace owns restore)")
+                else:
+                    self._restore("aside")
 
     def _duck_on(self, reason: str) -> None:
         if not self._should_duck() or self._ducked:
@@ -159,6 +180,7 @@ class MediaDuckController(FrameProcessor):
         self._ducked = True
         self._bot_spoke = False
         self._confirmed = False
+        self._duck_started_at = self._time()
         _tlog(f"DUCK  | on ({reason})")
         self._fire(True)
 

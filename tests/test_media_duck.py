@@ -10,12 +10,20 @@ stale `off`); it falls back to the longer idle grace instead. Over silence, the 
 import asyncio
 
 from brains.brain_client import FakeBrainClient
-from brains.media_duck import MediaDuckController
+from brains.media_duck import DuckReleaseFrame, MediaDuckController
 from pipecat.frames.frames import (
     TranscriptionFrame,
     VADUserStartedSpeakingFrame,
     VADUserStoppedSpeakingFrame,
 )
+
+
+class _Clock:
+    def __init__(self):
+        self.t = 0.0
+
+    def __call__(self):
+        return self.t
 
 
 def _ctrl(client, *, playing: bool, confirm_grace=0.02, restore_grace=0.20):
@@ -120,4 +128,72 @@ def test_unconfirmed_onset_over_movie_restores_via_idle_grace():
 
     asyncio.run(go())
     assert client.duck_calls == [("sess-test", True), ("sess-test", False)]
+    assert g._ducked is False
+
+
+# --- automatic duck-policy: hold the duck through sustained speech (2026-06-15) ---
+def _ctrl_clk(client, clk, *, sustained_secs=4.0):
+    return MediaDuckController(
+        client,
+        session_id="sess-test",
+        sustained_secs=sustained_secs,
+        confirm_grace=5.0,
+        restore_grace=5.0,
+        media_status=(lambda: {"playing": True}),
+        time_source=clk,
+    )
+
+
+def test_aside_held_while_user_still_speaking():
+    # Aside verdict arrives WHILE the user is mid-utterance → hold the duck (don't snap music to full).
+    client = FakeBrainClient()
+    g = _ctrl_clk(client, _Clock())
+
+    async def go():
+        g._handle(VADUserStartedSpeakingFrame())   # duck on, speech_in_flight=True
+        await _drain()
+        assert client.duck_calls == [("sess-test", True)]
+        g._handle(DuckReleaseFrame())              # aside while still speaking
+        await _drain()
+
+    asyncio.run(go())
+    assert client.duck_calls == [("sess-test", True)]  # HELD — no restore
+    assert g._ducked is True
+
+
+def test_aside_held_after_sustained_duration():
+    # User stopped, but the utterance was long (> sustained_secs) → still hold; idle-grace owns restore.
+    client = FakeBrainClient()
+    clk = _Clock()
+    g = _ctrl_clk(client, clk, sustained_secs=4.0)
+
+    async def go():
+        g._handle(VADUserStartedSpeakingFrame())   # duck on at t=0
+        await _drain()
+        g._handle(VADUserStoppedSpeakingFrame())   # speech_in_flight=False
+        clk.t = 5.0                                 # 5s ducked > 4s sustained
+        g._handle(DuckReleaseFrame())
+        await _drain()
+
+    asyncio.run(go())
+    assert client.duck_calls == [("sess-test", True)]  # HELD
+    assert g._ducked is True
+
+
+def test_short_aside_still_restores_immediately():
+    # A brief ambient aside (stopped, well under sustained_secs) → A1's immediate release still applies.
+    client = FakeBrainClient()
+    clk = _Clock()
+    g = _ctrl_clk(client, clk, sustained_secs=4.0)
+
+    async def go():
+        g._handle(VADUserStartedSpeakingFrame())   # duck on at t=0
+        await _drain()
+        g._handle(VADUserStoppedSpeakingFrame())   # speech_in_flight=False
+        clk.t = 1.0                                 # brief: 1s < 4s
+        g._handle(DuckReleaseFrame())
+        await _drain()
+
+    asyncio.run(go())
+    assert client.duck_calls == [("sess-test", True), ("sess-test", False)]  # restored (A1 preserved)
     assert g._ducked is False

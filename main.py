@@ -143,6 +143,9 @@ async def run() -> None:
 
     # Enumerate audio devices so the chosen mic/speaker indices are visible in the log.
     config.list_audio_devices()
+    # Heads-up if the default output sink is muted at startup (a stale device mute silences Aria with no
+    # obvious cause — 2026-06-15). Diagnostic only; the app never force-unmutes the user's master volume.
+    await config.warn_if_output_muted()
 
     transport = config.build_transport()
     stt = config.build_stt()
