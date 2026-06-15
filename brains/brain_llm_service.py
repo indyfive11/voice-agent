@@ -71,6 +71,27 @@ _WAKE_PHRASES = ("wake up", "i'm back", "are you awake", "you awake", "start lis
 # vocative guard → an unwanted chit-chat reply); included as a name variant, not a generic soundalike.
 _WAKE_VOCATIVES = ("aria", "arya", "ariya", "ari")
 
+# Lenient vocative match — used ONLY by the bare-vocative suppression path (awake; low cost, worst case it
+# drops a lone one-word turn that wasn't really the name). STT spells "Aria" many ways live
+# (aria/arya/ariya/ari/ariette/ariane — 2026-06-15), so an exact list is whack-a-mole. A short "ari"/"ary"
+# prefix catches the family; a denylist keeps real words (arid/arise/ariel/arial…) out. Deliberately NOT
+# used for the asleep-wake gate, which stays on the strict _WAKE_VOCATIVES whole-word list — a false wake
+# while asleep is the whole bug, so soundalikes must not open it.
+_VOCATIVE_PREFIXES = ("ari", "ary")
+_VOCATIVE_DENY = frozenset((
+    "arid", "arise", "arises", "arisen", "arising", "aristocrat", "aristocratic",
+    "arithmetic", "ariel", "arial", "aryan", "aryans",
+))
+
+
+def _looks_like_vocative(tok: str) -> bool:
+    """Lenient: a token that is or resembles the wake name. Bare-vocative path only (see above)."""
+    if tok in _WAKE_VOCATIVES:
+        return True
+    if tok in _VOCATIVE_DENY:
+        return False
+    return any(tok.startswith(p) for p in _VOCATIVE_PREFIXES)
+
 # Clean exit of the whole voice agent. Deliberately specific to *this process* — never bare
 # "shut down"/"power off", which are the brain's job (system control) and must pass through.
 _SHUTDOWN_PHRASES = (
@@ -156,9 +177,9 @@ def _is_bare_vocative(low_norm: str) -> bool:
     Scoped to the NAME only (not wake phrases like "are you awake", which read as real questions).
     """
     toks = low_norm.split()
-    if not any(v in toks for v in _WAKE_VOCATIVES):
+    if not any(_looks_like_vocative(w) for w in toks):
         return False
-    leftover = [w for w in toks if w not in _WAKE_VOCATIVES and w not in _COMMAND_FILLERS]
+    leftover = [w for w in toks if not _looks_like_vocative(w) and w not in _COMMAND_FILLERS]
     return not leftover
 
 

@@ -407,7 +407,8 @@ def test_bare_vocative_not_forwarded_to_brain():
     # 2026-06-15: awake, a lone "Aria"/"Hey Aria" must NOT reach the brain — the acoustic gate already
     # opened the window, and a chit-chat reply ("Yeah?") would barge over the command spoken a beat later.
     for text in ("Aria", "Hey Aria", "Hey, Aria!", "Aria?", "okay Aria",
-                 "Hey, Aria.  Hey, Ari."):  # STT clips "Aria"→"Ari" (2026-06-15 live leak)
+                 "Hey, Aria.  Hey, Ari.",   # STT clips "Aria"→"Ari" (2026-06-15 live leak)
+                 "Hey Ariette", "Hey, Ariane."):  # STT spelling drift (2026-06-15 live) — fuzzy ari* match
         client = FakeBrainClient(respond_events=[BrainEvent("token", text="Yeah?"), BrainEvent("done")])
         svc, pushed = _service_with_recorder(client)  # awake (not sleeping)
         asyncio.run(svc._process_context(_ctx(text)))
@@ -426,11 +427,22 @@ def test_vocative_plus_command_is_forwarded():
 
 def test_non_vocative_short_turn_still_forwarded():
     # No vocative token → not a bare vocative; a short utterance must still reach the brain.
-    for text in ("okay", "are you awake"):
+    # "arid"/"arise" start with "ari" but are denylisted, so they must NOT read as the wake name.
+    for text in ("okay", "are you awake", "arid", "arise and shine"):
         client = FakeBrainClient(respond_events=[BrainEvent("token", text="ok"), BrainEvent("done")])
         svc, pushed = _service_with_recorder(client)
         asyncio.run(svc._process_context(_ctx(text)))
         assert client.respond_calls, f"dropped non-vocative turn {text!r}"
+
+
+def test_fuzzy_vocative_does_not_loosen_asleep_gate():
+    # The lenient ari* match is awake-only. While ASLEEP, an STT-drift soundalike ("Ariette") that is NOT a
+    # strict _WAKE_VOCATIVES whole word must NOT wake her (a false wake while asleep is the whole bug).
+    client = FakeBrainClient(respond_events=[BrainEvent("token", text="Hi!"), BrainEvent("done")])
+    svc, pushed = _sleeping_service(client)
+    asyncio.run(svc._process_context(_ctx("Ariette")))
+    assert svc._sleeping, "fuzzy vocative wrongly woke her from sleep"
+    assert client.respond_calls == []
 
 
 def _sleeping_service(client, *, gated=True):
