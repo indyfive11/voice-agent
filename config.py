@@ -710,6 +710,10 @@ def build_wake_word_gate(llm):
     # 6s matches the human "hear the duck, then compose and speak the command" loop — 3s released the duck
     # before the user began, so the command landed over restored audio and was missed (2026-06-15 live).
     preduck_grace = float(_env("WAKE_PREDUCK_GRACE", "6.0"))
+    # Hard ceiling on the brain's media-keepalive hold (WakeHoldFrame ttl_secs). A keepalive TTL is clamped
+    # to this, and the gate auto-releases at it if the brain's refreshes stop (crash/dropped turn) — so a
+    # bad/large/never-refreshed hold can't pin the mic open. Must exceed the brain's media_keepalive_secs.
+    hold_max_secs = float(_env("WAKE_HOLD_MAX_SECS", "120.0"))
     speex_ns = False  # openWakeWord-only; set below when that engine is selected
     extra_log = ""
 
@@ -774,6 +778,7 @@ def build_wake_word_gate(llm):
         + (f" min-dwell={min_dwell_secs:.1f}s" if min_dwell_secs > 0 else "")
         + (" window-mute=on" if window_mute else " window-mute=off")
         + (f" preduck-grace={preduck_grace:.1f}s" if preduck_grace > 0 else " preduck-grace=off")
+        + f" hold-max={hold_max_secs:.0f}s"
         + (" speex_ns=on" if speex_ns else "")
         + extra_log
         + (f" debug=on floor={debug_floor}" if debug else "")
@@ -798,6 +803,7 @@ def build_wake_word_gate(llm):
         min_dwell_secs=min_dwell_secs,
         window_mute=window_mute,
         preduck_grace=preduck_grace,
+        hold_max_secs=hold_max_secs,
     )
 
 

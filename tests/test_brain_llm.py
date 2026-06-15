@@ -45,6 +45,33 @@ def test_tokens_become_text_frames():
     assert client.respond_calls == [("sess-test", "hello")]
 
 
+def test_wake_hold_event_pushes_keepalive_frame_upstream():
+    # A media command emits wake_hold → the service pushes WakeHoldFrame(hold=True, ttl_secs=N) UPSTREAM so
+    # the wake gate holds its window open for a follow-up command (no re-wake).
+    from wake_word import WakeHoldFrame
+    client = FakeBrainClient(respond_events=[
+        BrainEvent("token", text="Playing."),
+        BrainEvent("wake_hold", hold=True, ttl_secs=30),
+        BrainEvent("done"),
+    ])
+    svc, pushed = _service_with_recorder(client)
+    asyncio.run(svc._process_context(_ctx("play some music")))
+    holds = [f for f in pushed if isinstance(f, WakeHoldFrame)]
+    assert len(holds) == 1
+    assert holds[0].hold is True and holds[0].ttl_secs == 30
+
+
+def test_wake_hold_zero_ttl_pushes_no_frame():
+    from wake_word import WakeHoldFrame
+    client = FakeBrainClient(respond_events=[
+        BrainEvent("wake_hold", hold=True, ttl_secs=0),
+        BrainEvent("done"),
+    ])
+    svc, pushed = _service_with_recorder(client)
+    asyncio.run(svc._process_context(_ctx("hello")))
+    assert [f for f in pushed if isinstance(f, WakeHoldFrame)] == []
+
+
 def test_status_filler_logged_but_not_spoken():
     # the user disliked the spoken filler ("Trying tidal…"). Status events are now LOG-ONLY: no TTSSpeakFrame
     # and no LLMTextFrame for the status; only the token speaks.

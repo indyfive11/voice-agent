@@ -32,6 +32,10 @@ class BrainEvent:
                       that the VAD-onset pre-duck engaged for an utterance that turns out not to be a
                       command (no reply → nothing to make room for). `addressed:true` is never emitted, so
                       the mere ARRIVAL of this event means "not addressed" — see brain_llm_service.
+      - "wake_hold" : media keepalive (`hold:true`, `ttl_secs`). Emitted after any media-domain command,
+                      before `done`, so the wake gate holds its command window open for `ttl_secs` and a
+                      follow-up media command needs no re-wake. Release is by TTL (the brain never sends a
+                      false) + the gate's own ceiling. Refreshed by each new media command.
       - "done"      : end of this turn
     """
 
@@ -51,6 +55,10 @@ class BrainEvent:
     # solely on suppression). Carried for logging; the handler keys on the event TYPE, not this value,
     # so a brain-side serializer that drops a literal `False` (Python `False == 0`) can't disarm it.
     addressed: bool | None = None
+    # "wake_hold" event only: media keepalive. `hold` is always True on the wire (release is by TTL, never a
+    # false); `ttl_secs` is how long the wake gate should hold its command window open from receipt.
+    hold: bool | None = None
+    ttl_secs: float | None = None
 
 
 @runtime_checkable

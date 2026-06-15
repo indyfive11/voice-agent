@@ -392,6 +392,62 @@ def test_hold_keeps_window_open_past_idle_then_releases():
     asyncio.run(go())
 
 
+def test_keepalive_holds_window_for_ttl_then_idle_closes():
+    client = FakeBrainClient()
+    g = _gate(client, window_secs=0.01, hold_max_secs=120.0)
+
+    async def go():
+        g._set_keepalive(0.06)            # media command → hold window ~60ms
+        assert g._open is True
+        await asyncio.sleep(0.03)         # past the 10ms idle window, still within the keepalive
+        assert g._open is True            # held open by the keepalive
+        await asyncio.sleep(0.05)         # keepalive expired → idle window re-armed and elapsed
+        assert g._open is False           # closed normally after the TTL
+
+    asyncio.run(go())
+
+
+def test_keepalive_survives_idle_rearm_during_ttl():
+    # 2026-06-15 live bug: BotStoppedSpeaking/transcription/VAD re-arm the short idle-close mid-keepalive and
+    # truncated the hold. With _keepalive_active, _arm_window must bail for the whole TTL.
+    client = FakeBrainClient()
+    g = _gate(client, window_secs=0.01, hold_max_secs=120.0)
+
+    async def go():
+        g._set_keepalive(0.06)
+        g._arm_window()                   # simulate Aria finishing TTS (BotStoppedSpeaking) mid-keepalive
+        await asyncio.sleep(0.03)         # well past the 10ms idle window
+        assert g._open is True            # NOT truncated — the keepalive held it open
+        await asyncio.sleep(0.05)         # TTL elapses → idle re-armed → closes
+        assert g._open is False
+
+    asyncio.run(go())
+
+
+def test_keepalive_ttl_clamped_to_ceiling():
+    g = _gate(hold_max_secs=30.0)
+    assert g._clamp_ttl(10) == 10.0
+    assert g._clamp_ttl(999) == 30.0     # oversized TTL clamped to the ceiling
+    assert g._clamp_ttl(0) == 0.0
+    assert g._clamp_ttl(-5) == 0.0
+    assert g._clamp_ttl("bad") == 0.0    # non-numeric → no hold
+
+
+def test_keepalive_refresh_extends_window():
+    client = FakeBrainClient()
+    g = _gate(client, window_secs=0.01, hold_max_secs=120.0)
+
+    async def go():
+        g._set_keepalive(0.04)
+        await asyncio.sleep(0.03)
+        assert g._open is True
+        g._set_keepalive(0.06)            # a second media command refreshes the hold
+        await asyncio.sleep(0.03)         # past the first TTL, still within the refreshed one
+        assert g._open is True
+
+    asyncio.run(go())
+
+
 def test_escape_count_zero_disables_hatch():
     client = FakeBrainClient()
     g = _gate(client, escape_count=0)

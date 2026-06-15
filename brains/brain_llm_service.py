@@ -280,6 +280,15 @@ class BrainLLMService(LLMService):
 
         await self.push_frame(WakeHoldFrame(hold=hold), FrameDirection.UPSTREAM)
 
+    async def _keepalive_wake(self, ttl_secs: float) -> None:
+        """Media keepalive: tell the wake gate to hold its command window open for `ttl_secs` after a media
+        command (the gate clamps to its ceiling and self-releases on expiry). No-op when there's no gate."""
+        from wake_word import WakeHoldFrame
+
+        await self.push_frame(
+            WakeHoldFrame(hold=True, ttl_secs=ttl_secs), FrameDirection.UPSTREAM
+        )
+
     async def _set_thinking(self, active: bool) -> None:
         """Bracket the bot turn for the user-mute strategy: push BotThinkingFrame UPSTREAM so the user is
         muted from turn start (before any TTS) until it ends. No-op effect when the strategy isn't wired
@@ -485,6 +494,15 @@ class BrainLLMService(LLMService):
                     # boundary: keep consuming (a `done` still follows).
                     _tlog(f"ASIDE | not addressed (addressed={ev.addressed!r}) → release duck")
                     await self._release_duck_for_aside()
+                elif ev.type == "wake_hold":
+                    # Media keepalive: the brain ran a media command, so hold the wake gate's command window
+                    # open for ttl_secs (a follow-up media command then needs no re-wake). The gate clamps
+                    # the TTL to its ceiling and self-releases on expiry. NOT a stream boundary: keep
+                    # consuming (a `done` still follows).
+                    ttl = ev.ttl_secs
+                    if ttl and ttl > 0:
+                        _tlog(f"KEEPALIVE| media — hold wake window {ttl:.0f}s")
+                        await self._keepalive_wake(ttl)
                 elif ev.type == "done":
                     return
         except asyncio.CancelledError:

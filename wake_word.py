@@ -50,11 +50,18 @@ _CHUNK_BYTES = _CHUNK_SAMPLES * 2  # int16 mono
 
 @dataclass
 class WakeHoldFrame(SystemFrame):
-    """Pushed UPSTREAM by the brain (BrainLLMService) to keep the wake gate's command window OPEN while
-    a confirm is pending — so the user's yes/no answer doesn't require a fresh wake — and to release it
-    after the confirm resolves. SystemFrame so it propagates promptly regardless of queueing."""
+    """Pushed UPSTREAM by the brain (BrainLLMService) to keep the wake gate's command window OPEN.
+
+    Two modes:
+    - Confirm hold (`ttl_secs=None`): hold indefinitely while a confirm is pending; `hold=True` opens/freezes,
+      `hold=False` releases. The user's yes/no answer then needs no fresh wake.
+    - Media keepalive (`ttl_secs` set, `hold=True`): hold the window open for a TTL after a media command, so a
+      follow-up command needs no re-wake. Release is automatic on TTL expiry (the brain never sends a false);
+      the gate clamps the TTL to its hard ceiling and self-releases if refreshes stop.
+    SystemFrame so it propagates promptly regardless of queueing."""
 
     hold: bool = True
+    ttl_secs: float | None = None
 
 
 @dataclass
@@ -99,6 +106,7 @@ class WakeWordGate(FrameProcessor):
         min_dwell_secs: float = 2.0,
         window_mute: bool = True,
         preduck_grace: float = 3.0,
+        hold_max_secs: float = 120.0,
         time_source: Callable[[], float] | None = None,
         **kwargs,
     ):
@@ -181,6 +189,14 @@ class WakeWordGate(FrameProcessor):
         self._last_wake = 0.0
         self._ducked = False
         self._window_task: asyncio.Task | None = None
+        # Brain media-keepalive (WakeHoldFrame with ttl_secs): hold the command window open for a TTL after a
+        # media command so a follow-up needs no re-wake. _hold_max_secs is the hard ceiling — a TTL is clamped
+        # to it, and it auto-releases if the brain's refreshes stop (crash/dropped turn). See _set_keepalive.
+        self._hold_max_secs = hold_max_secs
+        self._keepalive_task: asyncio.Task | None = None
+        # While True, idle-close is suspended for the WHOLE keepalive TTL (like _hold) so a BotStoppedSpeaking
+        # / transcription / VAD re-arm of the 15s idle timer can't truncate the hold (2026-06-15 live bug).
+        self._keepalive_active = False
         # Peak score within the current sub-threshold burst (one line emitted per utterance, not per frame).
         self._nearmiss_peak = 0.0
         self._nearmiss_key = ""
@@ -233,9 +249,12 @@ class WakeWordGate(FrameProcessor):
             await self.push_frame(frame, direction)
             return
 
-        # Confirm pending (from the brain): hold the window open so the yes/no answer needs no re-wake.
+        # Hold the window open (from the brain). ttl_secs set → media keepalive (timed); else confirm hold.
         if isinstance(frame, WakeHoldFrame):
-            self._set_hold(frame.hold)
+            if frame.ttl_secs is not None and frame.hold:
+                self._set_keepalive(frame.ttl_secs)
+            else:
+                self._set_hold(frame.hold)
             await self.push_frame(frame, direction)
             return
 
@@ -447,6 +466,7 @@ class WakeWordGate(FrameProcessor):
 
     def _open_window(self, log_msg: str) -> None:
         """Open the command window (idempotent): log the reason, pre-duck, arm the idle timer."""
+        self._cancel_keepalive()  # a fresh wake/confirm supersedes any media keepalive hold
         if not self._open:
             self._open = True
             _tlog(log_msg)
@@ -461,8 +481,8 @@ class WakeWordGate(FrameProcessor):
     # --- command window ----------------------------------------------------
     def _arm_window(self) -> None:
         self._cancel_window()
-        if self._hold:
-            return  # held open for a pending confirm — no idle close until released
+        if self._hold or self._keepalive_active:
+            return  # held open (pending confirm) or kept alive (media TTL) — no idle close until released
 
         async def _later():
             try:
@@ -481,6 +501,51 @@ class WakeWordGate(FrameProcessor):
         if self._window_task is not None and not self._window_task.done():
             self._window_task.cancel()
         self._window_task = None
+
+    # --- media keepalive (brain TTL hold) ----------------------------------
+    def _clamp_ttl(self, ttl_secs: float) -> float:
+        """Clamp a brain-supplied keepalive TTL to [0, _hold_max_secs] (the hard ceiling). 0 = no hold."""
+        try:
+            ttl = float(ttl_secs)
+        except (TypeError, ValueError):
+            return 0.0
+        if ttl <= 0:
+            return 0.0
+        return min(ttl, self._hold_max_secs)
+
+    def _set_keepalive(self, ttl_secs: float) -> None:
+        """Hold the command window open for a clamped TTL after a media command (brain keepalive), so a
+        follow-up needs no re-wake. Refreshed by each new keepalive; on expiry it re-arms the normal idle
+        close. Capped by _hold_max_secs so a missed/oversized refresh can't pin the mic open."""
+        ttl = self._clamp_ttl(ttl_secs)
+        if ttl <= 0:
+            return
+        self._cancel_keepalive()
+        self._cancel_window()  # suspend the normal idle close while the keepalive holds the window open
+        self._keepalive_active = True  # make _arm_window bail for the whole TTL (no idle-close truncation)
+        if not self._open:
+            self._open = True
+            _tlog(f"GATE  | keepalive — opening window for {ttl:.0f}s")
+            self._fire_duck(True)
+        else:
+            _tlog(f"GATE  | keepalive — window held {ttl:.0f}s")
+
+        async def _later():
+            try:
+                await asyncio.sleep(ttl)
+                self._keepalive_active = False
+                _tlog("GATE  | keepalive expired — re-arming idle window")
+                self._arm_window()
+            except asyncio.CancelledError:
+                pass
+
+        self._keepalive_task = asyncio.create_task(_later())
+
+    def _cancel_keepalive(self) -> None:
+        self._keepalive_active = False
+        if self._keepalive_task is not None and not self._keepalive_task.done():
+            self._keepalive_task.cancel()
+        self._keepalive_task = None
 
     # --- pre-duck release grace --------------------------------------------
     def _arm_preduck(self) -> None:
