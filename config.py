@@ -707,7 +707,9 @@ def build_wake_word_gate(llm):
     window_mute = _env("WAKE_WINDOW_MUTE", "0") not in ("0", "false", "False")
     # Release the wake pre-duck after this many seconds if no speech follows the wake (an unused/phantom
     # wake), instead of holding media ducked for the whole window. Held while the user or Aria is speaking.
-    preduck_grace = float(_env("WAKE_PREDUCK_GRACE", "3.0"))
+    # 6s matches the human "hear the duck, then compose and speak the command" loop — 3s released the duck
+    # before the user began, so the command landed over restored audio and was missed (2026-06-15 live).
+    preduck_grace = float(_env("WAKE_PREDUCK_GRACE", "6.0"))
     speex_ns = False  # openWakeWord-only; set below when that engine is selected
     extra_log = ""
 

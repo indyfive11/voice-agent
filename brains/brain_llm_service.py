@@ -39,6 +39,15 @@ from brains.brain_client import BrainClient, BrainEvent
 
 _YES_WORDS = ("yes", "yeah", "yep", "yup", "confirm", "proceed", "go ahead", "do it", "affirmative", "sure")
 
+# Explicit "back out entirely" phrases for the controllable-client play confirm (yes-here / no-new-window /
+# cancel). A plain "no" must still mean *new window*, so these are matched separately and ONLY trigger cancel
+# — never folded into the yes/no parse. Sent through the existing confirm `passphrase` field (brain accepts
+# {cancel,cancelled,canceled,__cancel__}); no schema change. 2026-06-15 GA ask.
+_CANCEL_PHRASES = (
+    "cancel", "never mind", "nevermind", "forget it", "wrong movie", "wrong one",
+    "neither", "don't play it", "dont play it", "do not play it", "stop it",
+)
+
 # Multi-word phrases only (single words like "sleep"/"wake" cause false hits, e.g. "otters sleep").
 # "mute"-style requests map here too — live, the user asked to "mute voice mode" repeatedly and got
 # pointed at *shutdown*; muting/"stop until I call you" IS this sleep gate. Deliberately NOT a bare
@@ -57,8 +66,10 @@ _WAKE_PHRASES = ("wake up", "i'm back", "are you awake", "you awake", "start lis
 # the old "any transcript while gated = wake" rule then woke her on it (2026-06-15: talk radio re-woke her
 # on "Hike through the wilderness…"). Matched as a WHOLE WORD against the punctuation-stripped transcript
 # (so "malaria" can't trip it). Conservative on purpose — a missed real wake costs one repeat, a false wake
-# while asleep is the whole bug — so risky soundalikes ("area") are deliberately excluded.
-_WAKE_VOCATIVES = ("aria", "arya", "ariya")
+# while asleep is the whole bug — so risky soundalikes ("area") are deliberately excluded. "ari" is the
+# common STT clipping of "Aria" (2026-06-15 live: "Hey, Ari." left a residual that defeated the bare-
+# vocative guard → an unwanted chit-chat reply); included as a name variant, not a generic soundalike.
+_WAKE_VOCATIVES = ("aria", "arya", "ariya", "ari")
 
 # Clean exit of the whole voice agent. Deliberately specific to *this process* — never bare
 # "shut down"/"power off", which are the brain's job (system control) and must pass through.
@@ -132,6 +143,23 @@ def _command_is_standalone(low_norm: str, phrase: str) -> bool:
     """
     residual = [w for w in low_norm.replace(phrase, " ").split() if w not in _COMMAND_FILLERS]
     return len(residual) <= _DESTRUCTIVE_CMD_MAX_RESIDUAL_WORDS
+
+
+def _is_bare_vocative(low_norm: str) -> bool:
+    """True when the turn is ONLY the wake vocative ("Aria" / "Hey Aria") with no command attached.
+
+    The acoustic wake gate already opened the command window and pre-ducked on the spoken name, so
+    forwarding a lone "Aria" to the brain only yields a chit-chat reply ("Yeah?") whose TTS then collides
+    with the command the user speaks a beat later — the duck is the only acknowledgement they want
+    (2026-06-15 live: "Hey Aria" → BOT "Hey, what's up?" barged over the command, 8s round-trip, missed).
+    Bare iff a vocative token is present and nothing remains after stripping the vocative + fillers.
+    Scoped to the NAME only (not wake phrases like "are you awake", which read as real questions).
+    """
+    toks = low_norm.split()
+    if not any(v in toks for v in _WAKE_VOCATIVES):
+        return False
+    leftover = [w for w in toks if w not in _WAKE_VOCATIVES and w not in _COMMAND_FILLERS]
+    return not leftover
 
 
 def _tlog(message: str) -> None:
@@ -332,14 +360,30 @@ class BrainLLMService(LLMService):
                 _tlog("SKIP  | empty user turn ignored")
                 return
 
+            # Bare vocative ("Aria" / "Hey Aria" with no command) → the acoustic wake gate already opened
+            # the window and pre-ducked on the spoken name, so don't forward it to the brain: its chit-chat
+            # reply would barge over the command the user speaks a beat later (the duck is the ack they
+            # want). Not applied during a pending confirm (handled below). 2026-06-15 live regression.
+            if self._pending_confirm is None and _is_bare_vocative(low_norm):
+                _tlog(f"VOCATIVE| {user_text!r} (window open via wake gate; awaiting command)")
+                return
+
             # --- normal turn / confirm resume ---
             if self._pending_confirm is not None:
                 pending = self._pending_confirm
                 self._pending_confirm = None
                 await self._hold_wake(False)  # confirm answered → release the wake-gate hold
-                approved = self._parse_yes_no(user_text)
-                _tlog(f"USER  | {user_text!r}  (confirm decision: approved={approved})")
-                stream = self._client.confirm(self._session_id, pending["id"], approved)
+                if self._is_cancel(user_text):
+                    # Explicit "wrong one / back out" — distinct from "no" (= new window). The brain reads
+                    # this through the existing confirm passphrase field and aborts without playing.
+                    _tlog(f"USER  | {user_text!r}  (confirm decision: cancelled)")
+                    stream = self._client.confirm(
+                        self._session_id, pending["id"], approved=False, passphrase="cancel"
+                    )
+                else:
+                    approved = self._parse_yes_no(user_text)
+                    _tlog(f"USER  | {user_text!r}  (confirm decision: approved={approved})")
+                    stream = self._client.confirm(self._session_id, pending["id"], approved)
             else:
                 _tlog(f"USER  | {user_text!r}")
                 stream = self._client.respond(self._session_id, user_text)
@@ -492,6 +536,12 @@ class BrainLLMService(LLMService):
     def _parse_yes_no(text: str) -> bool:
         t = (text or "").strip().lower()
         return any(w in t for w in _YES_WORDS)
+
+    @staticmethod
+    def _is_cancel(text: str) -> bool:
+        """True only for explicit back-out phrases. A plain 'no' is NOT cancel (it = new window)."""
+        t = (text or "").strip().lower()
+        return any(p in t for p in _CANCEL_PHRASES)
 
     async def _keyboard_confirm(self, summary: str, reason: str | None = None) -> bool:
         """Out-of-band physical confirm for Tier-3 actions (KDE kdialog, terminal fallback).

@@ -167,6 +167,49 @@ def test_confirmation_declined():
     assert "cancelled" in " ".join(_texts(pushed)).lower()
 
 
+def test_confirm_cancel_sends_passphrase():
+    # Controllable-client play confirm (yes-here / no-new-window / cancel). An explicit "wrong one"
+    # must back out entirely: approved=False WITH passphrase="cancel" so the brain aborts the play.
+    client = FakeBrainClient(
+        respond_events=[BrainEvent("confirm", id="c3", tier=2, method="spoken_yesno",
+                                   summary="play that movie on your open Chrome")],
+        confirm_events=[BrainEvent("token", text="Okay, I won't play it."), BrainEvent("done")],
+    )
+    svc, pushed = _service_with_recorder(client)
+    asyncio.run(svc._process_context(_ctx("play the movie")))
+    assert svc._pending_confirm == {"id": "c3", "method": "spoken_yesno"}
+    asyncio.run(svc._process_context(_ctx("no, wrong one")))
+    assert client.confirm_calls == [("sess-test", "c3", False, "cancel")]
+    assert svc._pending_confirm is None
+
+
+def test_confirm_plain_no_is_not_cancel():
+    # A bare "no" still means new window (approved=False, passphrase=None) — NOT cancel.
+    client = FakeBrainClient(
+        respond_events=[BrainEvent("confirm", id="c4", tier=2, method="spoken_yesno",
+                                   summary="play that movie on your open Chrome")],
+        confirm_events=[BrainEvent("token", text="Opening a new window."), BrainEvent("done")],
+    )
+    svc, _ = _service_with_recorder(client)
+    asyncio.run(svc._process_context(_ctx("play the movie")))
+    asyncio.run(svc._process_context(_ctx("no")))
+    assert client.confirm_calls == [("sess-test", "c4", False, None)]
+
+
+def test_is_cancel_phrase_matching():
+    f = BrainLLMService._is_cancel
+    assert f("cancel")
+    assert f("never mind")
+    assert f("forget it")
+    assert f("that's the wrong movie")
+    assert f("neither")
+    assert f("don't play it")
+    # plain yes/no decisions are not cancel
+    assert not f("no")
+    assert not f("yes")
+    assert not f("no, open a new window")
+
+
 def test_error_event_spoken_once_fallback_status_suppressed():
     client = FakeBrainClient(respond_events=[
         BrainEvent("error", text="Sorry, I hit a problem.", summary="TimeoutError: jellyfin.play"),
@@ -358,6 +401,36 @@ def test_dictation_blob_does_not_sleep():
     asyncio.run(svc._process_context(_ctx("Just dictating, go to sleep was the phrase we used earlier")))
     assert svc._sleeping is False
     assert client.respond_calls and "go to sleep" in client.respond_calls[0][1].lower()
+
+
+def test_bare_vocative_not_forwarded_to_brain():
+    # 2026-06-15: awake, a lone "Aria"/"Hey Aria" must NOT reach the brain — the acoustic gate already
+    # opened the window, and a chit-chat reply ("Yeah?") would barge over the command spoken a beat later.
+    for text in ("Aria", "Hey Aria", "Hey, Aria!", "Aria?", "okay Aria",
+                 "Hey, Aria.  Hey, Ari."):  # STT clips "Aria"→"Ari" (2026-06-15 live leak)
+        client = FakeBrainClient(respond_events=[BrainEvent("token", text="Yeah?"), BrainEvent("done")])
+        svc, pushed = _service_with_recorder(client)  # awake (not sleeping)
+        asyncio.run(svc._process_context(_ctx(text)))
+        assert client.respond_calls == [], f"forwarded bare vocative {text!r}"
+        assert _texts(pushed) == [], f"spoke a reply to bare vocative {text!r}"
+
+
+def test_vocative_plus_command_is_forwarded():
+    # The guard must only swallow the BARE name — name + command still reaches the brain.
+    for text in ("Aria, pause the movie", "Hey Aria turn it up", "Aria what time is it"):
+        client = FakeBrainClient(respond_events=[BrainEvent("token", text="ok"), BrainEvent("done")])
+        svc, pushed = _service_with_recorder(client)
+        asyncio.run(svc._process_context(_ctx(text)))
+        assert client.respond_calls, f"bare-vocative guard swallowed a command: {text!r}"
+
+
+def test_non_vocative_short_turn_still_forwarded():
+    # No vocative token → not a bare vocative; a short utterance must still reach the brain.
+    for text in ("okay", "are you awake"):
+        client = FakeBrainClient(respond_events=[BrainEvent("token", text="ok"), BrainEvent("done")])
+        svc, pushed = _service_with_recorder(client)
+        asyncio.run(svc._process_context(_ctx(text)))
+        assert client.respond_calls, f"dropped non-vocative turn {text!r}"
 
 
 def _sleeping_service(client, *, gated=True):
