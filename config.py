@@ -679,15 +679,21 @@ def build_wake_word_gate(llm):
     # "hey aria" holds above threshold for 5-9 frames; music false-positives are isolated 1-frame spikes,
     # so this rejects the blips without touching real wakes (2026-06-04, data-backed). 1 = old behaviour.
     consec_frames = int(_env("WAKE_CONSEC_FRAMES", "3"))
-    gate_video = _env("WAKE_GATE_VIDEO", "0") not in ("0", "false", "False")  # default: don't gate video
+    # Default 1 = gate VIDEO behind the wake word too (a movie only ducks once you say "Aria"; no duck on
+    # asides). Safe to default on because the AEC echo-cancel mic keeps the movie out of the mic, so the
+    # wake word is heard cleanly over it (the old over-movie lockout that kept this off is gone). Set 0 on a
+    # box WITHOUT an echo-cancel source, where a movie would mask the wake word and lock you out.
+    gate_video = _env("WAKE_GATE_VIDEO", "1") not in ("0", "false", "False")
     # F3 gate hardening (defense-in-depth): never clamp the mic mid-utterance, and require a media-state
     # change to persist before flipping the gate so a transient blip can't truncate a command / leak the
     # wake phrase. guard_inflight on by default; min_dwell 0 = old instant-flip behaviour.
     guard_inflight = _env("WAKE_GATE_GUARD_INFLIGHT", "1") not in ("0", "false", "False")
     min_dwell_secs = float(_env("WAKE_GATE_MIN_DWELL_SECS", "2.0"))
     # On wake-window-open, send /media/duck {mute:true} → media to full 0% for the window (vs a partial
-    # duck) so no music vocal bleeds into the command's STT. On by default; 0 = plain pre-duck.
-    window_mute = _env("WAKE_WINDOW_MUTE", "1") not in ("0", "false", "False")
+    # duck) so no music vocal bleeds into the command's STT. Default 0 = a partial duck (media only dips):
+    # with an AEC mic keeping media out of the mic, a full mute isn't needed and a partial duck is less
+    # jarring. Set 1 on a box WITHOUT an echo-cancel source, where media would bleed into the command STT.
+    window_mute = _env("WAKE_WINDOW_MUTE", "0") not in ("0", "false", "False")
     # Release the wake pre-duck after this many seconds if no speech follows the wake (an unused/phantom
     # wake), instead of holding media ducked for the whole window. Held while the user or Aria is speaking.
     preduck_grace = float(_env("WAKE_PREDUCK_GRACE", "3.0"))
