@@ -448,6 +448,46 @@ def test_keepalive_refresh_extends_window():
     asyncio.run(go())
 
 
+def test_keepalive_preduck_releases_after_grace_window_stays_open():
+    # 2026-06-15 regression: the keepalive pre-ducked but armed NO release, and _keepalive_active suppresses
+    # the idle-close that would release it → the movie stayed ducked for the whole TTL (stuck at 18% ~30s
+    # after a play command). The pre-duck must release after the grace (no speech) while the window stays
+    # open for follow-ups (media_duck re-ducks on the next speech onset).
+    client = FakeBrainClient()
+    g = _gate(client, window_secs=10.0, hold_max_secs=120.0, preduck_grace=0.03)
+
+    async def go():
+        g._set_keepalive(5.0)             # media command → hold window + pre-duck
+        await asyncio.sleep(0)            # let the fire-and-forget duck task run
+        assert client.duck_calls == [("sess-test", True)]
+        await asyncio.sleep(0.06)         # past the pre-duck grace, no speech follows
+        assert client.duck_calls == [("sess-test", True), ("sess-test", False)]  # pre-duck released
+        assert g._open is True            # window STILL open — the keepalive holds it
+        assert g._keepalive_active is True
+
+    asyncio.run(go())
+
+
+def test_keepalive_preduck_releases_after_announcement():
+    # Aria's movie announcement (BotStarted) cancels the pre-duck timer; BotStopped must re-arm it so the
+    # pre-duck releases after she finishes — else the keepalive-held window (which never idle-closes) pins the
+    # movie ducked for the whole TTL.
+    client = FakeBrainClient()
+    g = _gate(client, window_secs=10.0, hold_max_secs=120.0, preduck_grace=0.04)
+
+    async def go():
+        g._set_keepalive(5.0)             # pre-duck on, release armed
+        await g.process_frame(BotStartedSpeakingFrame(), FrameDirection.DOWNSTREAM)  # announcement → cancels timer
+        await asyncio.sleep(0.07)         # would have released, but the timer was cancelled
+        assert client.duck_calls == [("sess-test", True)]   # still ducked DURING the announcement
+        await g.process_frame(BotStoppedSpeakingFrame(), FrameDirection.DOWNSTREAM)  # she finishes → re-arm
+        await asyncio.sleep(0.07)         # grace elapses with no speech
+        assert client.duck_calls == [("sess-test", True), ("sess-test", False)]  # released after she finishes
+        assert g._open is True            # window still open (keepalive)
+
+    asyncio.run(go())
+
+
 def test_escape_count_zero_disables_hatch():
     client = FakeBrainClient()
     g = _gate(client, escape_count=0)

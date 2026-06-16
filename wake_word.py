@@ -246,6 +246,11 @@ class WakeWordGate(FrameProcessor):
             self._bot_speaking = False
             if self._open:
                 self._arm_window()
+                # Aria's reply/announcement cancelled the pre-duck timer on BotStarted; re-arm it so a
+                # pre-duck left on after she finishes (notably the keepalive pre-duck, whose window is held
+                # open and so never idle-closes) still releases once the grace elapses with no speech.
+                if self._ducked and not self._hold:
+                    self._arm_preduck()
             await self.push_frame(frame, direction)
             return
 
@@ -529,6 +534,12 @@ class WakeWordGate(FrameProcessor):
             self._fire_duck(True)
         else:
             _tlog(f"GATE  | keepalive — window held {ttl:.0f}s")
+        # Release the pre-duck after the grace if no speech follows — the keepalive holds the *window* open
+        # for follow-ups, but the media must return to full while the user is silent (media_duck re-ducks on
+        # the next speech onset). Without this the pre-duck stayed pinned for the whole TTL (movie stuck
+        # ducked ~30s after a play command, 2026-06-15). Not while held for a confirm.
+        if not self._hold:
+            self._arm_preduck()
 
         async def _later():
             try:
