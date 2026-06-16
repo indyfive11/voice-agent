@@ -232,12 +232,28 @@ async def run() -> None:
             stop_secs=smart_turn_stop_secs, max_duration_secs=8, pre_speech_ms=500
         )
     )
-    # Start strategies: half-duplex keeps the default VAD-onset start. Full-duplex (mic open
-    # during TTS) gates turn-start on transcribed words via MinWords so residual TTS/media bleed
-    # can't false-start a turn / barge-in (min_words applies only while the bot is speaking; a
-    # single word starts a turn otherwise). Tune the interruption threshold via BARGE_IN_MIN_WORDS.
+    # Start strategies. The pipecat default is [VAD-onset, Transcription] — a bare VAD onset (no
+    # transcribed words) starts a turn, which BROADCASTS AN INTERRUPTION that cancels any in-flight bot
+    # turn. That's the residual empty-barge-in the thinking-mute can't always catch: 2026-06-15, 5ms after
+    # SmartTurn closed the maintainer's "Was your performance adequate?" turn and it forwarded, his own trailing audio
+    # tripped a wordless VADUserTurnStartStrategy onset → interruption → it cancelled the turn his words had
+    # just submitted (`BARGE-IN| said so far: ''`), so Aria silently dropped a question he was waiting on.
+    # The thinking-mute (BotThinkingFrame) is pushed upstream at turn-start but engages ~30ms later — the
+    # onset slips through that propagation gap. Fix: gate turn-start on >=1 transcribed word (interim) in
+    # BOTH modes, so a wordless VAD blip can't start a turn / interrupt. A single real word still starts a
+    # turn immediately; the media duck rides the separate VAD-onset path, unaffected. Half-duplex uses
+    # min_words=1 (reject only wordless onsets); full-duplex keeps 2 (also reject single-word TTS bleed).
+    # HALF_DUPLEX_START_MIN_WORDS=0 restores the bare-VAD default.
     if half_duplex:
-        start_strategies = default_user_turn_start_strategies()
+        min_words = int(os.environ.get("HALF_DUPLEX_START_MIN_WORDS", "1"))
+        if min_words > 0:
+            start_strategies = [
+                MinWordsUserTurnStartStrategy(min_words=min_words, use_interim=True)
+            ]
+            logger.info(f"Half-duplex turn-start gated on min_words={min_words} (rejects wordless barge-in)")
+        else:
+            start_strategies = default_user_turn_start_strategies()
+            logger.info("Half-duplex turn-start: bare-VAD default (HALF_DUPLEX_START_MIN_WORDS=0)")
     else:
         min_words = int(os.environ.get("BARGE_IN_MIN_WORDS", "2"))
         start_strategies = [
@@ -273,13 +289,16 @@ async def run() -> None:
         ),
     )
 
-    # Media-duck controller goes right after STT — it's the only spot that sees transcription
-    # frames (the user aggregator consumes them). No-op / absent for a raw-LLM brain.
-    media_duck = config.build_media_duck(llm)
-
     # Wake-word gate (opt-in via WAKE_WORD) sits before STT — while media plays it requires the wake
     # word before audio reaches STT (sidesteps STT-over-music) and pre-ducks on wake. None when unset.
+    # Built before the media-duck so the duck can be gated behind the wake word (DUCK_REQUIRE_WAKE).
     wake_gate = config.build_wake_word_gate(llm)
+
+    # Media-duck controller goes right after STT — it's the only spot that sees transcription
+    # frames (the user aggregator consumes them). No-op / absent for a raw-LLM brain. Gated behind the
+    # wake word via `gate` so media only ducks once Aria is addressed (window open), for ALL playback —
+    # not on ambient room speech (2026-06-15, the maintainer: gate the duck the same as STT, all media).
+    media_duck = config.build_media_duck(llm, gate=wake_gate)
     # Tell the brain whether an acoustic gate exists: with one, going to sleep forces it active so only
     # "hey aria" can wake her (no STT on ambient TV); without one, sleep falls back to text-phrase wake.
     if hasattr(llm, "set_acoustic_wake_gated"):

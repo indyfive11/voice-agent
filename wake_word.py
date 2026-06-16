@@ -299,6 +299,16 @@ class WakeWordGate(FrameProcessor):
             _tlog("GATE  | hold released — re-arming idle window")
             self._arm_window()
 
+    def duck_allowed(self) -> bool:
+        """Whether the downstream media-duck may fire on a speech onset. Gate the duck behind the wake word
+        for ALL gated media (audio AND video, like the STT gate): duck only once the command window is OPEN
+        (the user woke Aria → a command is coming, make room) or when media isn't being gated at all. While
+        gated+closed (media playing, no wake yet) a speech onset is room conversation, not for Aria — so the
+        duck is suppressed and media no longer dips every time someone talks (2026-06-15, the maintainer: gate the duck
+        the same as STT, for all playback). The on-wake pre-duck is fired by the gate itself (`_open_window`),
+        so a real "Hey Aria" still ducks immediately; this only suppresses the un-woken ambient-speech duck."""
+        return self._open or not bool(self._gated_committed)
+
     def hb_state(self) -> dict:
         """Snapshot for the input-watchdog heartbeat (and reset the wake-peak window). `gated=True
         open=False` with a low `wake_peak` over several beats = a LOCKOUT (masking), distinct from a

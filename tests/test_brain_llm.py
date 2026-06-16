@@ -7,11 +7,11 @@ driven with asyncio.run so plain pytest (no pytest-asyncio) works.
 
 import asyncio
 
-from pipecat.frames.frames import LLMTextFrame
+from pipecat.frames.frames import LLMTextFrame, TTSSpeakFrame
 from pipecat.processors.aggregators.llm_context import LLMContext
 
 from brains.brain_client import BrainEvent, FakeBrainClient
-from brains.brain_llm_service import BrainLLMService
+from brains.brain_llm_service import BrainLLMService, _BARE_WAKE_PROMPT
 
 
 def _service_with_recorder(client):
@@ -31,6 +31,11 @@ def _ctx(user_text):
 
 def _texts(frames):
     return [f.text for f in frames if isinstance(f, LLMTextFrame)]
+
+
+def _spoken_texts(frames):
+    # Both the normal LLM token stream and immediate short utterances (the bare-wake prompt is a TTSSpeakFrame).
+    return [f.text for f in frames if isinstance(f, (LLMTextFrame, TTSSpeakFrame))]
 
 
 def test_tokens_become_text_frames():
@@ -443,33 +448,74 @@ def test_bare_vocative_not_forwarded_to_brain():
         assert _texts(pushed) == [], f"spoke a reply to bare vocative {text!r}"
 
 
-def test_vocative_plus_command_is_forwarded():
-    # The guard must only swallow the BARE name — name + command still reaches the brain.
-    for text in ("Aria, pause the movie", "Hey Aria turn it up", "Aria what time is it"):
+def test_vocative_plus_command_is_forwarded_with_wake_word_stripped():
+    # name + command reaches the brain, and the wake word is STRIPPED — the brain hears only the command
+    # (the wake word is consumed by the voice-side gate). 2026-06-15, the maintainer.
+    cases = {
+        "Aria, pause the movie": "pause the movie",
+        "Hey Aria turn it up": "turn it up",
+        "Hey Aria, play a movie from jellyfin": "play a movie from jellyfin",
+    }
+    for text, expected in cases.items():
         client = FakeBrainClient(respond_events=[BrainEvent("token", text="ok"), BrainEvent("done")])
         svc, pushed = _service_with_recorder(client)
         asyncio.run(svc._process_context(_ctx(text)))
-        assert client.respond_calls, f"bare-vocative guard swallowed a command: {text!r}"
+        assert client.respond_calls == [("sess-test", expected)], f"{text!r} → {client.respond_calls}"
+
+
+def test_bare_wake_prompts_when_no_command_follows():
+    # "Hey Aria" with nothing after → after a short wait with no command, ask once. Never forwarded.
+    client = FakeBrainClient(respond_events=[BrainEvent("token", text="Hi!"), BrainEvent("done")])
+    svc, pushed = _service_with_recorder(client)
+    svc._bare_wake_delay = 0.01
+
+    async def go():
+        await svc._process_context(_ctx("Hey Aria"))
+        await asyncio.sleep(0.05)  # let the prompt timer fire
+    asyncio.run(go())
+    assert client.respond_calls == []
+    assert _spoken_texts(pushed) == [_BARE_WAKE_PROMPT]
+
+
+def test_bare_wake_prompt_cancelled_by_following_command():
+    # The natural pause: a command arriving after the bare wake answers it — the prompt never fires, and
+    # only the command (no wake word) reaches the brain.
+    client = FakeBrainClient(respond_events=[BrainEvent("token", text="ok"), BrainEvent("done")])
+    svc, pushed = _service_with_recorder(client)
+    svc._bare_wake_delay = 0.05
+
+    async def go():
+        await svc._process_context(_ctx("Hey Aria"))   # bare → arms the prompt
+        await asyncio.sleep(0.01)                       # command arrives before it fires
+        await svc._process_context(_ctx("turn it up"))
+        await asyncio.sleep(0.1)                        # well past the prompt delay
+    asyncio.run(go())
+    assert client.respond_calls == [("sess-test", "turn it up")]
+    assert _BARE_WAKE_PROMPT not in _spoken_texts(pushed)
 
 
 def test_non_vocative_short_turn_still_forwarded():
-    # No vocative token → not a bare vocative; a short utterance must still reach the brain.
+    # No vocative token / wake phrase → not a bare wake; a short utterance must still reach the brain.
     # "arid"/"arise" start with "ari" but are denylisted, so they must NOT read as the wake name.
-    for text in ("okay", "are you awake", "arid", "arise and shine"):
+    # ("are you awake" is now a wake phrase → covered by the bare-wake-prompt test, not here.)
+    for text in ("okay", "what time is it", "arid", "arise and shine"):
         client = FakeBrainClient(respond_events=[BrainEvent("token", text="ok"), BrainEvent("done")])
         svc, pushed = _service_with_recorder(client)
         asyncio.run(svc._process_context(_ctx(text)))
         assert client.respond_calls, f"dropped non-vocative turn {text!r}"
 
 
-def test_fuzzy_vocative_does_not_loosen_asleep_gate():
-    # The lenient ari* match is awake-only. While ASLEEP, an STT-drift soundalike ("Ariette") that is NOT a
-    # strict _WAKE_VOCATIVES whole word must NOT wake her (a false wake while asleep is the whole bug).
+def test_fuzzy_vocative_wakes_from_sleep():
+    # 2026-06-15 (the maintainer): an STT mis-spelling of the name ("Ariette") SHOULD wake her from sleep — the
+    # soundalike match is now used by the asleep gate too. It carries its own denylist and still REQUIRES a
+    # name-ish/wake token, so nameless ambient stays asleep (see test_asleep_ambient_dialogue_does_not_wake).
     client = FakeBrainClient(respond_events=[BrainEvent("token", text="Hi!"), BrainEvent("done")])
     svc, pushed = _sleeping_service(client)
+    svc._bare_wake_delay = 999  # don't let the bare-wake prompt fire mid-test
     asyncio.run(svc._process_context(_ctx("Ariette")))
-    assert svc._sleeping, "fuzzy vocative wrongly woke her from sleep"
-    assert client.respond_calls == []
+    svc._cancel_bare_wake_prompt()
+    assert svc._sleeping is False, "soundalike did not wake from sleep"
+    assert client.respond_calls == []   # bare wake → nothing forwarded, no greeting
 
 
 def _sleeping_service(client, *, gated=True):
@@ -502,13 +548,28 @@ def test_asleep_sleep_phrase_does_not_wake():
     assert client.respond_calls == []
 
 
-def test_asleep_vocative_wakes():
-    for text in ("Aria", "Aria, wake up", "Aria are you there"):
+def test_asleep_bare_vocative_wakes_silently():
+    # Asleep, a bare wake leaves sleep but does NOT greet and does NOT forward — the duck is the ack, and a
+    # bare wake only prompts (after a wait) if no command follows it. 2026-06-15, the maintainer.
+    for text in ("Aria", "Hey Aria", "Aria, wake up", "Hey, Aria.  Hey, Ari."):
         client = FakeBrainClient(respond_events=[BrainEvent("token", text="Hi!"), BrainEvent("done")])
         svc, pushed = _sleeping_service(client)
+        svc._bare_wake_delay = 999  # don't let the prompt fire during the test
         asyncio.run(svc._process_context(_ctx(text)))
+        svc._cancel_bare_wake_prompt()
         assert svc._sleeping is False, f"did not wake on {text!r}"
-        assert any("awake" in t.lower() for t in _texts(pushed)), f"no awake reply for {text!r}"
+        assert client.respond_calls == [], f"bare wake forwarded {text!r}"
+        assert _spoken_texts(pushed) == [], f"bare wake spoke something for {text!r}"
+
+
+def test_asleep_vocative_plus_command_forwards_stripped():
+    # Asleep, "Hey Aria, <command>" wakes AND forwards only the command (wake word stripped), no greeting.
+    client = FakeBrainClient(respond_events=[BrainEvent("token", text="ok"), BrainEvent("done")])
+    svc, pushed = _sleeping_service(client)
+    asyncio.run(svc._process_context(_ctx("Hey Aria, play a movie from jellyfin")))
+    assert svc._sleeping is False
+    assert client.respond_calls == [("sess-test", "play a movie from jellyfin")]
+    assert not any("awake" in t.lower() for t in _spoken_texts(pushed))
 
 
 def test_asleep_wake_phrase_wakes():
@@ -896,11 +957,13 @@ def test_sleep_wake_gates_input():
     assert client.respond_calls == []
     assert _texts(pushed) == []
 
-    # "wake up" → un-mutes; speaks a wake ack.
+    # "wake up" → un-mutes; no spoken ack (the duck is the ack; a bare wake only prompts if nothing follows).
     pushed.clear()
+    svc._bare_wake_delay = 999  # don't let the bare-wake prompt fire during the test
     asyncio.run(svc._process_context(_ctx("hey, wake up")))
+    svc._cancel_bare_wake_prompt()
     assert svc._sleeping is False
-    assert "awake" in " ".join(_texts(pushed)).lower()
+    assert _spoken_texts(pushed) == []
 
     # back to normal — input reaches the brain again.
     pushed.clear()
@@ -1065,11 +1128,13 @@ def test_acoustic_gated_still_requires_a_wake_token():
     assert _texts(pushed) == []
 
     pushed.clear()
-    # Naming her wakes, and the wake turn releases the gate force and doesn't hit the brain.
+    # Naming her wakes and releases the gate force; a bare wake speaks nothing and doesn't hit the brain.
+    svc._bare_wake_delay = 999  # don't let the bare-wake prompt fire during the test
     asyncio.run(svc._process_context(_ctx("Aria")))
+    svc._cancel_bare_wake_prompt()
     assert svc._sleeping is False
     assert _sleep_frames(pushed) == [False]
-    assert "awake" in " ".join(_texts(pushed)).lower()
+    assert _spoken_texts(pushed) == []                     # no greeting — the duck is the ack
     assert client.respond_calls == []                # the wake turn itself doesn't hit the brain
 
 

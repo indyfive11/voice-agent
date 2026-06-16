@@ -91,6 +91,31 @@ def test_unconfirmed_onset_over_movie_does_not_flap():
     assert g._ducked is True
 
 
+def test_duck_gated_behind_wake_word():
+    # 2026-06-15 (the maintainer): with media playing but the wake window CLOSED (no "Hey Aria" yet), a speech onset is
+    # room conversation, not for Aria — it must NOT duck. should_duck models the gate: False while
+    # gated+closed, True once the window opens. Applies to all media (audio + video), like the STT gate.
+    client = FakeBrainClient()
+    allow = {"v": False}  # gate gated+closed → duck suppressed
+    g = MediaDuckController(
+        client, session_id="sess-test", confirm_grace=0.02, restore_grace=0.2,
+        media_status=(lambda: {"playing": True}),
+        should_duck=(lambda: allow["v"]),
+    )
+
+    async def go():
+        g._handle(VADUserStartedSpeakingFrame())   # gated+closed → ambient speech → suppressed
+        await _drain()
+        assert client.duck_calls == [], "ducked on ambient speech while gated+closed"
+        assert g._ducked is False
+        allow["v"] = True                          # "Hey Aria" opened the window
+        g._handle(VADUserStartedSpeakingFrame())   # now a command onset → duck
+        await _drain()
+        assert client.duck_calls == [("sess-test", True)]
+
+    asyncio.run(go())
+
+
 def test_slow_transcript_over_movie_confirms_without_flap():
     # The real-command-over-a-movie case: onset ducks, confirm_grace elapses BEFORE the transcript (slow
     # Whisper), then the ≥min_words transcript lands. There must be NO down→up→down — only the single ON.

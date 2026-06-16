@@ -71,12 +71,12 @@ _WAKE_PHRASES = ("wake up", "i'm back", "are you awake", "you awake", "start lis
 # vocative guard → an unwanted chit-chat reply); included as a name variant, not a generic soundalike.
 _WAKE_VOCATIVES = ("aria", "arya", "ariya", "ari")
 
-# Lenient vocative match — used ONLY by the bare-vocative suppression path (awake; low cost, worst case it
-# drops a lone one-word turn that wasn't really the name). STT spells "Aria" many ways live
-# (aria/arya/ariya/ari/ariette/ariane — 2026-06-15), so an exact list is whack-a-mole. A short "ari"/"ary"
-# prefix catches the family; a denylist keeps real words (arid/arise/ariel/arial…) out. Deliberately NOT
-# used for the asleep-wake gate, which stays on the strict _WAKE_VOCATIVES whole-word list — a false wake
-# while asleep is the whole bug, so soundalikes must not open it.
+# Lenient vocative match — the wake-word strip and bare-wake handling, AND (since 2026-06-15) the
+# asleep-wake gate. STT spells "Aria" many ways live (aria/arya/ariya/ari/ariette/ariane), so an exact
+# list is whack-a-mole. A short "ari"/"ary" prefix catches the family; a denylist keeps real words
+# (arid/arise/ariel/arial…) out. It does NOT loosen the asleep gate: a wake token/phrase is still REQUIRED
+# there, so a NAMELESS ambient line stays asleep — the soundalike only recovers a mis-spelled name (the maintainer:
+# "the wake word should not have an unnecessary response", and a real wake lost to STT noise just repeats).
 _VOCATIVE_PREFIXES = ("ari", "ary")
 _VOCATIVE_DENY = frozenset((
     "arid", "arise", "arises", "arisen", "arising", "aristocrat", "aristocratic",
@@ -85,7 +85,7 @@ _VOCATIVE_DENY = frozenset((
 
 
 def _looks_like_vocative(tok: str) -> bool:
-    """Lenient: a token that is or resembles the wake name. Bare-vocative path only (see above)."""
+    """Lenient: a token that is or resembles the wake name (see the note above)."""
     if tok in _WAKE_VOCATIVES:
         return True
     if tok in _VOCATIVE_DENY:
@@ -166,21 +166,50 @@ def _command_is_standalone(low_norm: str, phrase: str) -> bool:
     return len(residual) <= _DESTRUCTIVE_CMD_MAX_RESIDUAL_WORDS
 
 
-def _is_bare_vocative(low_norm: str) -> bool:
-    """True when the turn is ONLY the wake vocative ("Aria" / "Hey Aria") with no command attached.
+# Lead-in words that can precede the name in a wake ("hey aria", "ok aria", "yo aria"). Stripped with the
+# name so the brain hears only the command. Kept short — these are conversational openers, not commands.
+_WAKE_LEADINS = frozenset(("hey", "ok", "okay", "yo", "hi", "hello", "um", "uh", "so", "well"))
 
-    The acoustic wake gate already opened the command window and pre-ducked on the spoken name, so
-    forwarding a lone "Aria" to the brain only yields a chit-chat reply ("Yeah?") whose TTS then collides
-    with the command the user speaks a beat later — the duck is the only acknowledgement they want
-    (2026-06-15 live: "Hey Aria" → BOT "Hey, what's up?" barged over the command, 8s round-trip, missed).
-    Bare iff a vocative token is present and nothing remains after stripping the vocative + fillers.
-    Scoped to the NAME only (not wake phrases like "are you awake", which read as real questions).
+# Spoken only when the user says the wake word alone and never follows with a command (after a short wait).
+# Natural-conversation flow: you answer the command after your name, not the name itself — and you ask
+# "did you need something?" only when the name is left hanging (2026-06-15, the maintainer).
+_BARE_WAKE_PROMPT = "Yes? Did you need something?"
+
+
+def _strip_leading_wake(user_text: str, low_norm: str) -> tuple[bool, str, bool]:
+    """Strip a LEADING wake trigger and return (had_wake, command, is_bare).
+
+    A wake trigger is an optional lead-in ("hey"/"ok"/…) followed by the name (or a soundalike — see
+    _looks_like_vocative), OR a wake phrase ("wake up", "are you awake") at the very start. Consecutive
+    triggers are all stripped ("Hey Aria. Hey Ari." → nothing), and only LEADING ones, so a name used
+    mid-sentence ("what's that opera Aria about") is left intact.
+
+    `had_wake` is True when the utterance opened with a trigger; `command` is the remainder with original
+    case preserved (the wake word is consumed by the voice-side gate and never sent to the brain). `is_bare`
+    is True when, after the trigger, nothing meaningful is left — empty, or only fillers/leftover vocatives
+    ("Hey Aria", "Hey Aria please", "Hey Aria. Hey Ari.") — i.e. the name was left hanging with no command.
     """
     toks = low_norm.split()
-    if not any(_looks_like_vocative(w) for w in toks):
-        return False
-    leftover = [w for w in toks if not _looks_like_vocative(w) and w not in _COMMAND_FILLERS]
-    return not leftover
+    consumed = 0
+    had_wake = False
+    while consumed < len(toks):
+        i = consumed
+        while i < len(toks) and toks[i] in _WAKE_LEADINS:
+            i += 1
+        if i < len(toks) and _looks_like_vocative(toks[i]):
+            consumed = i + 1
+        else:
+            rest = " ".join(toks[i:])
+            wp = next((p for p in _WAKE_PHRASES if rest == p or rest.startswith(p + " ")), None)
+            if wp is None:
+                break
+            consumed = i + len(wp.split())
+        had_wake = True
+    if not had_wake:
+        return False, user_text, False
+    residual = [w for w in toks[consumed:] if w not in _COMMAND_FILLERS and not _looks_like_vocative(w)]
+    command = " ".join(user_text.split()[consumed:])
+    return True, command, not residual
 
 
 def _tlog(message: str) -> None:
@@ -214,6 +243,10 @@ class BrainLLMService(LLMService):
         # because a phantom acoustic spike on un-AEC'd room audio can open the gate without a real wake
         # (2026-06-15). Kept for the main.py wiring and possible diagnostics; see the sleep branch below.
         self._acoustic_wake_gated = False
+        # Bare-wake prompt: when the user says only the wake word, wait this long for a command before
+        # asking "did you need something?" — a following command cancels the wait (see _arm/_cancel).
+        self._bare_wake_delay = float(os.environ.get("BARE_WAKE_PROMPT_DELAY", "3.5"))
+        self._bare_wake_task: asyncio.Task | None = None
         # Log the correlation key so the transcript can be lined up with the brain's own logs.
         _tlog(f"BRAIN | gabagent session_id={self._session_id}")
 
@@ -271,6 +304,31 @@ class BrainLLMService(LLMService):
         if text:
             self._reply_buf.append(text)
             await self.push_frame(TTSSpeakFrame(text) if immediate else LLMTextFrame(text))
+
+    def _arm_bare_wake_prompt(self) -> None:
+        """User said only the wake word: wait `_bare_wake_delay`, then ask "did you need something?" — but
+        a command arriving first cancels it (the natural pause before you answer a hanging name). Re-arming
+        resets the wait (a second "Hey Aria" means keep waiting)."""
+        self._cancel_bare_wake_prompt()
+        self._bare_wake_task = asyncio.create_task(self._bare_wake_prompt())
+
+    def _cancel_bare_wake_prompt(self) -> None:
+        if self._bare_wake_task is not None and not self._bare_wake_task.done():
+            self._bare_wake_task.cancel()
+        self._bare_wake_task = None
+
+    async def _bare_wake_prompt(self) -> None:
+        try:
+            await asyncio.sleep(self._bare_wake_delay)
+        except asyncio.CancelledError:
+            return
+        # No command followed the bare wake — prompt once. immediate=True so the short standalone phrase
+        # isn't held in the TTS sentence aggregator (see _speak). Logged as its own BOT line.
+        _tlog("WAKE  | bare wake unanswered — prompting")
+        self._reply_buf = []
+        await self._speak(_BARE_WAKE_PROMPT, immediate=True)
+        _tlog("BOT   | " + _BARE_WAKE_PROMPT)
+        self._bare_wake_task = None
 
     async def _hold_wake(self, hold: bool) -> None:
         """Tell the wake gate (upstream, if present) to hold its command window open while a confirm is
@@ -335,6 +393,11 @@ class BrainLLMService(LLMService):
         lead = " ".join(low_norm.split()[:4])
         is_dictation = any(m in lead for m in _DICTATION_MARKERS)
         try:
+            # A new spoken turn answers any pending "did you need something?" prompt, so cancel it (a bare
+            # wake below re-arms the wait). A blank/blip turn isn't a real utterance — leave it pending.
+            if user_text.strip():
+                self._cancel_bare_wake_prompt()
+
             # --- shutdown: a clean voice exit of the whole agent. Works in any state
             # (even asleep). Speak a goodbye, then request graceful pipeline closure by
             # pushing EndTaskFrame UPSTREAM — the task flushes queued frames (so the
@@ -349,30 +412,33 @@ class BrainLLMService(LLMService):
                 await self.push_frame(EndTaskFrame(), FrameDirection.UPSTREAM)
                 return
 
-            # --- sleep/wake gate. While asleep, LEAVE sleep only on a transcript that actually names her
-            # (a wake vocative) or carries a wake phrase, AND is not itself a sleep phrase. The old rule
-            # woke on ANY transcript whenever an acoustic gate was upstream — but a phantom acoustic spike
-            # on un-AEC'd room audio (a radio/TV the echo-canceller can't remove) opens the window and lets
-            # the next line of ambient dialogue through, which then "confirmed" the wake (2026-06-15: talk
-            # radio woke her repeatedly on non-wake lines; "Stop listening." — a sleep phrase arriving on an
-            # in-flight turn — also wrongly woke her). Requiring the name/phrase rejects both: radio chatter
-            # carries no "Aria", and a sleep phrase can never be a wake. Cost is deliberately asymmetric — a
-            # real wake lost to STT noise just needs a repeat; a false wake while asleep is the whole bug.
-            # (_acoustic_wake_gated no longer gates this decision; the text requirement applies in both the
-            # gated and the degraded gate-less configs.)
+            # --- sleep/wake gate. While asleep, LEAVE sleep only on a transcript that names her (a wake
+            # vocative or soundalike) or carries a wake phrase, AND is not itself a sleep phrase. The old
+            # rule woke on ANY transcript whenever an acoustic gate was upstream — but a phantom acoustic
+            # spike on un-AEC'd room audio (a radio/TV the echo-canceller can't remove) opens the window and
+            # lets the next line of ambient dialogue through, which then "confirmed" the wake (2026-06-15:
+            # talk radio woke her repeatedly on non-wake lines; "Stop listening." — a sleep phrase arriving
+            # on an in-flight turn — also wrongly woke her). Requiring the name/phrase rejects both: radio
+            # chatter carries no "Aria", and a sleep phrase can never be a wake. Cost is deliberately
+            # asymmetric — a real wake lost to STT noise just needs a repeat; a false wake while asleep is
+            # the whole bug. (_acoustic_wake_gated no longer gates this decision; the text requirement
+            # applies in both the gated and the degraded gate-less configs.) The soundalike (lenient) match
+            # is used here too — an STT mis-spelling of the name should still wake her — but it carries its
+            # own denylist (arid/arise/…) and a wake token/phrase is still REQUIRED, so nameless chatter is
+            # rejected exactly as before. After waking we DON'T greet: the shared wake-word handling below
+            # (awake or just-woken) forwards a riding command and only prompts on a truly bare wake.
             if self._sleeping:
                 tokens = low_norm.split()
-                has_wake = (any(v in tokens for v in _WAKE_VOCATIVES)
+                has_wake = (any(_looks_like_vocative(v) for v in tokens)
                             or any(p in low_norm for p in _WAKE_PHRASES))
                 is_sleep = any(p in low_norm for p in _SLEEP_PHRASES)
-                if has_wake and not is_sleep:
-                    self._sleeping = False
-                    await self._set_sleep_gate(False)
-                    _tlog(f"WAKE  | {user_text!r}")
-                    await self._speak("I'm awake. What do you need?")
-                else:
+                if not has_wake or is_sleep:
                     _tlog(f"ASLEEP| ignoring: {user_text!r}")
-                return
+                    return
+                self._sleeping = False
+                await self._set_sleep_gate(False)
+                _tlog(f"WAKE  | {user_text!r}")
+                # fall through to the shared wake-word handling below
             # Sleep gets only the narration guard (is_dictation), NOT the standalone/residual one:
             # sleep phrasings legitimately carry qualifiers ("mute voice mode unless I call your name" —
             # the qualifier is itself a sleep phrase), which a residual-length test would wrongly reject.
@@ -390,13 +456,22 @@ class BrainLLMService(LLMService):
                 _tlog("SKIP  | empty user turn ignored")
                 return
 
-            # Bare vocative ("Aria" / "Hey Aria" with no command) → the acoustic wake gate already opened
-            # the window and pre-ducked on the spoken name, so don't forward it to the brain: its chit-chat
-            # reply would barge over the command the user speaks a beat later (the duck is the ack they
-            # want). Not applied during a pending confirm (handled below). 2026-06-15 live regression.
-            if self._pending_confirm is None and _is_bare_vocative(low_norm):
-                _tlog(f"VOCATIVE| {user_text!r} (window open via wake gate; awaiting command)")
-                return
+            # --- shared wake-word handling (awake or just-woken). Natural conversation: when someone says
+            # your name then a command, you answer the COMMAND, not the name; you only answer the name when
+            # it's left hanging with nothing after — and even then you wait a beat to be sure (2026-06-15,
+            # the maintainer). So strip a LEADING wake trigger ("Hey Aria, play a movie" → "play a movie") and forward
+            # only the command; the brain never sees the wake word (it's consumed by the voice-side gate).
+            # A truly bare wake ("Hey Aria") forwards nothing — instead it arms a short timer that a
+            # following command cancels, and prompts ("Yes? Did you need something?") only if none comes.
+            # Skipped during a pending confirm (the answer is handled below).
+            if self._pending_confirm is None:
+                had_wake, command, is_bare = _strip_leading_wake(user_text, low_norm)
+                if is_bare:
+                    self._arm_bare_wake_prompt()
+                    _tlog(f"VOCATIVE| {user_text!r} (bare wake — awaiting command, prompt if none follows)")
+                    return
+                if had_wake:
+                    user_text = command  # forward only what followed the wake word
 
             # --- normal turn / confirm resume ---
             if self._pending_confirm is not None:

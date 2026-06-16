@@ -561,12 +561,16 @@ def build_vad_analyzer(*, sample_rate, params):
 
 
 # --------------------------------------------------------------------------- media ducking
-def build_media_duck(llm):
+def build_media_duck(llm, gate=None):
     """Build the MediaDuckController for an external brain, or None for a raw LLM.
 
     Inserted right after STT (see main.py) so it can see transcription frames — it ducks the brain's
     media on *confirmed* user speech and restores when Aria finishes. Shares the brain's session_id
     so `/media/duck` correlates, and gates on the brain's sleep state.
+
+    `gate` (the WakeWordGate, if present) gates the duck behind the wake word: with DUCK_REQUIRE_WAKE on
+    (default) media only ducks once Aria is addressed (window open), for ALL playback — so music/movies
+    don't dip on ambient room speech. Set DUCK_REQUIRE_WAKE=0 to duck on any speech onset (old behavior).
     """
     from brains.brain_llm_service import BrainLLMService
 
@@ -578,10 +582,16 @@ def build_media_duck(llm):
     restore_grace = float(_env("DUCK_RESTORE_GRACE", "8.0"))
     confirm_grace = float(_env("DUCK_CONFIRM_GRACE", "2.5"))
     sustained_secs = float(_env("DUCK_SUSTAINED_SECS", "4.0"))
+    require_wake = _env("DUCK_REQUIRE_WAKE", "1") not in ("0", "false", "False")
+    gate_duck = gate is not None and require_wake and hasattr(gate, "duck_allowed")
+    if gate_duck:
+        should_duck = lambda: not llm.is_sleeping and gate.duck_allowed()
+    else:
+        should_duck = lambda: not llm.is_sleeping
     logger.info(
         f"Media ducking: on VAD speech onset (min_words={min_words}, "
         f"confirm_grace={confirm_grace}s, restore_grace={restore_grace}s, "
-        f"sustained={sustained_secs}s)"
+        f"sustained={sustained_secs}s, require_wake={gate_duck})"
     )
     return MediaDuckController(
         llm.brain_client,
@@ -590,7 +600,7 @@ def build_media_duck(llm):
         restore_grace=restore_grace,
         confirm_grace=confirm_grace,
         sustained_secs=sustained_secs,
-        should_duck=lambda: not llm.is_sleeping,
+        should_duck=should_duck,
         media_status=build_media_state_provider(llm),  # SHARED with the wake gate (no divergence)
     )
 
