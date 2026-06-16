@@ -247,6 +247,12 @@ class BrainLLMService(LLMService):
         # asking "did you need something?" — a following command cancels the wait (see _arm/_cancel).
         self._bare_wake_delay = float(os.environ.get("BARE_WAKE_PROMPT_DELAY", "3.5"))
         self._bare_wake_task: asyncio.Task | None = None
+        # The in-flight reply turn, run as a cancellable task (NOT inline) so a mid-generation barge-in can
+        # cancel it. Cancelling raises CancelledError inside `_consume` → POST /cancel reaches the brain AND
+        # the token stream stops feeding TTS (she stays stopped, no resume). 2026-06-16: when this ran inline,
+        # `broadcast_interruption()` flushed the current TTS buffer but never cancelled this service's own
+        # task, so a long reply kept streaming and she resumed ~5s after the barge.
+        self._turn_task: asyncio.Task | None = None
         # Log the correlation key so the transcript can be lined up with the brain's own logs.
         _tlog(f"BRAIN | gabagent session_id={self._session_id}")
 
@@ -274,23 +280,76 @@ class BrainLLMService(LLMService):
         """Handle LLMContextFrame by streaming the brain's reply; forward everything else."""
         await super().process_frame(frame, direction)
 
+        from wake_word import StopWordFrame
+
+        if isinstance(frame, StopWordFrame):
+            # The wake gate detected the interrupt/stop word mid bot-turn. Two actions, both needed:
+            #   1. broadcast_interruption() — flushes the CURRENT TTS buffer downstream (output) so she stops
+            #      speaking now. Issued from HERE, downstream of the half-duplex user-mute that DROPS
+            #      InterruptionFrame at the user aggregator (`_maybe_mute_frame`) — the gate's own broadcast /
+            #      a top-injected InterruptionFrame were both swallowed by that mute (2026-06-16, twice).
+            #   2. cancel the in-flight `_turn_task` — broadcast_interruption does NOT route the interruption
+            #      back into THIS service, so on a mid-GENERATION barge `_consume` keeps streaming tokens →
+            #      TTS resumes ~5s later. Cancelling raises CancelledError in `_consume` → POST /cancel
+            #      reaches the brain (aborts the live turn) AND stops further tokens → she stays stopped.
+            # For a short reply already done generating, `_turn_task` is .done() → cancel no-ops (flush-only,
+            # which is correct — there's nothing live to cancel). Consume the frame (it has done its job).
+            _tlog("BARGE-IN| stop word — interrupting bot turn (flush TTS + cancel)")
+            await self.broadcast_interruption()
+            if self._turn_task is not None and not self._turn_task.done():
+                self._turn_task.cancel()
+            return
+
         if isinstance(frame, LLMContextFrame):
-            try:
-                await self.push_frame(LLMFullResponseStartFrame())
-                # Mute the user through the whole bot turn (not just while speaking): a SystemFrame
-                # pushed UPSTREAM that BotThinkingMuteStrategy honors, closing the first-token latency
-                # gap where an empty barge-in cancels the silent in-flight turn. Released in `finally`.
-                await self._set_thinking(True)
-                await self.start_processing_metrics()
-                await self._process_context(frame.context)
-            except Exception as e:  # noqa: BLE001 - surface as a pipeline error frame
-                await self.push_error(error_msg=f"Brain error: {e}", exception=e)
-            finally:
-                await self._set_thinking(False)
-                await self.stop_processing_metrics()
-                await self.push_frame(LLMFullResponseEndFrame())
+            # Guard against an overlapping turn: in normal flow the half-duplex mute (BotThinkingMute +
+            # AlwaysUserMute) keeps the user muted across the whole bot turn, so no new context arrives
+            # mid-turn. But after a barge opens the floor the mute lifts; await any still-unwinding prior
+            # turn before starting a new one so two `_consume` loops never run (and so the prior /cancel has
+            # landed before this turn's first /respond — closes the follow-up 409 race by sequencing).
+            await self._await_prior_turn()
+            self._turn_task = asyncio.create_task(self._run_turn(frame.context))
         else:
             await self.push_frame(frame, direction)
+
+    async def _await_prior_turn(self) -> None:
+        """Cancel + await any in-flight turn task so a new turn never overlaps the old one."""
+        task = self._turn_task
+        if task is not None and not task.done():
+            task.cancel()
+        if task is not None:
+            try:
+                await task  # _run_turn swallows its own CancelledError, so this returns cleanly
+            except Exception:  # noqa: BLE001 - any turn error was already surfaced inside _run_turn
+                pass
+        self._turn_task = None
+
+    async def _run_turn(self, context) -> None:
+        """Run one reply turn (stream brain → frames). Runs as a cancellable task (see `_turn_task`); a
+        mid-generation barge cancels it → `_consume` CancelledError → /cancel + stop streaming to TTS."""
+        try:
+            await self.push_frame(LLMFullResponseStartFrame())
+            # Mute the user through the whole bot turn (not just while speaking): a SystemFrame
+            # pushed UPSTREAM that BotThinkingMuteStrategy honors, closing the first-token latency
+            # gap where an empty barge-in cancels the silent in-flight turn. Released in `finally`.
+            await self._set_thinking(True)
+            await self.start_processing_metrics()
+            await self._process_context(context)
+        except asyncio.CancelledError:
+            # Barge-in cancelled this turn. `_consume` already issued POST /cancel on its way out; just
+            # let the finally restore state. Do NOT re-raise — this is a clean, expected stop, and the
+            # task should end normally rather than propagate cancellation into the event loop.
+            _tlog("BARGE-IN| turn cancelled (barge-in)")
+        except Exception as e:  # noqa: BLE001 - surface as a pipeline error frame
+            await self.push_error(error_msg=f"Brain error: {e}", exception=e)
+        finally:
+            await self._set_thinking(False)
+            await self.stop_processing_metrics()
+            await self.push_frame(LLMFullResponseEndFrame())
+
+    async def cleanup(self) -> None:
+        """Pipeline teardown: cancel any in-flight turn task so a shutdown mid-reply unwinds cleanly."""
+        await self._await_prior_turn()
+        await super().cleanup()
 
     async def _speak(self, text: str, *, immediate: bool = False) -> None:
         """Push text to TTS and record it for the transcript log.

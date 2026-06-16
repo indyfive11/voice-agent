@@ -1174,3 +1174,85 @@ def test_keyboard_confirm_resolves_in_turn():
     assert client.confirm_calls == [("sess-test", "k1", True, None)]
     assert "Done, removed it." in _texts(pushed)
     assert svc._pending_confirm is None
+
+
+def test_stop_word_frame_triggers_interruption():
+    # V2 barge-in: the wake gate's StopWordFrame survives the half-duplex user-mute (which drops
+    # InterruptionFrame), and BrainLLMService — sitting below that mute — converts it into the real
+    # interruption (broadcast_interruption → flush TTS downstream + cancel this turn → POST /cancel).
+    from pipecat.processors.frame_processor import FrameDirection
+
+    from wake_word import StopWordFrame
+
+    client = FakeBrainClient()
+    svc, _pushed = _service_with_recorder(client)
+    calls = []
+
+    async def _spy():
+        calls.append(True)
+
+    svc.broadcast_interruption = _spy  # type: ignore[assignment]
+
+    asyncio.run(svc.process_frame(StopWordFrame(), FrameDirection.DOWNSTREAM))
+    assert calls == [True]  # interruption issued from below the mute
+
+
+def test_stop_word_cancels_inflight_turn_and_posts_cancel():
+    # V2 Test B fix (2026-06-16 live): a mid-GENERATION barge must CANCEL the in-flight turn task, not just
+    # flush the current TTS buffer. When the turn ran inline, broadcast_interruption() flushed audio but never
+    # cancelled this service's own _consume → the long reply kept streaming → she resumed ~5s later, and no
+    # /cancel ever reached the brain. Now the turn runs as a cancellable task; StopWordFrame cancels it →
+    # _consume CancelledError → POST /cancel + token stream stops.
+    from pipecat.frames.frames import LLMContextFrame
+    from pipecat.processors.frame_processor import FrameDirection
+
+    from wake_word import StopWordFrame
+
+    # A slow, long stream so the turn is genuinely still in-flight when the barge lands (the overlap case).
+    client = FakeBrainClient(
+        respond_events=[BrainEvent("token", text=f"w{i} ") for i in range(20)] + [BrainEvent("done")],
+        delay=0.02,
+    )
+    svc, pushed = _service_with_recorder(client)
+
+    async def _noop():  # broadcast_interruption needs a live pipeline; stub the flush, test the cancel
+        pass
+
+    svc.broadcast_interruption = _noop  # type: ignore[assignment]
+
+    async def go():
+        await svc.process_frame(LLMContextFrame(_ctx("tell me a long story")), FrameDirection.DOWNSTREAM)
+        task = svc._turn_task
+        assert task is not None and not task.done()      # turn runs as a task, not inline
+        await asyncio.sleep(0.05)                          # let a few tokens stream
+        await svc.process_frame(StopWordFrame(), FrameDirection.DOWNSTREAM)  # mid-gen barge → cancel
+        await task                                         # unwind: _consume CancelledError → /cancel
+
+    asyncio.run(go())
+    assert client.cancel_calls == ["sess-test"]            # POST /cancel reached the brain (aborts live turn)
+    spoken = _texts(pushed)
+    assert 0 < len(spoken) < 20                            # stopped early — did NOT stream all 20 tokens
+
+
+def test_inflight_turn_runs_as_cancellable_task_not_inline():
+    # The LLMContextFrame handler must hand the turn to a task (so a SystemFrame barge can cancel it),
+    # rather than awaiting it inline (which left nothing to cancel). process_frame returns while the turn
+    # is still streaming.
+    from pipecat.frames.frames import LLMContextFrame
+    from pipecat.processors.frame_processor import FrameDirection
+
+    client = FakeBrainClient(
+        respond_events=[BrainEvent("token", text="slow "), BrainEvent("token", text="reply."),
+                        BrainEvent("done")],
+        delay=0.05,
+    )
+    svc, _pushed = _service_with_recorder(client)
+
+    async def go():
+        await svc.process_frame(LLMContextFrame(_ctx("hello")), FrameDirection.DOWNSTREAM)
+        # process_frame returned but the turn is still in flight (delay keeps it streaming)
+        assert svc._turn_task is not None and not svc._turn_task.done()
+        await svc._turn_task                               # let it finish cleanly
+        assert svc._turn_task.done()
+
+    asyncio.run(go())

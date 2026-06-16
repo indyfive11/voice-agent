@@ -750,6 +750,16 @@ def build_wake_word_gate(llm):
     # to this, and the gate auto-releases at it if the brain's refreshes stop (crash/dropped turn) — so a
     # bad/large/never-refreshed hold can't pin the mic open. Must exceed the brain's media_keepalive_secs.
     hold_max_secs = float(_env("WAKE_HOLD_MAX_SECS", "120.0"))
+    # V2 barge-in: while Aria is speaking, run the wake model and cut her TTS on a sustained hit (saying
+    # "Aria" mid-reply interrupts and opens the floor). Opt-in, default OFF — zero behavior change when off.
+    # Reuses the aria_nano wake model for now (a dedicated "stop" model is a follow-up). Threshold defaults
+    # to the wake threshold; consec 2 rejects 1-frame TTS-bleed spikes the same way the wake path does.
+    interrupt_enabled = _env("WAKE_INTERRUPT", "0") not in ("0", "false", "False")
+    _it = _env("WAKE_INTERRUPT_THRESHOLD", "")
+    interrupt_threshold = float(_it) if _it.strip() else None
+    interrupt_consec_frames = int(_env("WAKE_INTERRUPT_CONSEC", "2"))
+    interrupt_refractory_secs = float(_env("WAKE_INTERRUPT_REFRACTORY", "1.0"))
+    interrupt_arm_delay_secs = float(_env("WAKE_INTERRUPT_ARM_DELAY", "1.0"))
     speex_ns = False  # openWakeWord-only; set below when that engine is selected
     extra_log = ""
 
@@ -815,6 +825,8 @@ def build_wake_word_gate(llm):
         + (" window-mute=on" if window_mute else " window-mute=off")
         + (f" preduck-grace={preduck_grace:.1f}s" if preduck_grace > 0 else " preduck-grace=off")
         + f" hold-max={hold_max_secs:.0f}s"
+        + (f" interrupt=on@{interrupt_threshold if interrupt_threshold is not None else threshold}"
+           f"/consec{interrupt_consec_frames}/arm{interrupt_arm_delay_secs:.1f}s" if interrupt_enabled else "")
         + (" speex_ns=on" if speex_ns else "")
         + extra_log
         + (f" debug=on floor={debug_floor}" if debug else "")
@@ -840,6 +852,11 @@ def build_wake_word_gate(llm):
         window_mute=window_mute,
         preduck_grace=preduck_grace,
         hold_max_secs=hold_max_secs,
+        interrupt_enabled=interrupt_enabled,
+        interrupt_threshold=interrupt_threshold,
+        interrupt_consec_frames=interrupt_consec_frames,
+        interrupt_refractory_secs=interrupt_refractory_secs,
+        interrupt_arm_delay_secs=interrupt_arm_delay_secs,
     )
 
 

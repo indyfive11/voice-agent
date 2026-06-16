@@ -6,6 +6,7 @@ pipeline. asyncio.run drives the async bodies (plain pytest, no pytest-asyncio).
 """
 
 import asyncio
+import time
 
 from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
@@ -791,3 +792,121 @@ def test_preduck_grace_zero_holds_until_window_close():
     asyncio.run(go())
     assert g._ducked is False               # released only at window close
     assert client.duck_calls == [("sess-test", True), ("sess-test", False)]
+
+
+# --- V2 interrupt/stop word barge-in (WAKE_INTERRUPT) ----------------------------------------------
+def _interrupt_gate(client=None, **kw):
+    """A gate with the interrupt path enabled and push_frame spied (no live pipeline). _on_interrupt cuts
+    TTS by pushing a StopWordFrame DOWNSTREAM — a custom frame the half-duplex user-mute does NOT drop (an
+    InterruptionFrame from the gate IS dropped by that mute; BrainLLMService, below the mute, converts the
+    StopWordFrame into the real interruption). 2026-06-16 live root cause. g._interrupt_calls records
+    (frame_type, direction) for any StopWordFrame pushed."""
+    from wake_word import StopWordFrame
+
+    kw.setdefault("interrupt_enabled", True)
+    kw.setdefault("interrupt_consec_frames", 2)
+    g = _gate(client, **kw)
+    calls: list = []
+
+    async def _spy_push(frame, direction=FrameDirection.DOWNSTREAM):
+        if isinstance(frame, StopWordFrame):
+            calls.append((type(frame).__name__, direction))
+        # swallow (no downstream processor wired in the offline harness)
+
+    g.push_frame = _spy_push  # type: ignore[assignment]
+    g._interrupt_calls = calls
+    return g
+
+
+def test_interrupt_predicate_only_when_enabled_and_bot_speaking():
+    # Routing predicate: detect the interrupt word ONLY when opt-in AND Aria is currently speaking.
+    g = _gate(interrupt_enabled=True)
+    g._bot_speaking = True
+    assert g._interrupt_active() is True
+    g._bot_speaking = False
+    assert g._interrupt_active() is False  # not while idle (that's the wake path)
+    g_off = _gate(interrupt_enabled=False)
+    g_off._bot_speaking = True
+    assert g_off._interrupt_active() is False  # disabled → never routes to the interrupt detector
+
+
+def test_interrupt_fires_during_bot_speaking():
+    # Sustained interrupt word while she speaks → cut TTS (InterruptionTaskFrame upstream) + open floor + duck.
+    client = FakeBrainClient()
+    g = _interrupt_gate(client, interrupt_consec_frames=2)
+    g._oww.score = 0.9
+    g._bot_speaking = True
+
+    async def go():
+        await g._feed_interrupt(_CHUNK)        # frame 1 → consec=1, not yet
+        assert g._interrupt_calls == []
+        await g._feed_interrupt(_CHUNK)        # frame 2 → consec=2 → fire
+
+    asyncio.run(go())
+    # Cut via a StopWordFrame pushed DOWNSTREAM (survives the half-duplex mute; BrainLLMService converts it
+    # to the real interruption below the mute → flush TTS + /cancel).
+    assert g._interrupt_calls == [("StopWordFrame", FrameDirection.DOWNSTREAM)]
+    assert g._open is True                                # floor opened (stop-and-listen)
+    assert client.duck_calls == [("sess-test", True)]    # pre-duck for the redirect
+
+
+def test_interrupt_rejects_single_frame_spike():
+    # A 1-frame TTS-bleed/music spike must NOT interrupt when consec=2 (same rejection as the wake path).
+    client = FakeBrainClient()
+    g = _interrupt_gate(client, interrupt_consec_frames=2)
+    g._oww.score = 0.9
+    g._bot_speaking = True
+
+    asyncio.run(g._feed_interrupt(_CHUNK))     # one frame only
+    assert g._interrupt_calls == []
+    assert g._open is False
+    assert client.duck_calls == []
+
+
+def test_interrupt_arm_delay_suppresses_onset_selftrip():
+    # 2026-06-16 live: Aria's own TTS onset self-trips the detector 75–159ms after she starts speaking
+    # (AEC not yet converged). A sustained hit WITHIN the arm window must NOT fire.
+    client = FakeBrainClient()
+    g = _interrupt_gate(client, interrupt_consec_frames=2, interrupt_arm_delay_secs=0.6)
+    g._oww.score = 0.9
+    g._bot_speaking = True
+    g._bot_speaking_since = time.monotonic()    # just started → inside the 0.6s arm window
+
+    async def go():
+        await g._feed_interrupt(_CHUNK)         # frame 1
+        await g._feed_interrupt(_CHUNK)         # frame 2 → consec met, but armed-out → no fire
+
+    asyncio.run(go())
+    assert g._interrupt_calls == []
+    assert g._open is False
+    assert client.duck_calls == []
+
+
+def test_interrupt_arm_delay_allows_after_window():
+    # The same sustained hit AFTER the arm window elapses fires normally (real mid-reply interrupt preserved).
+    client = FakeBrainClient()
+    g = _interrupt_gate(client, interrupt_consec_frames=2, interrupt_arm_delay_secs=0.6)
+    g._oww.score = 0.9
+    g._bot_speaking = True
+    g._bot_speaking_since = time.monotonic() - 100.0   # well past the arm window
+
+    async def go():
+        await g._feed_interrupt(_CHUNK)
+        await g._feed_interrupt(_CHUNK)         # consec met AND armed → fire
+
+    asyncio.run(go())
+    assert g._interrupt_calls == [("StopWordFrame", FrameDirection.DOWNSTREAM)]
+    assert g._open is True
+
+
+def test_interrupt_threshold_defaults_to_wake_threshold():
+    # interrupt_threshold=None → uses the wake threshold; a sub-threshold burst never fires.
+    client = FakeBrainClient()
+    g = _interrupt_gate(client, threshold=0.5, interrupt_threshold=None, interrupt_consec_frames=1)
+    assert g._interrupt_threshold == 0.5
+    g._oww.score = 0.3                          # below threshold
+    g._bot_speaking = True
+
+    asyncio.run(g._feed_interrupt(_CHUNK))
+    assert g._interrupt_calls == []
+    assert g._open is False

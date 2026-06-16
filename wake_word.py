@@ -75,6 +75,18 @@ class WakeSleepFrame(SystemFrame):
     asleep: bool = False
 
 
+@dataclass
+class StopWordFrame(SystemFrame):
+    """Pushed DOWNSTREAM by the wake gate when the interrupt/stop word is detected while Aria is speaking.
+
+    Why a custom frame instead of `broadcast_interruption()`: in half-duplex the user-aggregator's mute
+    DROPS `InterruptionFrame` while the bot speaks (`_maybe_mute_frame`), so an interruption issued from the
+    gate (upstream of the aggregator) never reaches the LLM/output — it's silently suppressed (2026-06-16
+    live: "she didn't stop"). `StopWordFrame` is NOT in the mute's drop list, so it passes the muted
+    aggregator; `BrainLLMService` (downstream of the mute) catches it and issues the actual interruption
+    from below the mute → TTS flushes + the brain turn is cancelled. SystemFrame so it propagates promptly."""
+
+
 def _tlog(message: str) -> None:
     """One line to the transcript log (greppable alongside USER/BOT/DUCK/WAKE)."""
     logger.bind(transcript=True).info(message)
@@ -107,6 +119,11 @@ class WakeWordGate(FrameProcessor):
         window_mute: bool = True,
         preduck_grace: float = 3.0,
         hold_max_secs: float = 120.0,
+        interrupt_enabled: bool = False,
+        interrupt_threshold: float | None = None,
+        interrupt_consec_frames: int = 2,
+        interrupt_refractory_secs: float = 1.0,
+        interrupt_arm_delay_secs: float = 0.0,
         time_source: Callable[[], float] | None = None,
         **kwargs,
     ):
@@ -204,6 +221,25 @@ class WakeWordGate(FrameProcessor):
         # just fired) rather than by failing to sustain. Drives an accurate near-miss reason label.
         self._nearmiss_refractory = False
 
+        # Interrupt/stop word (V2 barge-in): while Aria is speaking, run the SAME wake model on the mic
+        # (AEC cancels her own referenced TTS → we see the user's residual) and on a sustained hit cut her
+        # TTS (broadcast_interruption) and open the floor. Opt-in (WAKE_INTERRUPT); zero effect when off.
+        # Separate buffer/counter/refractory from the wake path so the two never cross (they're mutually
+        # exclusive per-frame: you interrupt while she speaks, you don't wake).
+        self._interrupt_enabled = interrupt_enabled
+        self._interrupt_threshold = threshold if interrupt_threshold is None else interrupt_threshold
+        self._interrupt_consec_required = max(1, interrupt_consec_frames)
+        self._interrupt_refractory = max(0.0, interrupt_refractory_secs)
+        self._interrupt_consec = 0
+        self._last_interrupt = 0.0
+        self._interrupt_buf = bytearray()
+        # Arm-delay: suppress the interrupt FIRE for the first N secs after BotStartedSpeaking. AEC needs a
+        # beat to converge on a new TTS utterance; until it does, Aria's own voice leaks through and self-
+        # trips the detector at her speech onset (live: 3 fires 75–159ms after bot-start). A real user
+        # interrupt happens later (live: 7.5s in), so a short delay kills the onset self-trips losslessly.
+        self._interrupt_arm_delay = max(0.0, interrupt_arm_delay_secs)
+        self._bot_speaking_since = 0.0
+
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
 
@@ -215,10 +251,14 @@ class WakeWordGate(FrameProcessor):
                     "GATE  | media=playing → gating (muted until wake)" if gated
                     else "GATE  | media=idle → pass-through (open mic)"
                 )
-            if gated:
+            if self._interrupt_active():
+                # While Aria speaks, detect the interrupt word instead of waking (mutually exclusive). Runs
+                # regardless of `gated` so it works in a quiet room (no media). Routing below is unchanged.
+                await self._feed_interrupt(frame.audio)
+            elif gated:
                 await self._feed(frame.audio)
-                if not self._open:
-                    return  # swallow: muted until the wake word
+            if gated and not self._open:
+                return  # swallow: muted until the wake word
             await self.push_frame(frame, direction)
             return
 
@@ -238,6 +278,8 @@ class WakeWordGate(FrameProcessor):
         # media never restores out from under a reply, then resume the normal idle close when she finishes.
         if isinstance(frame, BotStartedSpeakingFrame):
             self._bot_speaking = True
+            self._bot_speaking_since = time.monotonic()  # arm-delay reference; gates the interrupt fire
+            self._interrupt_consec = 0  # fresh utterance → don't carry a stale consec into the arm window
             self._cancel_preduck()
             self._cancel_window()
             await self.push_frame(frame, direction)
@@ -407,6 +449,37 @@ class WakeWordGate(FrameProcessor):
                 if not self._open and self._escape_count > 0:
                     self._track_escape(score, now)  # lockout escape (independent of debug)
 
+    def _interrupt_active(self) -> bool:
+        """Whether the interrupt detector should run on this frame: opt-in AND Aria is currently speaking.
+        Pure/synchronous so the routing is unit-testable without a running pipeline. The wake and interrupt
+        feeds are mutually exclusive — you interrupt while she speaks, you don't wake."""
+        return self._interrupt_enabled and self._bot_speaking
+
+    async def _feed_interrupt(self, audio: bytes) -> None:
+        """Run the wake model while Aria is speaking; a sustained hit interrupts her (V2 barge-in).
+
+        Mirrors `_feed`'s chunk→predict→consecutive-frame logic but with the interrupt threshold/consec/
+        refractory and its own buffer, so the wake and interrupt paths never cross. A 1-frame TTS-bleed/
+        music spike won't reach `_interrupt_consec_required`, the same way the wake path rejects blips."""
+        self._interrupt_buf.extend(audio)
+        loop = asyncio.get_running_loop()
+        while len(self._interrupt_buf) >= _CHUNK_BYTES:
+            chunk = bytes(self._interrupt_buf[:_CHUNK_BYTES])
+            del self._interrupt_buf[:_CHUNK_BYTES]
+            pcm = np.frombuffer(chunk, dtype=np.int16)
+            scores = await loop.run_in_executor(None, self._oww.predict, pcm)
+            _key, score = self._best(scores)
+            if score > self._hb_peak:
+                self._hb_peak = score
+            now = time.monotonic()
+            self._interrupt_consec = self._interrupt_consec + 1 if score >= self._interrupt_threshold else 0
+            if (self._interrupt_consec >= self._interrupt_consec_required
+                    and (now - self._bot_speaking_since) >= self._interrupt_arm_delay
+                    and (now - self._last_interrupt) > self._interrupt_refractory):
+                self._last_interrupt = now
+                self._interrupt_consec = 0
+                await self._on_interrupt(score)
+
     def _best(self, scores) -> "tuple[str, float]":
         """The winning (key, score) across all loaded models for this frame."""
         best_k, best_s = "", 0.0
@@ -478,6 +551,27 @@ class WakeWordGate(FrameProcessor):
 
     def _on_wake(self, score: float) -> None:
         self._open_window(f"WAKE  | wake word ({score:.2f}) — opening command window")
+
+    async def _on_interrupt(self, score: float) -> None:
+        """Confirmed interrupt word while Aria speaks → cut her TTS and hand the floor back (stop-and-listen).
+
+        We push a `StopWordFrame` DOWNSTREAM rather than calling `broadcast_interruption()` here: in
+        half-duplex the user-aggregator's mute DROPS `InterruptionFrame` during the bot turn, so an
+        interruption issued from the gate (upstream of the aggregator) is silently suppressed and the TTS
+        never stops (2026-06-16 live, twice). `StopWordFrame` survives the mute; `BrainLLMService` (downstream
+        of it) catches it and issues the real interruption from below the mute → TTS flushes + brain turn
+        cancelled (POST /cancel). Output's BotStoppedSpeaking then re-enters this gate and re-arms the
+        window/preduck (benign). We open the command window so the user's redirect lands on ducked media."""
+        # dt = seconds since BotStartedSpeaking. Re-test discriminator (2026-06-16, agreed w/ GA): a trip
+        # past the arm window with no user speech (`vad` False — note VAD is muted during the bot turn, so
+        # it's near-always False here) is a candidate sentence-boundary self-trip the once-per-turn arm-delay
+        # can't cover; one at human-reaction latency is a real interrupt. dt < arm-delay should not appear.
+        dt = time.monotonic() - self._bot_speaking_since
+        _tlog(f"WAKE  | interrupt word ({score:.2f}, dt={dt:.2f}s, vad={self._speech_in_flight}) "
+              "— cutting TTS, opening floor")
+        await self.push_frame(StopWordFrame(), FrameDirection.DOWNSTREAM)
+        self._bot_speaking = False  # the interruption stops her now (BotStopped will also confirm it)
+        self._open_window("WAKE  | floor opened after interrupt")
 
     def _open_window(self, log_msg: str) -> None:
         """Open the command window (idempotent): log the reason, pre-duck, arm the idle timer."""
