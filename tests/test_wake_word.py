@@ -449,42 +449,63 @@ def test_keepalive_refresh_extends_window():
     asyncio.run(go())
 
 
-def test_keepalive_preduck_releases_after_grace_window_stays_open():
-    # 2026-06-15 regression: the keepalive pre-ducked but armed NO release, and _keepalive_active suppresses
-    # the idle-close that would release it → the movie stayed ducked for the whole TTL (stuck at 18% ~30s
-    # after a play command). The pre-duck must release after the grace (no speech) while the window stays
-    # open for follow-ups (media_duck re-ducks on the next speech onset).
+def test_keepalive_does_not_preduck_window_stays_open():
+    # F3 option B (2026-06-16): a media keepalive must NOT pre-duck — the command already ran, so dipping the
+    # song the user just asked to play/resume is the "dips the song I just started" annoyance (12:12:13). The
+    # window still opens (held for follow-ups); a follow-up command ducks via the confirmed-speech path. This
+    # also structurally retires the 2026-06-15 "movie stuck ducked for the TTL" regression — no preduck to strand.
     client = FakeBrainClient()
-    g = _gate(client, window_secs=10.0, hold_max_secs=120.0, preduck_grace=0.03)
+    g = _gate(client, window_secs=10.0, hold_max_secs=120.0,
+              preduck_grace=0.03, preduck_grace_keepalive=0.03)
 
     async def go():
-        g._set_keepalive(5.0)             # media command → hold window + pre-duck
-        await asyncio.sleep(0)            # let the fire-and-forget duck task run
-        assert client.duck_calls == [("sess-test", True)]
-        await asyncio.sleep(0.06)         # past the pre-duck grace, no speech follows
-        assert client.duck_calls == [("sess-test", True), ("sess-test", False)]  # pre-duck released
+        g._set_keepalive(5.0)             # media command → hold window, NO pre-duck
+        await asyncio.sleep(0)            # let any fire-and-forget task run
+        assert client.duck_calls == []    # the keepalive did not dip the just-started song
+        await asyncio.sleep(0.06)         # past the grace — still nothing
+        assert client.duck_calls == []
         assert g._open is True            # window STILL open — the keepalive holds it
         assert g._keepalive_active is True
 
     asyncio.run(go())
 
 
-def test_keepalive_preduck_releases_after_announcement():
-    # Aria's movie announcement (BotStarted) cancels the pre-duck timer; BotStopped must re-arm it so the
-    # pre-duck releases after she finishes — else the keepalive-held window (which never idle-closes) pins the
-    # movie ducked for the whole TTL.
+def test_keepalive_does_not_preduck_across_announcement():
+    # Option B: with no keepalive pre-duck, Aria's announcement (BotStarted/Stopped) over the just-started
+    # media fires no duck either — the song plays at full volume through her confirmation. (If that ever drowns
+    # a play announcement over loud media we'd add a duck-on-bot-speech-only path; not pre-emptive dipping.)
     client = FakeBrainClient()
-    g = _gate(client, window_secs=10.0, hold_max_secs=120.0, preduck_grace=0.04)
+    g = _gate(client, window_secs=10.0, hold_max_secs=120.0,
+              preduck_grace=0.04, preduck_grace_keepalive=0.04)
 
     async def go():
-        g._set_keepalive(5.0)             # pre-duck on, release armed
-        await g.process_frame(BotStartedSpeakingFrame(), FrameDirection.DOWNSTREAM)  # announcement → cancels timer
-        await asyncio.sleep(0.07)         # would have released, but the timer was cancelled
-        assert client.duck_calls == [("sess-test", True)]   # still ducked DURING the announcement
-        await g.process_frame(BotStoppedSpeakingFrame(), FrameDirection.DOWNSTREAM)  # she finishes → re-arm
-        await asyncio.sleep(0.07)         # grace elapses with no speech
-        assert client.duck_calls == [("sess-test", True), ("sess-test", False)]  # released after she finishes
+        g._set_keepalive(5.0)             # NO pre-duck
+        await g.process_frame(BotStartedSpeakingFrame(), FrameDirection.DOWNSTREAM)  # announcement
+        await asyncio.sleep(0.07)
+        await g.process_frame(BotStoppedSpeakingFrame(), FrameDirection.DOWNSTREAM)  # she finishes
+        await asyncio.sleep(0.07)
+        assert client.duck_calls == []    # never ducked the song across the whole announcement
         assert g._open is True            # window still open (keepalive)
+
+    asyncio.run(go())
+
+
+def test_keepalive_releases_a_residual_fresh_wake_preduck_on_short_grace():
+    # A fresh wake pre-ducks (long grace); if a media command then fires a keepalive, that residual pre-duck
+    # must still release — and on the SHORT keepalive grace, not the long wake grace (the song shouldn't stay
+    # dipped). This is what `preduck_grace_keepalive` still governs now that the keepalive itself doesn't duck.
+    client = FakeBrainClient()
+    g = _gate(client, window_secs=10.0, hold_max_secs=120.0,
+              preduck_grace=5.0, preduck_grace_keepalive=0.03)
+
+    async def go():
+        g._open_window("fresh wake")      # fresh-wake pre-duck ON (long grace)
+        await asyncio.sleep(0)
+        assert client.duck_calls == [("sess-test", True)]
+        g._set_keepalive(5.0)             # media command → keepalive; residual pre-duck released on short grace
+        await asyncio.sleep(0.06)
+        assert client.duck_calls == [("sess-test", True), ("sess-test", False)]
+        assert g._open is True
 
     asyncio.run(go())
 
@@ -792,6 +813,63 @@ def test_preduck_grace_zero_holds_until_window_close():
     asyncio.run(go())
     assert g._ducked is False               # released only at window close
     assert client.duck_calls == [("sess-test", True), ("sess-test", False)]
+
+
+# --- F1/F3: duck-over-music gating (2026-06-16) ----------------------------------------------------
+def test_duck_onset_suppressed_in_keepalive_tail_over_media():
+    # F1: over playing media, a raw VAD onset must NOT duck while the window is open only via a keepalive
+    # (held over the song a command just started → the music's own onsets would dip the bed with no wake).
+    client = FakeBrainClient()
+    g = _gate(client, window_secs=10.0, hold_max_secs=120.0, preduck_grace_keepalive=5.0)
+    g._gated_committed = True              # media is playing (gated)
+
+    async def go():
+        g._set_keepalive(5.0)             # window opened by a media command, not a fresh wake
+        assert g._open is True
+        assert g._open_via_keepalive is True
+        assert g.duck_onset_allowed() is False   # raw-onset duck suppressed in the keepalive tail
+        assert g.duck_allowed() is True          # confirmed-speech path still ducks a real follow-up
+
+    asyncio.run(go())
+
+
+def test_duck_onset_allowed_after_fresh_wake_over_media():
+    # A genuine "Hey Aria" over media opens a fresh-wake window → raw onset ducks immediately.
+    client = FakeBrainClient()
+    g = _gate(client, window_secs=10.0)
+    g._gated_committed = True
+
+    async def go():
+        g._open_window("test wake")
+        assert g._open_via_keepalive is False
+        assert g.duck_onset_allowed() is True
+        assert g.duck_allowed() is True
+
+    asyncio.run(go())
+
+
+def test_fresh_wake_supersedes_keepalive_for_onset_gate():
+    # A keepalive tail (onset suppressed) followed by a real wake → onset allowed again.
+    client = FakeBrainClient()
+    g = _gate(client, window_secs=10.0, preduck_grace_keepalive=5.0)
+    g._gated_committed = True
+
+    async def go():
+        g._set_keepalive(5.0)
+        assert g.duck_onset_allowed() is False
+        g._open_window("fresh wake during keepalive")
+        assert g._open_via_keepalive is False
+        assert g.duck_onset_allowed() is True
+
+    asyncio.run(go())
+
+
+def test_duck_onset_allowed_when_nothing_gated():
+    # No media gated → an onset duck is a harmless no-op (skipped downstream); allow it.
+    client = FakeBrainClient()
+    g = _gate(client, window_secs=10.0)
+    g._gated_committed = False
+    assert g.duck_onset_allowed() is True
 
 
 # --- V2 interrupt/stop word barge-in (WAKE_INTERRUPT) ----------------------------------------------

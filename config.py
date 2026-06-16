@@ -586,8 +586,18 @@ def build_media_duck(llm, gate=None):
     gate_duck = gate is not None and require_wake and hasattr(gate, "duck_allowed")
     if gate_duck:
         should_duck = lambda: not llm.is_sleeping and gate.duck_allowed()
+        # Raw VAD-onset duck uses the STRICTER gate (duck_onset_allowed): over playing media it ducks only
+        # in a fresh-wake window, not the keepalive/idle tail (where the held-open window over the song the
+        # user just started would otherwise make the music's own VAD onsets dip the bed — 2026-06-16). A real
+        # follow-up command still ducks via the confirmed-speech path (should_duck). Older gates without the
+        # method fall back to should_duck (no behaviour change).
+        if hasattr(gate, "duck_onset_allowed"):
+            should_duck_onset = lambda: not llm.is_sleeping and gate.duck_onset_allowed()
+        else:
+            should_duck_onset = should_duck
     else:
         should_duck = lambda: not llm.is_sleeping
+        should_duck_onset = should_duck
     logger.info(
         f"Media ducking: on VAD speech onset (min_words={min_words}, "
         f"confirm_grace={confirm_grace}s, restore_grace={restore_grace}s, "
@@ -601,6 +611,7 @@ def build_media_duck(llm, gate=None):
         confirm_grace=confirm_grace,
         sustained_secs=sustained_secs,
         should_duck=should_duck,
+        should_duck_onset=should_duck_onset,
         media_status=build_media_state_provider(llm),  # SHARED with the wake gate (no divergence)
     )
 
@@ -746,6 +757,11 @@ def build_wake_word_gate(llm):
     # 6s matches the human "hear the duck, then compose and speak the command" loop — 3s released the duck
     # before the user began, so the command landed over restored audio and was missed (2026-06-15 live).
     preduck_grace = float(_env("WAKE_PREDUCK_GRACE", "6.0"))
+    # Shorter pre-duck release grace for a media-KEEPALIVE-origin window. A keepalive isn't waiting on user
+    # speech (the command already ran), so once Aria's announcement/reply ends the song she just started
+    # should return promptly rather than linger the full wake grace — the "it dips the song I just played
+    # for ~6s" annoyance (2026-06-16). Held through her reply (BotStarted cancels, BotStopped re-arms).
+    preduck_grace_keepalive = float(_env("WAKE_PREDUCK_GRACE_KEEPALIVE", "1.0"))
     # Hard ceiling on the brain's media-keepalive hold (WakeHoldFrame ttl_secs). A keepalive TTL is clamped
     # to this, and the gate auto-releases at it if the brain's refreshes stop (crash/dropped turn) — so a
     # bad/large/never-refreshed hold can't pin the mic open. Must exceed the brain's media_keepalive_secs.
@@ -824,6 +840,7 @@ def build_wake_word_gate(llm):
         + (f" min-dwell={min_dwell_secs:.1f}s" if min_dwell_secs > 0 else "")
         + (" window-mute=on" if window_mute else " window-mute=off")
         + (f" preduck-grace={preduck_grace:.1f}s" if preduck_grace > 0 else " preduck-grace=off")
+        + f"(keepalive {preduck_grace_keepalive:.1f}s)"
         + f" hold-max={hold_max_secs:.0f}s"
         + (f" interrupt=on@{interrupt_threshold if interrupt_threshold is not None else threshold}"
            f"/consec{interrupt_consec_frames}/arm{interrupt_arm_delay_secs:.1f}s" if interrupt_enabled else "")
@@ -851,6 +868,7 @@ def build_wake_word_gate(llm):
         min_dwell_secs=min_dwell_secs,
         window_mute=window_mute,
         preduck_grace=preduck_grace,
+        preduck_grace_keepalive=preduck_grace_keepalive,
         hold_max_secs=hold_max_secs,
         interrupt_enabled=interrupt_enabled,
         interrupt_threshold=interrupt_threshold,

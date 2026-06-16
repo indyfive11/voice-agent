@@ -116,6 +116,49 @@ def test_duck_gated_behind_wake_word():
     asyncio.run(go())
 
 
+def test_onset_gate_suppresses_raw_onset_but_confirmed_speech_still_ducks():
+    # F1 (2026-06-16): in the keepalive/idle tail over playing media, the raw VAD onset is suppressed (the
+    # media's own onsets must not dip the bed) — modelled by should_duck_onset=False — while a REAL follow-up
+    # command (≥min_words transcription) still ducks via the broad should_duck path. Music never dips; a
+    # genuine command does (a beat later).
+    client = FakeBrainClient()
+    g = MediaDuckController(
+        client, session_id="sess-test", confirm_grace=0.02, restore_grace=5.0, min_words=2,
+        media_status=(lambda: {"playing": True}),
+        should_duck=(lambda: True),            # broad gate open (window open via keepalive)
+        should_duck_onset=(lambda: False),     # raw-onset gate closed (keepalive tail → suppress onset)
+    )
+
+    async def go():
+        g._handle(VADUserStartedSpeakingFrame())   # raw onset → suppressed (music tripping VAD)
+        await _drain()
+        assert client.duck_calls == [], "raw onset ducked in the keepalive tail"
+        assert g._ducked is False
+        g._handle(_transcript("turn it up"))        # ≥2 words → a real follow-up command
+        await _drain()
+        assert client.duck_calls == [("sess-test", True)]  # confirmed speech ducks
+        assert g._ducked is True
+
+    asyncio.run(go())
+
+
+def test_onset_gate_defaults_to_should_duck_when_unset():
+    # Back-compat: without should_duck_onset, the raw onset uses should_duck (no behaviour change).
+    client = FakeBrainClient()
+    g = MediaDuckController(
+        client, session_id="sess-test", confirm_grace=0.02, restore_grace=5.0,
+        media_status=(lambda: {"playing": True}),
+        should_duck=(lambda: True),
+    )
+
+    async def go():
+        g._handle(VADUserStartedSpeakingFrame())
+        await _drain()
+        assert client.duck_calls == [("sess-test", True)]
+
+    asyncio.run(go())
+
+
 def test_slow_transcript_over_movie_confirms_without_flap():
     # The real-command-over-a-movie case: onset ducks, confirm_grace elapses BEFORE the transcript (slow
     # Whisper), then the ≥min_words transcript lands. There must be NO down→up→down — only the single ON.

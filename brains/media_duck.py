@@ -80,6 +80,7 @@ class MediaDuckController(FrameProcessor):
         confirm_grace: float = 2.5,
         sustained_secs: float = 4.0,
         should_duck: Callable[[], bool] | None = None,
+        should_duck_onset: Callable[[], bool] | None = None,
         media_status: Callable[[], "dict|None"] | None = None,
         time_source: Callable[[], float] | None = None,
         **kwargs,
@@ -103,6 +104,11 @@ class MediaDuckController(FrameProcessor):
         self._confirm_grace = confirm_grace
         # Gate (e.g. "not asleep"); default always-allow.
         self._should_duck = should_duck or (lambda: True)
+        # Stricter gate for the RAW VAD-ONSET duck (the immediate, pre-transcription dip). Over playing media
+        # the held-open keepalive/idle window would otherwise let the media's own VAD onsets dip the bed with
+        # no wake (2026-06-16); this gate suppresses the onset duck there while the confirmed-speech path
+        # (gated by should_duck) still ducks a real follow-up command. Defaults to should_duck (no change).
+        self._should_duck_onset = should_duck_onset or self._should_duck
         self._ducked = False
         self._bot_spoke = False  # did the bot speak during the current duck?
         self._confirmed = False  # got ≥min_words this duck episode (so it's not a false onset)
@@ -131,7 +137,7 @@ class MediaDuckController(FrameProcessor):
             # Speech onset — duck immediately. Cancel any pending false-onset restore (still talking).
             self._speech_in_flight = True
             self._cancel_confirm()
-            self._duck_on("speech onset")
+            self._duck_on("speech onset", allow=self._should_duck_onset)
         elif isinstance(frame, VADUserStoppedSpeakingFrame):
             # Speech segment ended. If this onset hasn't been confirmed by real words yet, start the
             # short countdown that restores it as a false trigger (cancelled if a transcription
@@ -174,8 +180,10 @@ class MediaDuckController(FrameProcessor):
                 else:
                     self._restore("aside")
 
-    def _duck_on(self, reason: str) -> None:
-        if not self._should_duck() or self._ducked:
+    def _duck_on(self, reason: str, allow: Callable[[], bool] | None = None) -> None:
+        # `allow` lets the raw-onset path use the stricter onset gate while the confirmed-speech path uses
+        # the broad should_duck (default). Both still require something to be playing (checked in _fire).
+        if not (allow or self._should_duck)() or self._ducked:
             return
         self._ducked = True
         self._bot_spoke = False

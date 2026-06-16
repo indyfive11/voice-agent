@@ -118,6 +118,7 @@ class WakeWordGate(FrameProcessor):
         min_dwell_secs: float = 2.0,
         window_mute: bool = True,
         preduck_grace: float = 3.0,
+        preduck_grace_keepalive: float = 1.0,
         hold_max_secs: float = 120.0,
         interrupt_enabled: bool = False,
         interrupt_threshold: float | None = None,
@@ -192,6 +193,13 @@ class WakeWordGate(FrameProcessor):
         # once a command is transcribed, MediaDuckController owns the duck lifecycle (restore on Aria-stops)
         # and this is cancelled. 0 disables (the pre-duck then holds until the window closes — old behaviour).
         self._preduck_grace = max(0.0, preduck_grace)
+        # Shorter pre-duck release grace for a KEEPALIVE-origin window (a media command just opened it). The
+        # keepalive pre-duck keeps media down so Aria's post-command announcement/reply is audible over the
+        # song she just started — but unlike a fresh "Hey Aria" (where the long grace gives the user time to
+        # start a command), a keepalive isn't waiting on user speech, so the bed should return promptly once
+        # she stops talking instead of lingering the full wake grace (the "dips the song I just played for
+        # ~6s" annoyance, 2026-06-16). Held through her reply (BotStarted cancels, BotStopped re-arms).
+        self._preduck_grace_keepalive = max(0.0, preduck_grace_keepalive)
         self._preduck_task: asyncio.Task | None = None
         self._bot_speaking = False  # Aria is mid-reply → keep the pre-duck and freeze the idle close
 
@@ -214,6 +222,13 @@ class WakeWordGate(FrameProcessor):
         # While True, idle-close is suspended for the WHOLE keepalive TTL (like _hold) so a BotStoppedSpeaking
         # / transcription / VAD re-arm of the 15s idle timer can't truncate the hold (2026-06-15 live bug).
         self._keepalive_active = False
+        # True while the OPEN window originated from a media keepalive (a command the user already issued
+        # opened it) rather than a fresh "Hey Aria" wake — and stays True through the post-keepalive idle
+        # tail until the window actually closes or a fresh wake supersedes it. Two uses: (1) the raw-VAD-onset
+        # duck is suppressed in this state (the open window is held OVER the playing media, so an onset is the
+        # media tripping VAD, not a command — a real follow-up still ducks via confirmed speech); (2) the
+        # pre-duck releases on the shorter keepalive grace. Both fix the 2026-06-16 duck-over-music report.
+        self._open_via_keepalive = False
         # Peak score within the current sub-threshold burst (one line emitted per utterance, not per frame).
         self._nearmiss_peak = 0.0
         self._nearmiss_key = ""
@@ -350,6 +365,18 @@ class WakeWordGate(FrameProcessor):
         the same as STT, for all playback). The on-wake pre-duck is fired by the gate itself (`_open_window`),
         so a real "Hey Aria" still ducks immediately; this only suppresses the un-woken ambient-speech duck."""
         return self._open or not bool(self._gated_committed)
+
+    def duck_onset_allowed(self) -> bool:
+        """Stricter gate for the RAW VAD-onset duck (the immediate, pre-transcription dip). Over gated media,
+        a raw onset only ducks while the window is open from a FRESH WAKE — never in the keepalive/idle tail
+        a media command left open. There, the window is held OPEN OVER the very media the user just started,
+        and that media isn't AEC-removed (only Aria's TTS is), so it trips VAD onset repeatedly: ducking on it
+        is the "music dips with no wake word" bug (2026-06-16). A genuine follow-up command in the keepalive
+        window still ducks — via the confirmed-speech path (`duck_allowed`), a beat later. When nothing is
+        being gated (no media), an onset duck is a harmless no-op (skipped if nothing plays), so allow it."""
+        if not bool(self._gated_committed):
+            return True
+        return self._open and not self._open_via_keepalive
 
     def hb_state(self) -> dict:
         """Snapshot for the input-watchdog heartbeat (and reset the wake-peak window). `gated=True
@@ -576,6 +603,7 @@ class WakeWordGate(FrameProcessor):
     def _open_window(self, log_msg: str) -> None:
         """Open the command window (idempotent): log the reason, pre-duck, arm the idle timer."""
         self._cancel_keepalive()  # a fresh wake/confirm supersedes any media keepalive hold
+        self._open_via_keepalive = False  # a fresh wake → the long preduck grace + raw-onset duck apply
         if not self._open:
             self._open = True
             _tlog(log_msg)
@@ -598,6 +626,7 @@ class WakeWordGate(FrameProcessor):
                 await asyncio.sleep(self._window_secs)
                 if self._open:
                     self._open = False
+                    self._open_via_keepalive = False
                     self._cancel_preduck()
                     _tlog("WAKE  | window closed (idle) — muting until next wake word")
                     self._fire_duck(False)
@@ -632,17 +661,21 @@ class WakeWordGate(FrameProcessor):
         self._cancel_keepalive()
         self._cancel_window()  # suspend the normal idle close while the keepalive holds the window open
         self._keepalive_active = True  # make _arm_window bail for the whole TTL (no idle-close truncation)
+        self._open_via_keepalive = True  # window is held over the media a command started → strict onset gate
         if not self._open:
             self._open = True
             _tlog(f"GATE  | keepalive — opening window for {ttl:.0f}s")
-            self._fire_duck(True)
         else:
             _tlog(f"GATE  | keepalive — window held {ttl:.0f}s")
-        # Release the pre-duck after the grace if no speech follows — the keepalive holds the *window* open
-        # for follow-ups, but the media must return to full while the user is silent (media_duck re-ducks on
-        # the next speech onset). Without this the pre-duck stayed pinned for the whole TTL (movie stuck
-        # ducked ~30s after a play command, 2026-06-15). Not while held for a confirm.
-        if not self._hold:
+        # F3 (2026-06-16, the maintainer = "option B"): do NOT pre-duck on a media keepalive. The command already ran;
+        # pre-ducking here dips the song the user just asked to play/resume (the 12:12:13 "dips the song I
+        # just started" annoyance). There's nothing to make room for yet — a follow-up command still ducks
+        # via the confirmed-speech path (duck_allowed in the open window), and a raw onset is the media itself
+        # (F1 suppresses it). So no `_fire_duck(True)` here. We still release any pre-duck left ON from a
+        # PRIOR fresh wake on the SHORT keepalive grace (don't strand it for the TTL). Not while held for a
+        # confirm. [If a play announcement ever gets drowned over loud media, revisit with a duck-on-bot-
+        # speech-only path — duck exactly while Aria talks — rather than re-adding the pre-emptive dip.]
+        if not self._hold and self._ducked:
             self._arm_preduck()
 
         async def _later():
@@ -670,13 +703,16 @@ class WakeWordGate(FrameProcessor):
         wake would otherwise hold media down for the whole command window. Re-armed on each VAD onset/stop
         (a cough that yields no words still releases), cancelled by a real transcription (the media-duck then
         owns restore) and while Aria is speaking. Never fires mid-speech (`_speech_in_flight`)."""
-        if self._preduck_grace <= 0:
+        # A keepalive-origin window uses the shorter grace (return the song promptly once Aria stops); a fresh
+        # wake uses the long grace (give the user time to start a command after "Hey Aria").
+        grace = self._preduck_grace_keepalive if self._open_via_keepalive else self._preduck_grace
+        if grace <= 0:
             return
         self._cancel_preduck()
 
         async def _later():
             try:
-                await asyncio.sleep(self._preduck_grace)
+                await asyncio.sleep(grace)
                 if (self._open and self._ducked and not self._bot_speaking
                         and not self._hold and not self._speech_in_flight):
                     _tlog("WAKE  | pre-duck released (no speech after wake)")
