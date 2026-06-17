@@ -1256,3 +1256,67 @@ def test_inflight_turn_runs_as_cancellable_task_not_inline():
         assert svc._turn_task.done()
 
     asyncio.run(go())
+
+
+# --- brain-down resilience: a crashed brain must not leave the user in dead air -------------------
+# Live (2026-06-17): gabagent died mid web-lookup ("peer closed connection ... incomplete chunked
+# read", then "All connection attempts failed"). The turn's except only logged an ErrorFrame, so Aria
+# went SILENT and the user waited on a reply that never came. _run_turn now speaks a brief apology
+# (TTS is local — works even with the brain unreachable), dedup'd per outage and re-armed by a clean turn.
+from brains.brain_llm_service import _BRAIN_ERROR_REPLY
+
+
+async def _noop_metrics(*a, **k):  # start/stop_processing_metrics need a live pipeline; no-op offline
+    pass
+
+
+def _arm_offline(svc):
+    svc.start_processing_metrics = _noop_metrics
+    svc.stop_processing_metrics = _noop_metrics
+
+
+class _CrashingClient(FakeBrainClient):
+    """respond() dies before yielding — simulates the brain dropping the chunked stream mid-request."""
+
+    def __init__(self):
+        super().__init__()
+        self.mode = "fail"  # "fail" → raise; "ok" → stream a normal reply
+
+    async def respond(self, session_id, text):
+        self.respond_calls.append((session_id, text))
+        if self.mode == "fail":
+            raise RuntimeError("peer closed connection without sending complete message body")
+        for ev in (BrainEvent("token", text="Done."), BrainEvent("done")):
+            yield ev
+
+
+def test_brain_crash_speaks_apology_not_silence():
+    svc, pushed = _service_with_recorder(_CrashingClient())
+    _arm_offline(svc)
+    asyncio.run(svc._run_turn(_ctx("find us a campsite")))
+    assert _BRAIN_ERROR_REPLY in _spoken_texts(pushed)     # audible signal, not dead air
+
+
+def test_brain_crash_apology_dedups_while_down():
+    client = _CrashingClient()
+    svc, pushed = _service_with_recorder(client)
+    _arm_offline(svc)
+    asyncio.run(svc._run_turn(_ctx("q1")))                 # 1st failure speaks
+    assert _BRAIN_ERROR_REPLY in _spoken_texts(pushed)
+    pushed.clear()
+    asyncio.run(svc._run_turn(_ctx("q2")))                 # brain still down → no repeat
+    assert _BRAIN_ERROR_REPLY not in _spoken_texts(pushed)
+
+
+def test_brain_error_notice_rearms_after_clean_turn():
+    client = _CrashingClient()
+    svc, pushed = _service_with_recorder(client)
+    _arm_offline(svc)
+    asyncio.run(svc._run_turn(_ctx("q1")))                 # fail → speaks
+    assert _BRAIN_ERROR_REPLY in _spoken_texts(pushed)
+    client.mode = "ok"; pushed.clear()
+    asyncio.run(svc._run_turn(_ctx("q2")))                 # clean turn → re-arms
+    assert "Done." in _texts(pushed)
+    client.mode = "fail"; pushed.clear()
+    asyncio.run(svc._run_turn(_ctx("q3")))                 # fails again → speaks again
+    assert _BRAIN_ERROR_REPLY in _spoken_texts(pushed)

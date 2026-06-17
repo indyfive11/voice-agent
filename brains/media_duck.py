@@ -189,8 +189,7 @@ class MediaDuckController(FrameProcessor):
         self._bot_spoke = False
         self._confirmed = False
         self._duck_started_at = self._time()
-        _tlog(f"DUCK  | on ({reason})")
-        self._fire(True)
+        self._fire(True, reason)
 
     def _on_confirmed_speech(self) -> None:
         if not self._should_duck():
@@ -208,18 +207,22 @@ class MediaDuckController(FrameProcessor):
         self._arm_restore()
 
     # --- duck firing -------------------------------------------------------
-    def _fire(self, on: bool) -> None:
+    def _fire(self, on: bool, reason: str = "") -> None:
         """Fire-and-forget the brain duck call — never block the audio pipeline."""
 
         async def _go():
             try:
                 if on and not await self._media_playing():
                     # Nothing actually playing — don't bother the brain; undo the optimistic flag.
+                    # DEBUG-only: in open-mic conversation (no media) every VAD onset hits this path, so
+                    # logging it to the transcript drowns USER/BOT in "on SKIPPED" noise (~40% of the
+                    # transcript in the 2026-06-17 open-mic drive). The skip is a no-op; keep it in
+                    # session.log for media debugging, off the transcript.
                     self._ducked = False
-                    _tlog("DUCK  | on SKIPPED (media_state: nothing playing)")
+                    logger.debug("DUCK  | on SKIPPED (media_state: nothing playing)")
                     return
                 await self._client.duck(self._session_id, on)
-                _tlog(f"DUCK  | /media/duck on={on} sent")
+                _tlog(f"DUCK  | on ({reason}) sent" if on else "DUCK  | /media/duck on=False sent")
             except Exception as e:  # noqa: BLE001 - media control must never break audio
                 _tlog(f"DUCK  | /media/duck on={on} FAILED: {type(e).__name__}: {e}")
 

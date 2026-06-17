@@ -177,6 +177,12 @@ _WAKE_LEADINS = frozenset(("hey", "ok", "okay", "yo", "hi", "hello", "um", "uh",
 # "did you need something?" only when the name is left hanging (2026-06-15, the maintainer).
 _BARE_WAKE_PROMPT = "Yes? Did you need something?"
 
+# Spoken when a turn fails because the brain dropped mid-request (crash / connection lost). Without an
+# audible signal the turn just vanishes into dead air and the user waits on a reply that will never come
+# (2026-06-17: gabagent died mid web-lookup — "incomplete chunked read" — and Aria went silent). TTS is
+# local, so we can still speak even when the brain is unreachable.
+_BRAIN_ERROR_REPLY = "Sorry, I lost my connection just then. Try that again in a moment."
+
 
 def _strip_leading_wake(user_text: str, low_norm: str) -> tuple[bool, str, bool]:
     """Strip a LEADING wake trigger and return (had_wake, command, is_bare).
@@ -238,6 +244,9 @@ class BrainLLMService(LLMService):
         self._session_id = session_id or uuid.uuid4().hex
         self._pending_confirm: dict | None = None  # {"id":…, "method":…}
         self._reply_buf: list[str] = []  # accumulates this turn's spoken text (transcript log)
+        # Speak a brain-down apology at most once per outage — re-armed by the first turn that completes
+        # cleanly — so a fully-dead brain doesn't repeat "I lost my connection" on every subsequent turn.
+        self._brain_error_spoken = False
         self._sleeping = False  # when True, ignore all input except a naming/wake-phrase transcript
         # Whether an acoustic wake-word gate sits upstream (set by main.py once the gate is built). Going to
         # sleep still forces that gate active (so ambient audio is mostly held out of STT), but it no longer
@@ -337,6 +346,7 @@ class BrainLLMService(LLMService):
             await self._set_thinking(True)
             await self.start_processing_metrics()
             await self._process_context(context)
+            self._brain_error_spoken = False  # a turn completed cleanly → re-arm the brain-down notice
         except asyncio.CancelledError:
             # Barge-in cancelled this turn. `_consume` already issued POST /cancel on its way out; just
             # let the finally restore state. Do NOT re-raise — this is a clean, expected stop, and the
@@ -344,6 +354,14 @@ class BrainLLMService(LLMService):
             _tlog("BARGE-IN| turn cancelled (barge-in)")
         except Exception as e:  # noqa: BLE001 - surface as a pipeline error frame
             await self.push_error(error_msg=f"Brain error: {e}", exception=e)
+            # Don't leave the user in dead air: the ErrorFrame is only logged. If nothing was spoken yet
+            # this turn, speak a brief apology (TTS is local — works even with the brain down) so a brain
+            # crash degrades to "try again" instead of silence. Dedup'd so a fully-down brain doesn't
+            # repeat it every turn (re-armed by the next clean turn).
+            if not self._reply_buf and not self._brain_error_spoken:
+                self._brain_error_spoken = True
+                await self._speak(_BRAIN_ERROR_REPLY, immediate=True)
+                _tlog("BOT   | " + _BRAIN_ERROR_REPLY)
         finally:
             await self._set_thinking(False)
             await self.stop_processing_metrics()
