@@ -44,6 +44,8 @@ from pipecat.frames.frames import (
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
+import aria_state
+
 _CHUNK_SAMPLES = 1280  # 80ms @16k — openWakeWord's preferred frame
 _CHUNK_BYTES = _CHUNK_SAMPLES * 2  # int16 mono
 
@@ -324,6 +326,7 @@ class WakeWordGate(FrameProcessor):
         # never runs on ambient TV and only "hey aria" can wake her (see _gated_now / _force_gated).
         if isinstance(frame, WakeSleepFrame):
             self._force_gated = frame.asleep
+            aria_state.set_state("off" if frame.asleep else "idle")  # eye: asleep = closed, awake = idle
             if self._debug:
                 _tlog(
                     "GATE  | asleep — forcing wake-word gate active (acoustic wake only)" if frame.asleep
@@ -614,6 +617,7 @@ class WakeWordGate(FrameProcessor):
         self._escape_run = 0
         self._escape_hits.clear()  # fresh start once we're open
         self._arm_window()
+        aria_state.set_state("listening")  # eye: wake/floor open — capturing the user's speech
 
     # --- command window ----------------------------------------------------
     def _arm_window(self) -> None:
@@ -630,6 +634,10 @@ class WakeWordGate(FrameProcessor):
                     self._cancel_preduck()
                     _tlog("WAKE  | window closed (idle) — muting until next wake word")
                     self._fire_duck(False)
+                    # eye: a wake with no command → back to idle. Only downgrade `listening`; never
+                    # step on `speaking`/`thinking` (those own their own return to idle).
+                    if aria_state.current() == "listening":
+                        aria_state.set_state("idle")
             except asyncio.CancelledError:
                 pass
 

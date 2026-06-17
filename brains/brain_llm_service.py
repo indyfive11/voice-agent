@@ -37,6 +37,8 @@ from pipecat.services.settings import LLMSettings
 
 from brains.brain_client import BrainClient, BrainEvent
 
+import aria_state
+
 _YES_WORDS = ("yes", "yeah", "yep", "yup", "confirm", "proceed", "go ahead", "do it", "affirmative", "sure")
 
 # Explicit "back out entirely" phrases for the controllable-client play confirm (yes-here / no-new-window /
@@ -328,6 +330,7 @@ class BrainLLMService(LLMService):
         mid-generation barge cancels it → `_consume` CancelledError → /cancel + stop streaming to TTS."""
         try:
             await self.push_frame(LLMFullResponseStartFrame())
+            aria_state.set_state("thinking")  # eye: request sent to the brain, awaiting the reply
             # Mute the user through the whole bot turn (not just while speaking): a SystemFrame
             # pushed UPSTREAM that BotThinkingMuteStrategy honors, closing the first-token latency
             # gap where an empty barge-in cancels the silent in-flight turn. Released in `finally`.
@@ -345,6 +348,11 @@ class BrainLLMService(LLMService):
             await self._set_thinking(False)
             await self.stop_processing_metrics()
             await self.push_frame(LLMFullResponseEndFrame())
+            # eye: an aside / suppressed turn produces no TTS, so no BotStarted/StoppedSpeaking ever
+            # returns the eye from `thinking` to `idle` — do it here. A spoken reply (reply_buf
+            # populated) is owned by the TTS path (speaking→idle on the bot-speaking frames); leave it.
+            if not self._reply_buf:
+                aria_state.set_state("idle")
 
     async def cleanup(self) -> None:
         """Pipeline teardown: cancel any in-flight turn task so a shutdown mid-reply unwinds cleanly."""

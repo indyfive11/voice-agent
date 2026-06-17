@@ -58,6 +58,8 @@ from turn_cap import MaxTurnDurationUserTurnStopStrategy
 from turn_mute import BotThinkingMuteStrategy
 from response_latency import ResponseLatencyObserver
 from tts_gain import TTSGainProcessor
+
+import aria_state
 from pipecat.turns.user_turn_strategies import (
     UserTurnStrategies,
     default_user_turn_start_strategies,
@@ -394,6 +396,7 @@ async def run() -> None:
         await worker.queue_frames([LLMRunFrame()])
 
     logger.info("Voice agent ready — start speaking. (Ctrl-C to quit.)")
+    aria_state.set_state("idle")  # eye: awake, listening for the wake word
     # Guard the TTS output stream against PipeWire module-stream-restore stranding it silent (which would
     # leave the user muted under half-duplex and break the conversation). In-app, dies with the app.
     pin_task = asyncio.create_task(config.pin_output_stream_volume())
@@ -402,6 +405,7 @@ async def run() -> None:
         await runner.add_workers(worker)
         await runner.run()
     finally:
+        aria_state.set_state("off")  # eye: voice mode down → eye closed
         pin_task.cancel()
         # Tear down an external brain (stop `gab --voice-serve`); no-op for local brains.
         await config.stop_brain(llm)
