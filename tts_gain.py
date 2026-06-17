@@ -52,7 +52,9 @@ class TTSGainProcessor(FrameProcessor):
         if isinstance(frame, BotStartedSpeakingFrame):
             aria_state.set_state("speaking")  # glow on; RMS fills in as audio frames arrive
         elif isinstance(frame, BotStoppedSpeakingFrame):
-            aria_state.set_state("idle")
+            # Return to the current resting state, not always `idle`: a goodbye spoken on the way to
+            # sleep must settle the eye on `off` (the wake gate set resting=off before this TTS).
+            aria_state.set_state(aria_state.resting_state())
         elif isinstance(frame, TTSAudioRawFrame) and frame.audio:
             now = time.monotonic()
             if now - self._last_level_write >= _LEVEL_MIN_INTERVAL:

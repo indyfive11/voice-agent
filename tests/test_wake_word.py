@@ -240,6 +240,7 @@ def test_always_gated_when_not_media_only():
 def test_force_gated_while_asleep_overrides_media_state():
     # While asleep the gate is FORCED active even with nothing playing, so ambient TV never reaches STT
     # and only an acoustic "hey aria" can wake her. A WakeSleepFrame(asleep=True) flips it; (False) clears.
+    import aria_state
     from pipecat.processors.frame_processor import FrameDirection
     from wake_word import WakeSleepFrame
 
@@ -249,10 +250,12 @@ def test_force_gated_while_asleep_overrides_media_state():
     asyncio.run(g.process_frame(WakeSleepFrame(asleep=True), FrameDirection.UPSTREAM))
     assert g._force_gated is True
     assert asyncio.run(g._gated_now()) is True                   # forced gated despite nothing playing
+    assert aria_state.resting_state() == "off"                   # eye must REST on off, not flash-then-idle
 
     asyncio.run(g.process_frame(WakeSleepFrame(asleep=False), FrameDirection.UPSTREAM))
     assert g._force_gated is False
     assert asyncio.run(g._gated_now()) is False                  # awake → media-aware gating restored
+    assert aria_state.resting_state() == "idle"                  # awake → eye rests on idle again
 
 
 def test_escape_hatch_opens_after_repeated_near_misses():

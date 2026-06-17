@@ -326,7 +326,11 @@ class WakeWordGate(FrameProcessor):
         # never runs on ambient TV and only "hey aria" can wake her (see _gated_now / _force_gated).
         if isinstance(frame, WakeSleepFrame):
             self._force_gated = frame.asleep
-            aria_state.set_state("off" if frame.asleep else "idle")  # eye: asleep = closed, awake = idle
+            rest = "off" if frame.asleep else "idle"
+            # Record what "rest" means now so a goodbye TTS spoken on the way to sleep settles the eye
+            # on `off`, not `idle` (tts_gain's BotStopped→rest write reads this); then set it live.
+            aria_state.set_resting_state(rest)
+            aria_state.set_state(rest)  # eye: asleep = closed, awake = idle
             if self._debug:
                 _tlog(
                     "GATE  | asleep — forcing wake-word gate active (acoustic wake only)" if frame.asleep

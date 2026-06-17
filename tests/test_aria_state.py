@@ -19,6 +19,7 @@ def state_file(tmp_path, monkeypatch):
     monkeypatch.setattr(aria_state, "_last_state", None)
     monkeypatch.setattr(aria_state, "_last_level", -1.0)
     monkeypatch.setattr(aria_state, "_level_gain", 4.0)
+    monkeypatch.setattr(aria_state, "_resting_state", "idle")
     return p
 
 
@@ -72,6 +73,23 @@ def test_current_tracks_last_written(state_file):
     assert aria_state.current() is None
     aria_state.set_state("listening")
     assert aria_state.current() == "listening"
+
+
+def test_resting_state_defaults_to_idle(state_file):
+    assert aria_state.resting_state() == "idle"
+
+
+def test_set_resting_state_is_read_back(state_file):
+    aria_state.set_resting_state("off")  # asleep → eye rests on off
+    assert aria_state.resting_state() == "off"
+    aria_state.set_resting_state("idle")  # awake → back to idle
+    assert aria_state.resting_state() == "idle"
+
+
+def test_set_resting_state_does_not_write_the_file(state_file):
+    # Recording the resting state is a pure flag set — it must not touch the state file (set_state does).
+    aria_state.set_resting_state("off")
+    assert not state_file.exists()
 
 
 def test_disabled_writes_nothing(state_file, monkeypatch):

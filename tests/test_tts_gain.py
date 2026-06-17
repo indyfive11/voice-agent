@@ -1,6 +1,11 @@
 """TTSGainProcessor — verify the PCM attenuation math (the audio scaling Aria's voice down)."""
-import numpy as np
+import asyncio
 
+import numpy as np
+from pipecat.frames.frames import BotStoppedSpeakingFrame
+from pipecat.processors.frame_processor import FrameDirection
+
+import aria_state
 from tts_gain import TTSGainProcessor
 
 
@@ -34,3 +39,24 @@ def test_gain_no_overflow_at_extremes():
     p = TTSGainProcessor(gain=0.9)
     out = np.frombuffer(p._apply(_pcm([32767, -32768])), dtype=np.int16)
     assert out.min() >= -32768 and out.max() <= 32767
+
+
+def test_bot_stopped_returns_to_resting_state(monkeypatch):
+    # The clobber bug: a goodbye spoken on the way to sleep set the eye `off`, then this BotStopped
+    # handler overwrote it with a hardcoded `idle` — so sleep never showed. It must honor the resting
+    # state the wake gate recorded instead.
+    writes = []
+    monkeypatch.setattr(aria_state, "set_state", lambda s, level=0.0: writes.append(s))
+    monkeypatch.setattr(aria_state, "_resting_state", "off")  # wake gate set rest=off (asleep)
+    p = TTSGainProcessor(gain=0.6)
+    asyncio.run(p.process_frame(BotStoppedSpeakingFrame(), FrameDirection.DOWNSTREAM))
+    assert writes == ["off"]  # NOT idle — the goodbye no longer clobbers the sleep state
+
+
+def test_bot_stopped_rests_on_idle_when_awake(monkeypatch):
+    writes = []
+    monkeypatch.setattr(aria_state, "set_state", lambda s, level=0.0: writes.append(s))
+    monkeypatch.setattr(aria_state, "_resting_state", "idle")  # awake → normal return-to-idle
+    p = TTSGainProcessor(gain=0.6)
+    asyncio.run(p.process_frame(BotStoppedSpeakingFrame(), FrameDirection.DOWNSTREAM))
+    assert writes == ["idle"]

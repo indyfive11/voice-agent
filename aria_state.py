@@ -39,6 +39,12 @@ except ValueError:
 _last_state: str | None = None
 _last_level: float = -1.0
 
+# The state the eye should settle on once a transient (speaking/thinking/listening) ends: `idle`
+# while awake, `off` while asleep. Whoever owns a return-to-rest transition reads this instead of
+# hardcoding `idle`, so a goodbye spoken on the way to sleep settles the eye on `off`, not `idle`
+# (the goodbye TTS's BotStopped→rest write would otherwise clobber the earlier `off`).
+_resting_state: str = "idle"
+
 
 def _state_path() -> Path:
     base = os.environ.get("XDG_RUNTIME_DIR")
@@ -53,6 +59,20 @@ def current() -> str | None:
     """The last state we wrote (None before the first write). Lets callers avoid clobbering a state
     they don't own — e.g. only downgrade `listening`→`idle`, never step on `speaking`."""
     return _last_state
+
+
+def set_resting_state(state: str) -> None:
+    """Record the state the eye should return to when no transient is active: `idle` while awake,
+    `off` while asleep. Set by the sleep/wake authority (the wake gate); read via resting_state() by
+    whoever owns the return-to-rest transition (tts_gain on BotStopped). Does NOT itself write the
+    file — call set_state() for that."""
+    global _resting_state
+    _resting_state = state
+
+
+def resting_state() -> str:
+    """The state to settle on once a transient ends (see set_resting_state). Defaults to `idle`."""
+    return _resting_state
 
 
 def set_state(state: str, level: float = 0.0) -> None:
