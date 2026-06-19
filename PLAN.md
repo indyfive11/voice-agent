@@ -35,7 +35,7 @@ to whatever brain `BRAIN=` selects:
 - `BRAIN=local` — a raw LLM brain (still uses `config.build_llm()`; default `claude-sonnet-4-6`,
   swappable to OpenAI-compatible or local Ollama on the RX 7900 XT).
 - `BRAIN=gabagent` — the full agent: tools + escalating-tier safety + media control + an
-  addressing/aside classifier. Released independently (currently **v0.4.4**, own AUR package, own
+  addressing/aside classifier. Released independently (currently **v0.5.1**, own AUR package, own
   test suite).
 
 **Why:** the brain grew its own complexity and release cadence; coupling two independently-evolving
@@ -101,6 +101,30 @@ below is **net-new** vs the v1 plan:
 
 ---
 
+## Status side-channel — the Aria "HAL eye" indicator (net-new vs v1)
+
+The voice shell publishes its semantic state to a tmpfs file that a **separate** desktop panel (a
+standalone Conky "HAL eye", not in this repo) renders — so the user can *see* at a glance whether Aria
+is idle, listening, thinking, or speaking.
+
+- `aria_state.py` — an atomic writer (`tmp` + `os.replace`) to `${XDG_RUNTIME_DIR}/aria/state`
+  (fallback `~/.local/state/aria/state`), JSON `{"state","level","ts"}`, enum
+  `off | idle | listening | thinking | speaking` (`error` reserved). It is a **cosmetic side-channel**:
+  every write error is swallowed and never affects the conversation. Disable with `ARIA_EYE_STATE=0`
+  (see `.env.example`); `ARIA_EYE_LEVEL_GAIN` boosts the `speaking` amplitude pulse.
+- **Multi-writer, one transition each:** `main.py` (idle/off), `wake_word.py` (listening on
+  window-open, rest on window-close, off/idle on sleep/wake), `brains/brain_llm_service.py` (thinking
+  on a turn), `tts_gain.py` (speaking + a live RMS `level` from the TTS PCM, ~20 Hz). The contract is
+  **single-writer-at-a-time** — in voice mode the voice shell is the sole writer; the reader (Conky)
+  fails safe to `off` if `ts` goes stale (>~5s).
+- **The return-to-rest invariant:** when a transient ends, the eye settles on a process-global
+  *resting state* (`aria_state.resting_state()` — `idle` awake, `off` asleep), never a hardcoded
+  `idle`. All four return-to-rest writers honor it — `tts_gain` BotStopped, the wake gate's
+  window-open and window-close, and `brain_llm_service._run_turn` (start + finally) — so a wake-model
+  false-fire while asleep can't drift the eye back to `idle` (fixed across `9cbd609` → `45e0790`).
+
+---
+
 ## Smaller divergences from v1
 
 - **Python:** v1 said "3.12 venv, fall back to 3.11." As built: **3.12–3.13** (3.13 verified
@@ -133,7 +157,8 @@ transport.input()
   → transport.output()
   → assistant_aggregator
 ```
-Supporting modules: `turn_cap.py`, `response_latency.py`, `vad_diag.py`, `input_watchdog.py`.
+Supporting modules: `turn_cap.py`, `response_latency.py`, `vad_diag.py`, `input_watchdog.py`,
+`aria_state.py` (the HAL-eye status side-channel — see above).
 
 Swappability still holds (env in `config.py`): `STT_PROVIDER`, `TTS_PROVIDER`, `LLM_PROVIDER`/`BRAIN`.
 
