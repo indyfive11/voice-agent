@@ -1320,3 +1320,54 @@ def test_brain_error_notice_rearms_after_clean_turn():
     client.mode = "fail"; pushed.clear()
     asyncio.run(svc._run_turn(_ctx("q3")))                 # fails again → speaks again
     assert _BRAIN_ERROR_REPLY in _spoken_texts(pushed)
+
+
+# --- eye: _run_turn is a fourth return-to-rest writer; it must honor resting_state() -----------------
+# Live (2026-06-19): asleep, a nano false-fire on un-AEC'd room audio opened a wake-candidate window →
+# STT transcribed ambient chatter → an LLMContextFrame → _run_turn ran even though _process_context
+# ASLEEP-ignored it. _run_turn hardcoded eye `thinking` (start) then `idle` (finally, no reply), so the
+# eye went off→thinking→idle and STUCK at idle while she was genuinely asleep — exactly the maintainer's "won't
+# sleep / eye shows idle". The wake-gate fix (9cbd609 + Phase-1) wasn't enough: this is the 4th writer.
+import aria_state
+
+
+def test_run_turn_keeps_eye_off_for_asleep_phantom_turn():
+    # Asleep (resting=off): a phantom turn (ambient chatter, not naming her) is ASLEEP-ignored and
+    # produces no reply → the eye must stay `off`, never flashing thinking/idle.
+    client = FakeBrainClient(respond_events=[BrainEvent("token", text="x"), BrainEvent("done")])
+    svc, pushed = _service_with_recorder(client)
+    _arm_offline(svc)
+    svc._sleeping = True
+    aria_state.set_resting_state("off"); aria_state.set_state("off")
+    try:
+        asyncio.run(svc._run_turn(_ctx("oh yeah")))
+        assert client.respond_calls == []            # never reached the brain (ASLEEP-ignored)
+        assert aria_state.current() == "off"         # eye stayed asleep, no thinking/idle drift
+    finally:
+        aria_state.set_resting_state("idle")
+
+
+def test_run_turn_settles_idle_for_awake_aside():
+    # Awake (resting=idle): a no-reply aside (bare vocative, not forwarded) settles the eye to `idle`,
+    # exactly as before — no behavior change while awake.
+    client = FakeBrainClient(respond_events=[BrainEvent("token", text="Yeah?"), BrainEvent("done")])
+    svc, pushed = _service_with_recorder(client)
+    _arm_offline(svc)
+    svc._sleeping = False
+    aria_state.set_resting_state("idle"); aria_state.set_state("thinking")
+    asyncio.run(svc._run_turn(_ctx("Aria")))         # bare vocative → no reply
+    assert client.respond_calls == []
+    assert aria_state.current() == "idle"
+
+
+def test_run_turn_leaves_eye_for_tts_when_reply_spoken():
+    # A spoken reply (reply_buf populated) is owned by the TTS path — _run_turn must NOT write a resting
+    # state over it. The eye is left on whatever the turn last set (here `thinking`).
+    client = FakeBrainClient(respond_events=[BrainEvent("token", text="Sure thing."), BrainEvent("done")])
+    svc, pushed = _service_with_recorder(client)
+    _arm_offline(svc)
+    svc._sleeping = False
+    aria_state.set_resting_state("idle"); aria_state.set_state("idle")
+    asyncio.run(svc._run_turn(_ctx("tell me a joke")))
+    assert "Sure thing." in _texts(pushed)           # a reply was produced
+    assert aria_state.current() != "idle"            # finally left the eye for the TTS speaking→rest path

@@ -621,7 +621,11 @@ class WakeWordGate(FrameProcessor):
         self._escape_run = 0
         self._escape_hits.clear()  # fresh start once we're open
         self._arm_window()
-        aria_state.set_state("listening")  # eye: wake/floor open — capturing the user's speech
+        # eye: wake/floor open — capturing speech. But while asleep the gate still opens a wake-CANDIDATE
+        # window (the nano model false-fires on un-AEC'd room audio); the brain may reject it and STAY
+        # asleep, so honor the resting state (`off`) rather than lighting `listening` — contract: sleep→off.
+        # A real wake-from-sleep relights via the awake-path writes once the brain confirms the wake.
+        aria_state.set_state("listening" if aria_state.resting_state() != "off" else aria_state.resting_state())
 
     # --- command window ----------------------------------------------------
     def _arm_window(self) -> None:
@@ -638,10 +642,11 @@ class WakeWordGate(FrameProcessor):
                     self._cancel_preduck()
                     _tlog("WAKE  | window closed (idle) — muting until next wake word")
                     self._fire_duck(False)
-                    # eye: a wake with no command → back to idle. Only downgrade `listening`; never
-                    # step on `speaking`/`thinking` (those own their own return to idle).
+                    # eye: a wake with no command → back to the resting state (`idle` awake, `off`
+                    # asleep). Only downgrade `listening`; never step on `speaking`/`thinking` (those own
+                    # their own return to rest). Honors resting_state() so an asleep false-wake settles `off`.
                     if aria_state.current() == "listening":
-                        aria_state.set_state("idle")
+                        aria_state.set_state(aria_state.resting_state())
             except asyncio.CancelledError:
                 pass
 
