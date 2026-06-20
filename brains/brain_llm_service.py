@@ -538,6 +538,14 @@ class BrainLLMService(LLMService):
 
         await self.push_frame(DuckReleaseFrame(), FrameDirection.UPSTREAM)
 
+    async def _release_convo_hold(self) -> None:
+        """Tell the media-duck controller (upstream) that this reply is terminal — restore the bed at the
+        turn's end instead of holding it open for a follow-up. Pushed UPSTREAM; no-op when no duck
+        controller is present (frame flows on). See ConvoReleaseFrame for the contract + ordering."""
+        from brains.media_duck import ConvoReleaseFrame
+
+        await self.push_frame(ConvoReleaseFrame(), FrameDirection.UPSTREAM)
+
     async def _process_context(self, context):
         user_text = self._latest_user_text(context)
         self._reply_buf = []
@@ -766,6 +774,14 @@ class BrainLLMService(LLMService):
                     if ttl and ttl > 0:
                         _tlog(f"KEEPALIVE| media — hold wake window {ttl:.0f}s")
                         await self._keepalive_wake(ttl)
+                elif ev.type == "convo_hold":
+                    # Turn-terminality hint: the brain judged this reply terminal (one-shot Q&A / dismiss),
+                    # so the media conversation-hold should restore the bed at this turn's end rather than
+                    # holding it open for a follow-up. Arrival-keyed (like `addressed`/`wake_hold`): the
+                    # brain only ever emits it to release. NOT a stream boundary: keep consuming (`done`
+                    # still follows). No-op if no media controller is downstream (frame just flows on).
+                    _tlog(f"CONVO | brain release hint (release={ev.release!r}) → no convo-hold this turn")
+                    await self._release_convo_hold()
                 elif ev.type == "done":
                     return
         except asyncio.CancelledError:

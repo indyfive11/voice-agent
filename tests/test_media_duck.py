@@ -10,7 +10,7 @@ stale `off`); it falls back to the longer idle grace instead. Over silence, the 
 import asyncio
 
 from brains.brain_client import FakeBrainClient
-from brains.media_duck import DuckReleaseFrame, MediaDuckController
+from brains.media_duck import ConvoReleaseFrame, DuckReleaseFrame, MediaDuckController
 from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
     BotStoppedSpeakingFrame,
@@ -516,3 +516,100 @@ def test_convo_hold_clamps_to_window_secs():
     client = FakeBrainClient()
     g = _ctrl(client, playing=True, convo_hold_secs=30.0, window_secs=15.0)
     assert g._convo_secs == 15.0
+
+
+# --- Phase 2: brain release hint (ConvoReleaseFrame) -----------------------------------------------
+
+def test_convo_release_skips_hold_and_restores():
+    # A brain release hint (terminal turn) arriving mid-turn → at BotStopped the bed restores immediately
+    # instead of entering the conversation-hold. The hint is a one-shot flag consumed at BotStopped.
+    client = FakeBrainClient()
+    g = _ctrl(client, playing=True, convo_hold_secs=5.0)
+
+    async def go():
+        g._handle(VADUserStartedSpeakingFrame())       # onset → duck
+        await _drain()
+        g._handle(_transcript("what time is it"))      # confirmed
+        await _drain()
+        g._handle(ConvoReleaseFrame())                 # brain: terminal turn (before BotStopped)
+        await _drain()
+        assert g._convo_release_pending is True
+        assert g._ducked is True                       # NOT restored yet — bot may still reply
+        g._handle(BotStartedSpeakingFrame())
+        await _drain()
+        g._handle(BotStoppedSpeakingFrame())           # terminal → restore, no hold
+        await _drain()
+
+    asyncio.run(go())
+    assert client.duck_calls == [("sess-test", True), ("sess-test", False)]
+    assert g._ducked is False
+    assert g._convo_task is None
+    assert g._convo_release_pending is False           # one-shot consumed
+
+
+def test_convo_release_does_not_restore_under_live_tts():
+    # The hint can land while TTS is mid-reply; it must NOT cut the bed out from under live speech — it only
+    # flags for the BotStopped restore.
+    client = FakeBrainClient()
+    g = _ctrl(client, playing=True, convo_hold_secs=5.0)
+
+    async def go():
+        g._handle(VADUserStartedSpeakingFrame())
+        await _drain()
+        g._handle(_transcript("what time is it"))
+        await _drain()
+        g._handle(BotStartedSpeakingFrame())           # bot is speaking
+        await _drain()
+        g._handle(ConvoReleaseFrame())                 # release arrives mid-reply
+        await _drain()
+        assert g._ducked is True                       # still ducked under live TTS
+        assert client.duck_calls == [("sess-test", True)]   # no `off` yet
+        g._handle(BotStoppedSpeakingFrame())
+        await _drain()
+
+    asyncio.run(go())
+    assert client.duck_calls == [("sess-test", True), ("sess-test", False)]
+    assert g._ducked is False
+
+
+def test_convo_release_is_one_shot_next_turn_holds():
+    # The release flag is per-turn: a following addressed turn with no hint enters the hold normally (the
+    # flag never leaks across turns).
+    client = FakeBrainClient()
+    g = _ctrl(client, playing=True, convo_hold_secs=5.0)
+
+    async def go():
+        g._handle(VADUserStartedSpeakingFrame())       # turn 1 — released
+        await _drain()
+        g._handle(_transcript("what time is it"))
+        await _drain()
+        g._handle(ConvoReleaseFrame())
+        await _drain()
+        g._handle(BotStartedSpeakingFrame())
+        await _drain()
+        g._handle(BotStoppedSpeakingFrame())
+        await _drain()
+        assert g._ducked is False
+        assert g._convo_release_pending is False
+        await _addressed_turn(g)                        # turn 2 — no hint → normal hold
+
+    asyncio.run(go())
+    assert g._ducked is True
+    assert g._convo_task is not None
+
+
+def test_convo_release_noop_when_disabled():
+    # convo_hold_secs=0 → there's no hold to release; the hint is ignored (flag never set).
+    client = FakeBrainClient()
+    g = _ctrl(client, playing=True, convo_hold_secs=0.0)
+
+    async def go():
+        g._handle(VADUserStartedSpeakingFrame())
+        await _drain()
+        g._handle(_transcript("x y"))
+        await _drain()
+        g._handle(ConvoReleaseFrame())
+        await _drain()
+        assert g._convo_release_pending is False
+
+    asyncio.run(go())

@@ -51,8 +51,10 @@ run, same as v1.
   the pipeline; forwards turns to the brain and streams replies back. Also hosts wake-flow logic
   (strip leading wake trigger, bare-wake prompt) and the interrupt/cancel plumbing.
 - Endpoints/contract: `/respond` (turn), `/media/duck` (on/off — idempotent), `/media/state`,
-  `/cancel` (barge-in floor-yield), and the `wake_hold` SSE channel (keepalive: hold the command
-  window open after a media command so follow-ups need no re-wake).
+  `/cancel` (barge-in floor-yield), the `wake_hold` SSE channel (keepalive: hold the command
+  window open after a media command so follow-ups need no re-wake), and the `convo_hold` SSE channel
+  (turn-terminality hint: on a terminal reply over media, release the conversation-hold so the bed
+  restores at turn end instead of holding for a follow-up).
 - **Naming debt:** the contract still carries brain-specific names (`gabagent.duck_exclude`,
   `/media/*`). Decoupling is tracked publicly as GitHub #1.
 

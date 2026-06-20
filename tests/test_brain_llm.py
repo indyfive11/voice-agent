@@ -77,6 +77,20 @@ def test_wake_hold_zero_ttl_pushes_no_frame():
     assert [f for f in pushed if isinstance(f, WakeHoldFrame)] == []
 
 
+def test_convo_hold_event_pushes_release_frame_upstream():
+    # A terminal turn emits convo_hold → the service pushes ConvoReleaseFrame UPSTREAM so the media-duck
+    # controller restores the bed at this turn's end instead of holding it for a follow-up.
+    from brains.media_duck import ConvoReleaseFrame
+    client = FakeBrainClient(respond_events=[
+        BrainEvent("token", text="It's 3pm."),
+        BrainEvent("convo_hold", release=True),
+        BrainEvent("done"),
+    ])
+    svc, pushed = _service_with_recorder(client)
+    asyncio.run(svc._process_context(_ctx("what time is it")))
+    assert len([f for f in pushed if isinstance(f, ConvoReleaseFrame)]) == 1
+
+
 def test_status_filler_logged_but_not_spoken():
     # the user disliked the spoken filler ("Trying tidal…"). Status events are now LOG-ONLY: no TTSSpeakFrame
     # and no LLMTextFrame for the status; only the token speaks.

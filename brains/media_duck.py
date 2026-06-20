@@ -63,6 +63,24 @@ class DuckReleaseFrame(SystemFrame):
     same way WakeSleepFrame/BotThinkingFrame reach the wake gate."""
 
 
+@dataclass
+class ConvoReleaseFrame(SystemFrame):
+    """Pushed UPSTREAM by the brain (BrainLLMService) mid-turn (before `done`) when it judges the reply
+    TERMINAL — the exchange is over (a one-shot Q&A, or an explicit dismiss like "thanks, that's all").
+    The conversation-hold (Phase 1) otherwise keeps the bed ducked for `DUCK_CONVO_HOLD_SECS` after the
+    reply so a follow-up needs no re-wake; a terminal turn doesn't want that wait, so this asks the duck
+    to restore the bed at this turn's end instead of holding.
+
+    Ordering matters: the brain emits this DURING the response stream, which is BEFORE the convo-hold is
+    armed (the hold arms at BotStopped, after TTS finishes). So this can't 'cancel + restore' — there's
+    nothing armed yet. It sets a ONE-SHOT 'don't hold this turn' flag consumed at the next BotStopped,
+    which then restores immediately instead of arming the hold. Arrival-keyed like DuckReleaseFrame (the
+    brain only ever emits it to act). A dropped frame degrades safely to Phase-1 (the idle timer still
+    restores after the hold). RELEASE only — 'extend the hold longer than the wake window' is a separate
+    future step: it would break the Phase-1 `_convo_secs ≤ window_secs` clamp (the gate's window idle-close
+    is the backstop restore) and so must pair with a `wake_hold` to co-extend the gate window."""
+
+
 def _tlog(message: str) -> None:
     """One line to the transcript log (greppable alongside USER/BOT/DUCK)."""
     logger.bind(transcript=True).info(message)
@@ -122,6 +140,10 @@ class MediaDuckController(FrameProcessor):
         # path calls `_restore` (a held duck with no pending restore is the one regression this guards against).
         self._convo_secs = max(0.0, min(convo_hold_secs, window_secs)) if convo_hold_secs > 0 else 0.0
         self._convo_task: asyncio.Task | None = None
+        # Phase-2 brain release hint (ConvoReleaseFrame): a one-shot "this turn was terminal — don't hold,
+        # restore at BotStopped" flag. Set mid-turn (before the hold is armed), consumed at the next
+        # BotStopped, reset there. See ConvoReleaseFrame for the ordering rationale.
+        self._convo_release_pending = False
         self._time = time_source or time.monotonic
         self._duck_started_at = 0.0
         # How long after speech *stops* to wait for a confirming transcription before treating the
@@ -233,16 +255,19 @@ class MediaDuckController(FrameProcessor):
             _tlog(f"DUCK  | bot-stopped (ducked={self._ducked})")
             if self._ducked:
                 # Conversation-hold: an ADDRESSED reply (bot actually spoke) over still-ducked media → hold the
-                # bed ducked + floor open for a follow-up instead of restoring now. Asides (`_bot_spoke=False`)
-                # and the disabled case (`_convo_secs==0`) fall through to the normal immediate restore.
-                if self._convo_secs > 0 and self._bot_spoke:
+                # bed ducked + floor open for a follow-up instead of restoring now. Asides (`_bot_spoke=False`),
+                # the disabled case (`_convo_secs==0`), AND a brain release hint (`_convo_release_pending` — the
+                # turn was terminal) fall through to the normal immediate restore.
+                if self._convo_secs > 0 and self._bot_spoke and not self._convo_release_pending:
                     # Reset the per-turn flags so the next follow-up is a clean duck episode (the duck stays
                     # physically on; `_duck_on` will no-op on it). The hold's own timer owns restore from here.
                     self._bot_spoke = False
                     self._confirmed = False
                     self._arm_convo()
                 else:
-                    self._restore("bot-stopped")
+                    self._restore("convo release" if self._convo_release_pending else "bot-stopped")
+            # One-shot: consumed at this turn's end regardless of whether a hold would have engaged.
+            self._convo_release_pending = False
         elif isinstance(frame, DuckReleaseFrame):
             # Brain says this turn was an aside (not addressed) → no reply is coming. Release the
             # pre-duck now rather than holding it for the idle grace. Keyed on the frame TYPE, which the
@@ -261,6 +286,14 @@ class MediaDuckController(FrameProcessor):
                     _tlog("DUCK  | aside during sustained speech — holding (idle-grace owns restore)")
                 else:
                     self._restore("aside")
+        elif isinstance(frame, ConvoReleaseFrame):
+            # Brain says this reply is TERMINAL → don't hold the bed for a follow-up; restore at this
+            # turn's BotStopped. Arrives mid-turn (before the hold is armed), so set a one-shot flag the
+            # BotStopped branch consumes — never restore here (the bot may still be mid-reply; cutting the
+            # bed now would un-duck under live TTS). No-op when convo-hold is disabled. See ConvoReleaseFrame.
+            if self._convo_secs > 0:
+                _tlog("DUCK  | brain release hint — terminal turn, no convo-hold")
+                self._convo_release_pending = True
 
     def _duck_on(self, reason: str, allow: Callable[[], bool] | None = None) -> None:
         # `allow` lets the raw-onset path use the stricter onset gate while the confirmed-speech path uses

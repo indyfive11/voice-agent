@@ -36,6 +36,13 @@ class BrainEvent:
                       before `done`, so the wake gate holds its command window open for `ttl_secs` and a
                       follow-up media command needs no re-wake. Release is by TTL (the brain never sends a
                       false) + the gate's own ceiling. Refreshed by each new media command.
+      - "convo_hold": conversation-hold turn-terminality hint over playing media. Emitted before `done`
+                      when the brain judges the reply TERMINAL (a one-shot Q&A, or an explicit dismiss
+                      like "thanks, that's all") — so the media conversation-hold should NOT keep the bed
+                      ducked for a follow-up but restore at this turn's end. Arrival-keyed (the brain
+                      emits it only to release; `release` is carried for logging). A dropped event degrades
+                      safely to the timed conversation-hold. (Extend — hold LONGER — is a future variant;
+                      it must pair with `wake_hold` to also hold the gate window, see media_duck.)
       - "done"      : end of this turn
     """
 
@@ -59,6 +66,10 @@ class BrainEvent:
     # false); `ttl_secs` is how long the wake gate should hold its command window open from receipt.
     hold: bool | None = None
     ttl_secs: float | None = None
+    # "convo_hold" event only: turn-terminality hint. `release` is True on the wire (the brain emits the
+    # event only to release the conversation-hold); the handler keys on the event TYPE, not this value, so a
+    # serializer that drops a literal True can't disarm it. (Carried for logging / future `extend` variant.)
+    release: bool | None = None
 
 
 @runtime_checkable
