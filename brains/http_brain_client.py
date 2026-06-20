@@ -141,13 +141,19 @@ class HttpBrainClient:
         except Exception as e:  # noqa: BLE001
             logger.debug(f"Brain: /media/duck failed (ignored): {type(e).__name__}: {e}")
 
-    async def media_state(self, session_id: str) -> dict | None:
+    async def media_state(self, session_id: str, bot_speaking: bool = False) -> dict | None:
         """Best-effort `GET /media/state` → provider-neutral `{"playing": bool, "state":
         "playing"|"paused"|"idle"}`. None if the brain doesn't expose it (older brain / 404) or on any
-        error — caller then assumes media may be playing."""
+        error — caller then assumes media may be playing.
+
+        `bot_speaking=True` (Aria's TTS is playing) rides as a query param so the brain can refresh its
+        duck watchdog during a long reply; an older brain ignores the unknown param. Lowercase to match
+        the brain's truthy parse (`true`/`false`)."""
         try:
             r = await self._http.get(
-                "/media/state", params={"session_id": session_id}, timeout=httpx.Timeout(2.0)
+                "/media/state",
+                params={"session_id": session_id, "bot_speaking": str(bot_speaking).lower()},
+                timeout=httpx.Timeout(2.0),
             )
             if r.status_code == 200:
                 return r.json()

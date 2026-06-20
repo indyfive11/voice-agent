@@ -91,6 +91,22 @@ def test_convo_hold_event_pushes_release_frame_upstream():
     assert len([f for f in pushed if isinstance(f, ConvoReleaseFrame)]) == 1
 
 
+def test_voice_volume_event_pushes_frame_downstream():
+    # A my-voice-volume command emits voice_volume → the service pushes VoiceVolumeFrame DOWNSTREAM (toward
+    # the TTS-gain processor), carrying op/value.
+    from tts_gain import VoiceVolumeFrame
+    client = FakeBrainClient(respond_events=[
+        BrainEvent("token", text="Lowering my voice."),
+        BrainEvent("voice_volume", op="down"),
+        BrainEvent("done"),
+    ])
+    svc, pushed = _service_with_recorder(client)
+    asyncio.run(svc._process_context(_ctx("lower your voice")))
+    frames = [f for f in pushed if isinstance(f, VoiceVolumeFrame)]
+    assert len(frames) == 1
+    assert frames[0].op == "down" and frames[0].value is None
+
+
 def test_status_filler_logged_but_not_spoken():
     # the user disliked the spoken filler ("Trying tidal…"). Status events are now LOG-ONLY: no TTSSpeakFrame
     # and no LLMTextFrame for the status; only the token speaks.

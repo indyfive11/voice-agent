@@ -55,6 +55,7 @@ from pipecat.turns.user_start import MinWordsUserTurnStartStrategy
 from pipecat.turns.user_stop import TurnAnalyzerUserTurnStopStrategy
 
 from turn_cap import MaxTurnDurationUserTurnStopStrategy
+from turn_stop import SmartTurnHonoringStopStrategy
 from turn_mute import BotThinkingMuteStrategy
 from response_latency import ResponseLatencyObserver
 from tts_gain import TTSGainProcessor
@@ -156,9 +157,15 @@ async def run() -> None:
     # (0..1, default 0.55; 1.0 = no change) — tune live to taste. Keeps duck-exclude; just lowers her level.
     # 0.55: the user judged 0.6 "about right, a teeny bit down" on the 2026-06-04 live tune.
     tts_gain = float(os.environ.get("TTS_GAIN", "0.55"))
-    tts_gain_proc = TTSGainProcessor(gain=tts_gain)
+    # Runtime voice-volume control (F3): "lower your voice" / "speak up" step the live gain by TTS_VOLUME_STEP;
+    # "down" floors at TTS_VOLUME_FLOOR so repeated "quieter" can't reach inaudible (an explicit "set to zero"
+    # still can). The brain classifies the my-voice intent and emits a voice_volume event → VoiceVolumeFrame.
+    tts_vol_step = float(os.environ.get("TTS_VOLUME_STEP", "0.1"))
+    tts_vol_floor = float(os.environ.get("TTS_VOLUME_FLOOR", "0.1"))
+    tts_gain_proc = TTSGainProcessor(gain=tts_gain, step=tts_vol_step, floor=tts_vol_floor)
     if tts_gain < 1.0:
-        logger.info(f"TTS gain: attenuating Aria's output to {tts_gain:.2f} (TTS_GAIN; keeps duck-exclude).")
+        logger.info(f"TTS gain: attenuating Aria's output to {tts_gain:.2f} (TTS_GAIN; keeps duck-exclude). "
+                    f"Voice-volume control: step={tts_vol_step} floor={tts_vol_floor}.")
     llm = config.build_llm()
     # Start an external brain (BRAIN=gabagent) — spawn `gab --voice-serve` + wait for /health.
     # No-op for local LLM brains.
@@ -224,10 +231,15 @@ async def run() -> None:
     # Wall-clock turn cap: SmartTurn has none (max_duration_secs is just its model window), so a long
     # continuous ramble can hang the turn — force-complete it past this many seconds (with transcript).
     max_turn_secs = float(os.environ.get("MAX_TURN_SECS", "15"))
+    # Honor SmartTurn's INCOMPLETE verdict over the stock strategy's transcript-fallback / STT-p99 timeout,
+    # which otherwise ends a turn the model judged unfinished and cuts the user off on a natural pause. See
+    # turn_stop.SmartTurnHonoringStopStrategy. Default on; TURN_HONOR_INCOMPLETE=0 reverts to stock pipecat.
+    honor_incomplete = os.environ.get("TURN_HONOR_INCOMPLETE", "1") not in ("0", "false", "False")
     logger.info(
         f"Turn detection: VAD stop_secs={vad_stop_secs}s confidence={vad_confidence} "
         f"min_volume={vad_min_volume} → SmartTurn v3 "
-        f"(stop_secs={smart_turn_stop_secs}s max-silence fallback, max_turn={max_turn_secs}s cap)"
+        f"(stop_secs={smart_turn_stop_secs}s max-silence fallback, max_turn={max_turn_secs}s cap, "
+        f"honor-incomplete={honor_incomplete})"
     )
     turn_analyzer = LocalSmartTurnAnalyzerV3(
         params=SmartTurnParams(
@@ -282,7 +294,12 @@ async def run() -> None:
             user_turn_strategies=UserTurnStrategies(
                 start=start_strategies,
                 stop=[
-                    TurnAnalyzerUserTurnStopStrategy(turn_analyzer=turn_analyzer),
+                    # Honor SmartTurn's INCOMPLETE verdict: the stock strategy's transcript-fallback +
+                    # STT-p99 timeout can end a turn the model judged unfinished, cutting the user off on a
+                    # natural mid-sentence pause (2026-06-20). The honoring subclass suppresses that until a
+                    # real COMPLETE verdict or the stop_secs(4s) silence. TURN_HONOR_INCOMPLETE=0 reverts.
+                    (SmartTurnHonoringStopStrategy
+                     if honor_incomplete else TurnAnalyzerUserTurnStopStrategy)(turn_analyzer=turn_analyzer),
                     # Safety cap so a long continuous ramble can't hang the turn (SmartTurn won't
                     # end it; this force-completes past max_turn_secs when there's transcribed text).
                     MaxTurnDurationUserTurnStopStrategy(max_turn_secs=max_turn_secs),
@@ -301,6 +318,12 @@ async def run() -> None:
     # wake word via `gate` so media only ducks once Aria is addressed (window open), for ALL playback —
     # not on ambient room speech (2026-06-15, the maintainer: gate the duck the same as STT, all media).
     media_duck = config.build_media_duck(llm, gate=wake_gate)
+    # Single-writer duck coordination (F2, 2026-06-20): make the media-duck the sole authority that posts
+    # `/media/duck off`. The wake gate still pre-ducks ON on a fresh wake, but its own off-paths now relinquish
+    # silently while the media-duck owns an active duck (it un-ducked the bed mid-reply otherwise). Wire the
+    # gate to read the duck's live state. Both must exist (external brain + gate present).
+    if wake_gate is not None and media_duck is not None and hasattr(wake_gate, "set_media_ducked"):
+        wake_gate.set_media_ducked(lambda: media_duck._ducked)
     # Tell the brain whether an acoustic gate exists: with one, going to sleep forces it active so only
     # "hey aria" can wake her (no STT on ambient TV); without one, sleep falls back to text-phrase wake.
     if hasattr(llm, "set_acoustic_wake_gated"):

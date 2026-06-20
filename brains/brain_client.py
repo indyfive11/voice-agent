@@ -43,6 +43,12 @@ class BrainEvent:
                       emits it only to release; `release` is carried for logging). A dropped event degrades
                       safely to the timed conversation-hold. (Extend — hold LONGER — is a future variant;
                       it must pair with `wake_hold` to also hold the gate window, see media_duck.)
+      - "voice_volume": adjust Aria's OWN voice (TTS) level — distinct from media volume. Emitted before
+                      `done` when the brain classifies a my-voice-volume intent ("lower your voice" / "speak
+                      up" / "set your voice to half"). `op` is "up"|"down"|"set"; `value` is a 0..1 absolute
+                      level for `set` (1.0 = full, 0.0 = silent), absent for up/down (voice side owns the
+                      step). Arrival-keyed; kill-switched brain-side. A dropped event is a no-op (the gain
+                      just doesn't change). See tts_gain.VoiceVolumeFrame.
       - "done"      : end of this turn
     """
 
@@ -70,6 +76,10 @@ class BrainEvent:
     # event only to release the conversation-hold); the handler keys on the event TYPE, not this value, so a
     # serializer that drops a literal True can't disarm it. (Carried for logging / future `extend` variant.)
     release: bool | None = None
+    # "voice_volume" event only: adjust Aria's own TTS level. `op` = "up"|"down"|"set"; `value` = 0..1
+    # absolute level for `set` (1.0 full, 0.0 silent), absent for up/down (voice side owns the step).
+    op: str | None = None
+    value: float | None = None
 
 
 @runtime_checkable
@@ -98,11 +108,14 @@ class BrainClient(Protocol):
         plain duck). No-op if the brain controls no media; must never raise."""
         ...
 
-    async def media_state(self, session_id: str) -> dict | None:
+    async def media_state(self, session_id: str, bot_speaking: bool = False) -> dict | None:
         """Best-effort, provider-neutral playback snapshot: {"playing": bool, "state":
         "playing"|"paused"|"idle"} so the caller can skip ducking when nothing is playing. Brain-
         agnostic by contract — no per-provider keys. None if the brain doesn't expose it (older brain /
-        404) or on any error; never raises."""
+        404) or on any error; never raises.
+
+        `bot_speaking` rides the poll so the brain can refresh its duck watchdog while Aria's TTS is
+        playing (a long reply produces no incoming speech to refresh it otherwise). Best-effort hint."""
         ...
 
     async def aclose(self) -> None:
@@ -136,6 +149,7 @@ class FakeBrainClient:
         # Tests set this to drive media_state(); None → capability absent (callers assume "playing").
         self.media_state_value: dict | None = None
         self.media_state_calls = 0  # how many times media_state() was queried (debounce tests)
+        self.media_state_bot_speaking: list[bool] = []  # bot_speaking carried on each media_state() poll
 
     async def respond(self, session_id: str, text: str) -> AsyncIterator[BrainEvent]:
         self.respond_calls.append((session_id, text))
@@ -160,8 +174,9 @@ class FakeBrainClient:
         self.duck_calls.append((session_id, on))          # back-compat shape for existing tests
         self.duck_mute_calls.append((session_id, on, mute))  # full shape incl. mute
 
-    async def media_state(self, session_id: str) -> dict | None:
+    async def media_state(self, session_id: str, bot_speaking: bool = False) -> dict | None:
         self.media_state_calls += 1
+        self.media_state_bot_speaking.append(bot_speaking)
         return self.media_state_value
 
     async def aclose(self) -> None:

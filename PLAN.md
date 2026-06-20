@@ -1,4 +1,4 @@
-# Plan: Voice Agent — as-built architecture (reconciled 2026-06-16)
+# Plan: Voice Agent — as-built architecture (reconciled 2026-06-20)
 
 This is the **current, authoritative** description of the system as built. It supersedes the original
 v1 implementation plan, which is archived for reference at
@@ -50,11 +50,17 @@ run, same as v1.
 - `brains/brain_llm_service.py` — a Pipecat `FrameProcessor` that stands in for the LLM service in
   the pipeline; forwards turns to the brain and streams replies back. Also hosts wake-flow logic
   (strip leading wake trigger, bare-wake prompt) and the interrupt/cancel plumbing.
-- Endpoints/contract: `/respond` (turn), `/media/duck` (on/off — idempotent), `/media/state`,
-  `/cancel` (barge-in floor-yield), the `wake_hold` SSE channel (keepalive: hold the command
-  window open after a media command so follow-ups need no re-wake), and the `convo_hold` SSE channel
-  (turn-terminality hint: on a terminal reply over media, release the conversation-hold so the bed
-  restores at turn end instead of holding for a follow-up).
+- Endpoints/contract: `/respond` (turn), `/media/duck` (on/off — idempotent), `/media/state`
+  (now also carries a `bot_speaking` query flag — see below), `/cancel` (barge-in floor-yield), the
+  `wake_hold` SSE channel (keepalive: hold the command window open after a media command so follow-ups
+  need no re-wake), the `convo_hold` SSE channel (turn-terminality hint: on a terminal reply over
+  media, release the conversation-hold so the bed restores at turn end instead of holding for a
+  follow-up), and the `voice_volume` SSE channel (Aria's own-voice volume control — see TTS leveling).
+- **`bot_speaking` on `/media/state`:** the voice side carries `bot_speaking=true|false` on the ~1 Hz
+  state poll (true while Aria's TTS is playing). The brain treats a `true` poll as a duck-watchdog
+  **heartbeat refresh**, so a long reply's TTS — which produces no incoming user speech — can't outlive
+  the brain's watchdog grace and pop the ducked bed mid-narration. Coupled invariant: the brain's
+  `duck_watchdog_secs` must stay **above** the voice `convo_hold` (currently 20 > 8).
 - **Naming debt:** the contract still carries brain-specific names (`gabagent.duck_exclude`,
   `/media/*`). Decoupling is tracked publicly as GitHub #1.
 
@@ -77,11 +83,21 @@ below is **net-new** vs the v1 plan:
   "Aria" over loud media. This is the durable wake-over-music root cause (see TRACKER + memory).
 
 ### Media ducking
-- `brains/media_duck.py` + the `/media/duck` contract. **Two independent duckers**, each with its own
-  flag, both POSTing the idempotent brain endpoint:
-  1. `MediaDuckController` (post-STT) — ducks on user VAD onset / confirmed speech.
-  2. the wake-gate pre-duck (`wake_word.py`) — fires on a fresh wake / window-open.
+- `brains/media_duck.py` + the `/media/duck` contract. **Two duck writers**, now coordinated as
+  **single-writer**:
+  1. `MediaDuckController` (post-STT) — ducks on user VAD onset / confirmed speech, and is the **SOLE
+     authority for the duck *off***.
+  2. the wake-gate pre-duck (`wake_word.py`) — fires on a fresh wake / window-open, but **relinquishes
+     silently** (clears its local flag, no `off` POST) whenever `media_duck` owns the duck, via a
+     `set_media_ducked(lambda: media_duck._ducked)` callback wired in `main.py`. This fixed the
+     two-writer desync where the wake gate POSTed `/media/duck off` in the reply→TTS gap and un-ducked
+     music mid-reply while `media_duck` still held the duck.
 - `DUCK_REQUIRE_WAKE=1` gates the duck behind the wake word so ambient room speech doesn't dip media.
+- **Conversation-hold** (`DUCK_CONVO_HOLD_SECS`, default **8s**): after a **non-terminal** reply over
+  playing media (one ending in "?", where Aria is waiting for an answer), the bed stays ducked + the
+  floor open this long for a follow-up needing no re-wake. A **terminal** reply (the brain's
+  `convo_hold release=True`, e.g. a story or a command-confirmation) restores the bed promptly at
+  BotStopped instead. Stays under the brain's 20s duck-watchdog (see `bot_speaking` above).
 - Hard-won invariant: **every window-hold path must own its pre-duck *release*, and must reason about
   *what* it's held open over** — an open window re-enables the ambient duck over the system's *own*
   music. (This is the F1/F3 fix family, `1ef8c71`.)
@@ -97,9 +113,26 @@ below is **net-new** vs the v1 plan:
 - The durable fix (roadmap) is a **dedicated "stop"/"Aria stop" model** decoupled from the reused
   wake model — closes both the onset-transient and sentence-boundary self-trips.
 
-### TTS leveling
+### Endpointing — honor SmartTurn's INCOMPLETE verdict
+- `turn_stop.py::SmartTurnHonoringStopStrategy` (env `TURN_HONOR_INCOMPLETE=1`, default on) — the stock
+  pipecat `TurnAnalyzerUserTurnStopStrategy` ends a turn via a transcript-fallback + STT-p99 timeout
+  (~0.8s) that can fire **even when SmartTurn just predicted INCOMPLETE**, cutting the user off on a
+  natural mid-sentence pause ("tell me a story about…\<pause\>"). The fix gates the single stop funnel
+  on `turn_analyzer.speech_triggered` (True ⟺ last verdict INCOMPLETE; cleared only on a COMPLETE
+  verdict or the 4s `stop_secs` silence), so a pause is held until SmartTurn actually calls the turn.
+  **Gotcha:** Whisper marks *every* segment `finalized=True`, so the guard must **not** exempt
+  finalized transcripts (that made the first cut a no-op). The 15s MaxTurn cap remains the backstop.
+
+### TTS leveling + runtime voice volume
 - `tts_gain.py` — scales Aria's TTS PCM by `TTS_GAIN` (default 0.55). TTS is duck-excluded (rides at
   full level over ducked music), so it needed independent attenuation. Not in v1.
+- **Runtime, voice-commandable** (was a static startup knob): "Aria, lower your voice" → the brain
+  classifies a my-voice intent and emits a `voice_volume {op,value}` SSE event → `brain_llm_service`
+  pushes a `VoiceVolumeFrame` DOWNSTREAM → `tts_gain` adjusts the live gain (up/down step
+  `TTS_VOLUME_STEP=0.1`, down floored at `TTS_VOLUME_FLOOR=0.1`, `set` clamps to [0,1]). Distinct from
+  the media-volume commands (those lower OTHER apps); this is Aria's own output. Persistence across
+  restarts is deferred. `bot_speech.py` exposes the live `bot_speaking` flag (set here on
+  BotStarted/BotStopped) that rides the `/media/state` poll (see contract above).
 
 ---
 
@@ -163,8 +196,9 @@ transport.input()
   → transport.output()
   → assistant_aggregator
 ```
-Supporting modules: `turn_cap.py`, `response_latency.py`, `vad_diag.py`, `input_watchdog.py`,
-`aria_state.py` (the HAL-eye status side-channel — see above).
+Supporting modules: `turn_cap.py`, `turn_stop.py` (SmartTurn-honoring endpointing — see above),
+`response_latency.py`, `vad_diag.py`, `input_watchdog.py`, `bot_speech.py` (live `bot_speaking` flag
+for the duck-watchdog refresh), `aria_state.py` (the HAL-eye status side-channel — see above).
 
 Swappability still holds (env in `config.py`): `STT_PROVIDER`, `TTS_PROVIDER`, `LLM_PROVIDER`/`BRAIN`.
 
@@ -187,7 +221,10 @@ above, not the v1 foundation, which is done):
 
 - **Voice-side:** wake false-positives over music (next lever: `capture_selfneg.sh` self-negatives);
   wake recall over a loud movie (held pending brain wrong-sink fix); dedicated stop-word barge-in
-  model; "Aria, turn your voice up/down" (runtime-mutable `TTS_GAIN`).
+  model; STT mis-expanding the bare wake ("Hey Aria" → "Hey, how are you?") — next priority, needs a
+  better STT engine and/or an out-of-band wake-confidence signal. *(Done this cycle: SmartTurn-honoring
+  endpointing, duck single-writer, runtime voice-volume control, `bot_speaking` watchdog refresh,
+  convo-hold 8s.)*
 - **Brain-side (gabagent):** reconcile-vs-duck-off race stranding the music sink quiet; TIDAL search
   latency (~15s); resume-from-position-0.
 - **Cross-project:** decouple gabagent-specific naming (GitHub #1); whole-home / multi-room (Home

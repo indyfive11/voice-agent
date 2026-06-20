@@ -27,11 +27,12 @@ together for a full voice-driven agent.
 - **Audio / pipeline:** Pipecat 1.3.x — local audio transport, VAD (Silero), turn-taking (SmartTurn v3),
   half-duplex with optional barge-in
 - **STT:** Whisper (local) — swappable (e.g. Deepgram) via `.env`
-- **TTS:** Kokoro (local) — swappable
+- **TTS:** Kokoro (local) — swappable; runtime, voice-commandable output level ("Aria, lower your voice")
 - **LLM (`BRAIN=local`):** Claude (`claude-sonnet-4-6`), or any OpenAI-compatible / local Ollama endpoint
 - **Wake word:** openWakeWord / nanowakeword / Porcupine, behind one gate
-- **Status indicator (optional):** publishes Aria's state (idle / listening / thinking / speaking) to a
-  tmpfs file for an external desktop "HAL eye" panel to render — a cosmetic side-channel, off via `ARIA_EYE_STATE=0`
+- **Status indicator (optional):** publishes Aria's state (off / idle / sleeping / listening / thinking /
+  speaking) to a tmpfs file for an external desktop "HAL eye" panel to render — a cosmetic side-channel,
+  off via `ARIA_EYE_STATE=0`
 
 Everything is selected by environment variables — see [`.env.example`](.env.example).
 

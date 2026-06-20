@@ -588,7 +588,7 @@ def build_media_duck(llm, gate=None):
     # restore). Read the SAME WAKE_WINDOW_SECS the gate uses so the controller can clamp the hold to it — the
     # gate re-arms its command window ~window_secs per reply, keeping the two in lockstep (and its idle-close
     # is a free second restore guarantee). A hold > window would re-gate/bob mid-conversation, so it's clamped.
-    convo_hold_secs = float(_env("DUCK_CONVO_HOLD_SECS", "15.0"))
+    convo_hold_secs = float(_env("DUCK_CONVO_HOLD_SECS", "8.0"))  # 2026-06-20: 15→8s, media returns sooner when no follow-up (stays < duck_watchdog 20s)
     window_secs = float(_env("WAKE_WINDOW_SECS", "15"))
     require_wake = _env("DUCK_REQUIRE_WAKE", "1") not in ("0", "false", "False")
     gate_duck = gate is not None and require_wake and hasattr(gate, "duck_allowed")
@@ -690,7 +690,9 @@ def build_media_state_provider(llm):
         try:
             v = {"playing": False, "kind": None}
             try:
-                st = await ms(session_id)
+                import bot_speech
+
+                st = await ms(session_id, bot_speaking=bot_speech.bot_speaking())
                 if st:
                     playing = bool(st["playing"]) if "playing" in st \
                         else any(str(x).lower() == "playing" for x in st.values())

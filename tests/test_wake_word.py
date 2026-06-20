@@ -217,6 +217,57 @@ def test_window_closes_and_restores():
     assert client.duck_calls == [("sess-test", True), ("sess-test", False)]
 
 
+def test_window_close_relinquishes_duck_when_media_duck_owns():
+    # F2 single-writer: when the media-duck owns an active duck, the gate's window idle-close must NOT post its
+    # own off (that double-fired / fought the media-duck) — it relinquishes silently. The window still closes.
+    client = FakeBrainClient()
+    g = _gate(client, window_secs=0.01)
+    g.set_media_ducked(lambda: True)  # media-duck holds the duck
+    g._oww.score = 0.9
+
+    async def go():
+        await g._feed(_CHUNK)          # open + pre-duck (True)
+        await asyncio.sleep(0.05)      # window elapses → close, but relinquish (no off)
+
+    asyncio.run(go())
+    assert g._open is False
+    assert client.duck_calls == [("sess-test", True)]  # pre-duck on only — no off posted
+    assert g._ducked is False                          # ownership handed to the media-duck
+
+
+def test_preduck_release_relinquishes_when_media_duck_owns():
+    # The run-1 "story over full-volume music" desync: a real command landed and the media-duck owns the duck,
+    # but the gate's pre-duck-release grace fired in the reply→TTS gap and posted off, un-ducking the bed mid-
+    # reply. With the single-writer fix it relinquishes silently instead.
+    client = FakeBrainClient()
+    g = _gate(client, preduck_grace=0.01, window_secs=10.0)
+    g.set_media_ducked(lambda: True)
+    g._oww.score = 0.9
+
+    async def go():
+        await g._feed(_CHUNK)          # open + pre-duck (True), pre-duck grace armed
+        await asyncio.sleep(0.05)      # grace elapses → release path → relinquish (media-duck owns)
+
+    asyncio.run(go())
+    assert client.duck_calls == [("sess-test", True)]  # no premature off
+    assert g._ducked is False
+
+
+def test_preduck_release_still_restores_when_media_duck_idle():
+    # Regression: a genuine phantom wake (no command → media-duck never ducked) still restores the gate's own
+    # pre-duck on the release grace (default media_ducked → False).
+    client = FakeBrainClient()
+    g = _gate(client, preduck_grace=0.01, window_secs=10.0)
+    g._oww.score = 0.9
+
+    async def go():
+        await g._feed(_CHUNK)
+        await asyncio.sleep(0.05)
+
+    asyncio.run(go())
+    assert client.duck_calls == [("sess-test", True), ("sess-test", False)]  # phantom wake restores
+
+
 def test_media_aware_gating_open_mic_when_quiet():
     # media_only: gate is required only while media plays. Quiet → not gated (open-mic).
     g_quiet = _gate(media_only=True, media_status=lambda: {"playing": False, "kind": None})

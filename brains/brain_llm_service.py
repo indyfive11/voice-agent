@@ -546,6 +546,14 @@ class BrainLLMService(LLMService):
 
         await self.push_frame(ConvoReleaseFrame(), FrameDirection.UPSTREAM)
 
+    async def _set_voice_volume(self, op: str | None, value: float | None) -> None:
+        """Adjust Aria's OWN voice (TTS) level — push DOWNSTREAM to the TTS-gain processor (which lives in the
+        TTS PCM path, below this service). Distinct from the media duck (upstream). No-op if no gain processor
+        is downstream (frame flows on). See tts_gain.VoiceVolumeFrame."""
+        from tts_gain import VoiceVolumeFrame
+
+        await self.push_frame(VoiceVolumeFrame(op=op or "set", value=value), FrameDirection.DOWNSTREAM)
+
     async def _process_context(self, context):
         user_text = self._latest_user_text(context)
         self._reply_buf = []
@@ -782,6 +790,13 @@ class BrainLLMService(LLMService):
                     # still follows). No-op if no media controller is downstream (frame just flows on).
                     _tlog(f"CONVO | brain release hint (release={ev.release!r}) → no convo-hold this turn")
                     await self._release_convo_hold()
+                elif ev.type == "voice_volume":
+                    # The brain classified a my-voice-volume intent → adjust Aria's OWN TTS level (distinct
+                    # from media volume). Push the change DOWNSTREAM to the TTS-gain processor (which lives in
+                    # the TTS PCM path). NOT a stream boundary: keep consuming (`done` still follows). A no-op
+                    # if no gain processor is downstream (frame just flows on).
+                    _tlog(f"VOICE | own-volume hint op={ev.op!r} value={ev.value!r}")
+                    await self._set_voice_volume(ev.op, ev.value)
                 elif ev.type == "done":
                     return
         except asyncio.CancelledError:

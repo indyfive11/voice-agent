@@ -229,6 +229,16 @@ class WakeWordGate(FrameProcessor):
         self._force_gated = False
         self._last_wake = 0.0
         self._ducked = False
+        # Single-writer coordination (2026-06-20, F2): the MediaDuckController is the sole authority that fires
+        # `/media/duck off`. This gate still pre-ducks ON on a fresh wake (so a command lands on already-ducked
+        # media), but its two OFF paths (the pre-duck release grace + the window idle-close) must NOT post an
+        # `off` while the media-duck owns an active duck — doing so un-ducked the bed mid-reply in the
+        # reply→TTS gap (the run-1 "story over full-volume music" desync) and double-fired offs. When the
+        # media-duck owns the duck we RELINQUISH silently (clear our `_ducked`, no POST) and let the media-duck's
+        # own restore (BotStopped / convo-end / aside / sleep / shutdown) be the single off. Wired in main.py
+        # after both are built; defaults to "media-duck never ducked" so a gate built without a duck (raw LLM)
+        # keeps its original standalone behaviour.
+        self._media_ducked: Callable[[], bool] = lambda: False
         self._window_task: asyncio.Task | None = None
         # Brain media-keepalive (WakeHoldFrame with ttl_secs): hold the command window open for a TTL after a
         # media command so a follow-up needs no re-wake. _hold_max_secs is the hard ceiling — a TTL is clamped
@@ -695,7 +705,7 @@ class WakeWordGate(FrameProcessor):
                     self._open_via_keepalive = False
                     self._cancel_preduck()
                     _tlog("WAKE  | window closed (idle) — muting until next wake word")
-                    self._fire_duck(False)
+                    self._release_or_relinquish_duck()
                     # eye: a wake with no command → back to the resting state (`idle` awake, `off`
                     # asleep). Only downgrade `listening`; never step on `speaking`/`thinking` (those own
                     # their own return to rest). Honors resting_state() so an asleep false-wake settles `off`.
@@ -786,8 +796,7 @@ class WakeWordGate(FrameProcessor):
                 await asyncio.sleep(grace)
                 if (self._open and self._ducked and not self._bot_speaking
                         and not self._hold and not self._speech_in_flight):
-                    _tlog("WAKE  | pre-duck released (no speech after wake)")
-                    self._fire_duck(False)
+                    self._release_or_relinquish_duck("WAKE  | pre-duck released (no speech after wake)")
             except asyncio.CancelledError:
                 pass
 
@@ -797,6 +806,25 @@ class WakeWordGate(FrameProcessor):
         if self._preduck_task is not None and not self._preduck_task.done():
             self._preduck_task.cancel()
         self._preduck_task = None
+
+    def set_media_ducked(self, media_ducked: Callable[[], bool]) -> None:
+        """Wire the single-writer coordination: a callback returning whether the MediaDuckController currently
+        owns an active duck. Called from main.py after both processors are built. See `self._media_ducked`."""
+        self._media_ducked = media_ducked
+
+    def _release_or_relinquish_duck(self, log_msg: str | None = None) -> None:
+        """End the gate's own pre-duck. If the media-duck owns an active duck, RELINQUISH silently — clear our
+        `_ducked` (so a future wake re-pre-ducks) but do NOT post `off`, because the media-duck is the single
+        off authority and will restore at the right time (BotStopped / convo-end / aside / sleep / shutdown).
+        Posting our own off here is what un-ducked the bed in the reply→TTS gap (run-1 story desync) and
+        double-fired offs. When the media-duck is NOT ducked (a genuine phantom wake), restore our pre-duck as
+        before."""
+        if self._media_ducked():
+            self._ducked = False
+            return
+        if log_msg:
+            _tlog(log_msg)
+        self._fire_duck(False)
 
     # --- pre-duck (idempotent with MediaDuckController via the brain's idempotent /media/duck) ------
     def _fire_duck(self, on: bool) -> None:
