@@ -56,3 +56,14 @@ aur/pkg/
 aur/*.pkg.tar.zst
 aur/*.log
 aur/voice-agent-git/
+
+# Local-only working directories — never shipped:
+#   comms/         inter-agent coordination notes (superset of the GABAGENT_*/VOICE_MODE_* globs above —
+#                  ignore the whole dir so a stray non-matching note can't slip in)
+#   wake-train/    real-voice wake-word training scratchpad (multi-GB; the granular rules above already
+#                  drop the voice data — this blanket is belt-and-suspenders; the shipped training doc is
+#                  wakewords/README.md)
+#   docs/research/ in-progress research drafts (promoted into PLAN/docs when finalized)
+comms/
+wake-train/
+docs/research/
