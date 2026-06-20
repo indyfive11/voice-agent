@@ -1383,18 +1383,18 @@ def test_brain_error_notice_rearms_after_clean_turn():
 import aria_state
 
 
-def test_run_turn_keeps_eye_off_for_asleep_phantom_turn():
-    # Asleep (resting=off): a phantom turn (ambient chatter, not naming her) is ASLEEP-ignored and
-    # produces no reply → the eye must stay `off`, never flashing thinking/idle.
+def test_run_turn_keeps_eye_resting_for_asleep_phantom_turn():
+    # Asleep (resting=sleeping): a phantom turn (ambient chatter, not naming her) is ASLEEP-ignored and
+    # produces no reply → the eye must stay `sleeping`, never flashing thinking/idle.
     client = FakeBrainClient(respond_events=[BrainEvent("token", text="x"), BrainEvent("done")])
     svc, pushed = _service_with_recorder(client)
     _arm_offline(svc)
     svc._sleeping = True
-    aria_state.set_resting_state("off"); aria_state.set_state("off")
+    aria_state.set_resting_state("sleeping"); aria_state.set_state("sleeping")
     try:
         asyncio.run(svc._run_turn(_ctx("oh yeah")))
         assert client.respond_calls == []            # never reached the brain (ASLEEP-ignored)
-        assert aria_state.current() == "off"         # eye stayed asleep, no thinking/idle drift
+        assert aria_state.current() == "sleeping"    # eye stayed dozing, no thinking/idle drift
     finally:
         aria_state.set_resting_state("idle")
 

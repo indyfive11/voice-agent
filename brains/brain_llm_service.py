@@ -381,9 +381,9 @@ class BrainLLMService(LLMService):
             await self.push_frame(LLMFullResponseStartFrame())
             # eye: request sent to the brain. But a nano false-fire on un-AEC'd room audio while asleep
             # opens a wake-candidate window → STT → an LLMContextFrame → this turn, even though
-            # _process_context will ASLEEP-ignore it. Don't flash `thinking` (and below, settle to `off`
-            # not `idle`) for that phantom turn — honor resting_state() (`off` asleep, `idle` awake).
-            aria_state.set_state("thinking" if aria_state.resting_state() != "off" else aria_state.resting_state())
+            # _process_context will ASLEEP-ignore it. Don't flash `thinking` (and below, settle to
+            # `sleeping` not `idle`) for that phantom turn — honor resting_state() via is_resting().
+            aria_state.set_state("thinking" if not aria_state.is_resting() else aria_state.resting_state())
             # Mute the user through the whole bot turn (not just while speaking): a SystemFrame
             # pushed UPSTREAM that BotThinkingMuteStrategy honors, closing the first-token latency
             # gap where an empty barge-in cancels the silent in-flight turn. Released in `finally`.
@@ -412,8 +412,8 @@ class BrainLLMService(LLMService):
             await self.push_frame(LLMFullResponseEndFrame())
             # eye: an aside / suppressed turn (incl. an asleep-ignored phantom wake) produces no TTS, so
             # no BotStarted/StoppedSpeaking ever returns the eye to rest — do it here. Honor
-            # resting_state() (`idle` awake, `off` asleep) so a phantom turn while asleep settles back to
-            # `off`, not a hardcoded `idle`. A spoken reply (reply_buf populated) is owned by the TTS path
+            # resting_state() (`idle` awake, `sleeping` asleep) so a phantom turn while asleep settles
+            # back to `sleeping`, not a hardcoded `idle`. A spoken reply (reply_buf populated) is owned by the TTS path
             # (speaking→rest on the bot-speaking frames); leave it.
             if not self._reply_buf:
                 aria_state.set_state(aria_state.resting_state())

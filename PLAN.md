@@ -105,23 +105,27 @@ below is **net-new** vs the v1 plan:
 
 The voice shell publishes its semantic state to a tmpfs file that a **separate** desktop panel (a
 standalone Conky "HAL eye", not in this repo) renders — so the user can *see* at a glance whether Aria
-is idle, listening, thinking, or speaking.
+is idle, asleep, listening, thinking, or speaking.
 
 - `aria_state.py` — an atomic writer (`tmp` + `os.replace`) to `${XDG_RUNTIME_DIR}/aria/state`
   (fallback `~/.local/state/aria/state`), JSON `{"state","level","ts"}`, enum
-  `off | idle | listening | thinking | speaking` (`error` reserved). It is a **cosmetic side-channel**:
+  `off | idle | sleeping | listening | thinking | speaking` (`error` reserved). `off` is voice-mode-down
+  (eye closed); `sleeping` is the distinct asleep-but-running doze (the brain ships a matching `sleeping`
+  enum; Conky renders it). It is a **cosmetic side-channel**:
   every write error is swallowed and never affects the conversation. Disable with `ARIA_EYE_STATE=0`
   (see `.env.example`); `ARIA_EYE_LEVEL_GAIN` boosts the `speaking` amplitude pulse.
 - **Multi-writer, one transition each:** `main.py` (idle/off), `wake_word.py` (listening on
-  window-open, rest on window-close, off/idle on sleep/wake), `brains/brain_llm_service.py` (thinking
-  on a turn), `tts_gain.py` (speaking + a live RMS `level` from the TTS PCM, ~20 Hz). The contract is
-  **single-writer-at-a-time** — in voice mode the voice shell is the sole writer; the reader (Conky)
-  fails safe to `off` if `ts` goes stale (>~5s).
+  window-open, rest on window-close, sleeping/idle on sleep/wake), `brains/brain_llm_service.py`
+  (thinking on a turn), `tts_gain.py` (speaking + a live RMS `level` from the TTS PCM, ~20 Hz). The
+  contract is **single-writer-at-a-time** — in voice mode the voice shell is the sole writer; the reader
+  (Conky) fails safe to `off` if `ts` goes stale (>~5s).
 - **The return-to-rest invariant:** when a transient ends, the eye settles on a process-global
-  *resting state* (`aria_state.resting_state()` — `idle` awake, `off` asleep), never a hardcoded
+  *resting state* (`aria_state.resting_state()` — `idle` awake, `sleeping` asleep), never a hardcoded
   `idle`. All four return-to-rest writers honor it — `tts_gain` BotStopped, the wake gate's
   window-open and window-close, and `brain_llm_service._run_turn` (start + finally) — so a wake-model
   false-fire while asleep can't drift the eye back to `idle` (fixed across `9cbd609` → `45e0790`).
+  "Am I awake?" decisions route through `aria_state.is_resting()` (rest = `off` *or* `sleeping`), not a
+  `!= "off"` literal, so the new `sleeping` rest doesn't read as awake.
 
 ---
 

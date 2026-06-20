@@ -255,7 +255,7 @@ def test_force_gated_while_asleep_overrides_media_state():
     asyncio.run(g.process_frame(WakeSleepFrame(asleep=True), FrameDirection.UPSTREAM))
     assert g._force_gated is True
     assert asyncio.run(g._gated_now()) is True                   # forced gated despite nothing playing
-    assert aria_state.resting_state() == "off"                   # eye must REST on off, not flash-then-idle
+    assert aria_state.resting_state() == "sleeping"              # eye must REST on the dozing state, not flash-then-idle
 
     asyncio.run(g.process_frame(WakeSleepFrame(asleep=False), FrameDirection.UPSTREAM))
     assert g._force_gated is False
@@ -263,21 +263,21 @@ def test_force_gated_while_asleep_overrides_media_state():
     assert aria_state.resting_state() == "idle"                  # awake → eye rests on idle again
 
 
-def test_open_window_keeps_eye_off_while_asleep():
+def test_open_window_keeps_eye_resting_while_asleep():
     # Regression (2026-06-18): while asleep the nano model false-fires on un-AEC'd room audio, opening a
     # wake-CANDIDATE window the brain then rejects (stays asleep). The window-open eye write must honor
-    # resting_state() (`off` asleep) instead of hardcoding `listening`, else the eye lies — the maintainer saw
+    # resting_state() (`sleeping` asleep) instead of hardcoding `listening`, else the eye lies — the maintainer saw
     # `listening` while genuinely asleep. (Same bug class as the 9cbd609 tts_gain clobber fix.)
     import aria_state
 
     g = _gate(window_secs=10.0)
-    aria_state.set_resting_state("off")          # asleep
-    aria_state.set_state("off")
+    aria_state.set_resting_state("sleeping")     # asleep
+    aria_state.set_state("sleeping")
 
     asyncio.run(_call(g._open_window, "test: asleep false-wake"))
 
     assert g._open is True
-    assert aria_state.current() == "off"         # eye stayed dark — did NOT flash `listening`
+    assert aria_state.current() == "sleeping"    # eye stayed dozing — did NOT flash `listening`
 
 
 def test_open_window_lights_listening_while_awake():
@@ -293,9 +293,9 @@ def test_open_window_lights_listening_while_awake():
     assert aria_state.current() == "listening"
 
 
-def test_window_close_settles_off_when_asleep_midwindow():
+def test_window_close_settles_resting_when_asleep_midwindow():
     # A window open (listening, awake) at the instant she's put to sleep must idle-close to the resting
-    # state (`off`), not the old hardcoded `idle`. Covers the second of the two missed writes.
+    # state (`sleeping`), not the old hardcoded `idle`. Covers the second of the two missed writes.
     import aria_state
 
     g = _gate(window_secs=0.01)
@@ -305,12 +305,12 @@ def test_window_close_settles_off_when_asleep_midwindow():
     async def go():
         g._open_window("test: awake wake")       # current → listening
         assert aria_state.current() == "listening"
-        aria_state.set_resting_state("off")      # WakeSleepFrame(asleep=True) arrives mid-window
+        aria_state.set_resting_state("sleeping") # WakeSleepFrame(asleep=True) arrives mid-window
         await asyncio.sleep(0.05)                 # window elapses → idle close
 
     asyncio.run(go())
     assert g._open is False
-    assert aria_state.current() == "off"         # settled on resting (off), not hardcoded `idle`
+    assert aria_state.current() == "sleeping"    # settled on resting (sleeping), not hardcoded `idle`
 
 
 def test_escape_hatch_opens_after_repeated_near_misses():

@@ -80,15 +80,26 @@ def test_resting_state_defaults_to_idle(state_file):
 
 
 def test_set_resting_state_is_read_back(state_file):
-    aria_state.set_resting_state("off")  # asleep → eye rests on off
-    assert aria_state.resting_state() == "off"
+    aria_state.set_resting_state("sleeping")  # asleep → eye rests on the dozing state
+    assert aria_state.resting_state() == "sleeping"
     aria_state.set_resting_state("idle")  # awake → back to idle
     assert aria_state.resting_state() == "idle"
 
 
+def test_is_resting_tracks_asleep_vs_awake(state_file):
+    # "am I awake?" must route through is_resting(), not a `!= "off"` literal — asleep now rests on
+    # `sleeping`, and `off` (voice-mode-down) is also a rest, so both count as resting.
+    aria_state.set_resting_state("idle")
+    assert aria_state.is_resting() is False  # awake
+    aria_state.set_resting_state("sleeping")
+    assert aria_state.is_resting() is True   # asleep
+    aria_state.set_resting_state("off")
+    assert aria_state.is_resting() is True   # voice-mode-down also rests
+
+
 def test_set_resting_state_does_not_write_the_file(state_file):
     # Recording the resting state is a pure flag set — it must not touch the state file (set_state does).
-    aria_state.set_resting_state("off")
+    aria_state.set_resting_state("sleeping")
     assert not state_file.exists()
 
 

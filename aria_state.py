@@ -25,7 +25,13 @@ from pathlib import Path
 
 # Semantic states the eye understands. "error" is reserved (the Conky renderer defines it) but not
 # emitted by v1; kept here so adding it later is a one-liner with no contract change.
-VALID_STATES = frozenset({"off", "idle", "listening", "thinking", "speaking", "error"})
+VALID_STATES = frozenset({"off", "idle", "sleeping", "listening", "thinking", "speaking", "error"})
+
+# The "resting" (no-transient) states. `idle` is the awake rest; `sleeping` is the asleep rest (the
+# Conky eye renders it as a distinct dozing look — `off` is reserved for voice-mode-down). A transient
+# (listening/thinking/speaking) is only lit while AWAKE; while asleep even a phantom wake/turn settles
+# back to the resting state. Whoever owns "am I awake?" should ask is_resting(), NOT compare to "off".
+RESTING_STATES = frozenset({"off", "sleeping"})
 
 _disabled = os.environ.get("ARIA_EYE_STATE", "1") == "0"
 
@@ -40,9 +46,9 @@ _last_state: str | None = None
 _last_level: float = -1.0
 
 # The state the eye should settle on once a transient (speaking/thinking/listening) ends: `idle`
-# while awake, `off` while asleep. Whoever owns a return-to-rest transition reads this instead of
-# hardcoding `idle`, so a goodbye spoken on the way to sleep settles the eye on `off`, not `idle`
-# (the goodbye TTS's BotStopped→rest write would otherwise clobber the earlier `off`).
+# while awake, `sleeping` while asleep. Whoever owns a return-to-rest transition reads this instead of
+# hardcoding `idle`, so a goodbye spoken on the way to sleep settles the eye on `sleeping`, not `idle`
+# (the goodbye TTS's BotStopped→rest write would otherwise clobber the earlier `sleeping`).
 _resting_state: str = "idle"
 
 
@@ -63,8 +69,8 @@ def current() -> str | None:
 
 def set_resting_state(state: str) -> None:
     """Record the state the eye should return to when no transient is active: `idle` while awake,
-    `off` while asleep. Set by the sleep/wake authority (the wake gate); read via resting_state() by
-    whoever owns the return-to-rest transition (tts_gain on BotStopped). Does NOT itself write the
+    `sleeping` while asleep. Set by the sleep/wake authority (the wake gate); read via resting_state()
+    by whoever owns the return-to-rest transition (tts_gain on BotStopped). Does NOT itself write the
     file — call set_state() for that."""
     global _resting_state
     _resting_state = state
@@ -73,6 +79,14 @@ def set_resting_state(state: str) -> None:
 def resting_state() -> str:
     """The state to settle on once a transient ends (see set_resting_state). Defaults to `idle`."""
     return _resting_state
+
+
+def is_resting() -> bool:
+    """True when the agent is at rest (asleep or voice-mode-down) — i.e. the resting state is NOT the
+    awake `idle`. Use this for "am I awake?" decisions instead of comparing to a literal: a transient
+    (listening/thinking/speaking) should only be lit while awake, and asleep is now `sleeping`, not
+    `off`, so a `!= "off"` check would wrongly read as awake."""
+    return _resting_state in RESTING_STATES
 
 
 def set_state(state: str, level: float = 0.0) -> None:

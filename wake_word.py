@@ -340,11 +340,11 @@ class WakeWordGate(FrameProcessor):
         # never runs on ambient TV and only "hey aria" can wake her (see _gated_now / _force_gated).
         if isinstance(frame, WakeSleepFrame):
             self._force_gated = frame.asleep
-            rest = "off" if frame.asleep else "idle"
+            rest = "sleeping" if frame.asleep else "idle"
             # Record what "rest" means now so a goodbye TTS spoken on the way to sleep settles the eye
-            # on `off`, not `idle` (tts_gain's BotStopped→rest write reads this); then set it live.
+            # on `sleeping`, not `idle` (tts_gain's BotStopped→rest write reads this); then set it live.
             aria_state.set_resting_state(rest)
-            aria_state.set_state(rest)  # eye: asleep = closed, awake = idle
+            aria_state.set_state(rest)  # eye: asleep = dozing, awake = idle
             if self._debug:
                 _tlog(
                     "GATE  | asleep — forcing wake-word gate active (acoustic wake only)" if frame.asleep
@@ -677,9 +677,9 @@ class WakeWordGate(FrameProcessor):
         self._arm_window()
         # eye: wake/floor open — capturing speech. But while asleep the gate still opens a wake-CANDIDATE
         # window (the nano model false-fires on un-AEC'd room audio); the brain may reject it and STAY
-        # asleep, so honor the resting state (`off`) rather than lighting `listening` — contract: sleep→off.
-        # A real wake-from-sleep relights via the awake-path writes once the brain confirms the wake.
-        aria_state.set_state("listening" if aria_state.resting_state() != "off" else aria_state.resting_state())
+        # asleep, so honor the resting state (`sleeping`) rather than lighting `listening` — contract: stay
+        # dozing. A real wake-from-sleep relights via the awake-path writes once the brain confirms the wake.
+        aria_state.set_state("listening" if not aria_state.is_resting() else aria_state.resting_state())
 
     # --- command window ----------------------------------------------------
     def _arm_window(self) -> None:

@@ -42,15 +42,15 @@ def test_gain_no_overflow_at_extremes():
 
 
 def test_bot_stopped_returns_to_resting_state(monkeypatch):
-    # The clobber bug: a goodbye spoken on the way to sleep set the eye `off`, then this BotStopped
-    # handler overwrote it with a hardcoded `idle` — so sleep never showed. It must honor the resting
-    # state the wake gate recorded instead.
+    # The clobber bug: a goodbye spoken on the way to sleep set the eye to the sleep state, then this
+    # BotStopped handler overwrote it with a hardcoded `idle` — so sleep never showed. It must honor the
+    # resting state the wake gate recorded instead.
     writes = []
     monkeypatch.setattr(aria_state, "set_state", lambda s, level=0.0: writes.append(s))
-    monkeypatch.setattr(aria_state, "_resting_state", "off")  # wake gate set rest=off (asleep)
+    monkeypatch.setattr(aria_state, "_resting_state", "sleeping")  # wake gate set rest=sleeping (asleep)
     p = TTSGainProcessor(gain=0.6)
     asyncio.run(p.process_frame(BotStoppedSpeakingFrame(), FrameDirection.DOWNSTREAM))
-    assert writes == ["off"]  # NOT idle — the goodbye no longer clobbers the sleep state
+    assert writes == ["sleeping"]  # NOT idle — the goodbye no longer clobbers the sleep state
 
 
 def test_bot_stopped_rests_on_idle_when_awake(monkeypatch):
