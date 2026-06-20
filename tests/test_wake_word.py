@@ -363,7 +363,10 @@ def test_escape_ignores_single_frame_spikes_when_sustain_required():
     assert g._open is True
 
 
-# --- asleep-retry escape (2026-06-19: wake-from-sleep over a movie) ---------------------------------
+# --- gated-retry escape (2026-06-19: re-wake over a movie/music; asleep OR awake-gated) --------------
+# The retry fires while the wake is GATED — `_gated_committed` True (set in process_frame from _gated_now();
+# True asleep AND awake-over-playing-media). These tests drive _feed() directly, so they set _gated_committed
+# explicitly (and _force_gated where the asleep flavor matters for the consec bar).
 
 def test_asleep_lowered_bar_opens_on_two_frames():
     # The 2026-06-19 retune: asleep_consec dropped 3→2. A 2-frame burst over a movie that peaked 2/3 (one
@@ -381,13 +384,14 @@ def test_asleep_lowered_bar_opens_on_two_frames():
     assert g._open is True
 
 
-def test_asleep_retry_opens_after_repeated_near_wakes():
+def test_gated_retry_opens_after_repeated_near_wakes_asleep():
     # A single clean "Aria" over a movie can flicker to 1 frame and never clear even the lowered sustain.
     # If the user clearly tries AGAIN (a 2nd >=threshold near-wake within the window), open anyway.
     client = FakeBrainClient()
     g = _gate(client, consec_frames=2, asleep_consec_frames=3,  # high bar so single frames never fire directly
-              asleep_retry_count=2, asleep_retry_secs=6.0, escape_count=0)
+              gated_retry_count=2, gated_retry_secs=6.0, escape_count=0)
     g._force_gated = True
+    g._gated_committed = True
 
     async def near_wake():           # one >=threshold frame, then below floor → burst ends, peak>=threshold
         g._oww.score = 0.9; await g._feed(_CHUNK)
@@ -403,12 +407,34 @@ def test_asleep_retry_opens_after_repeated_near_wakes():
     assert client.duck_calls == [("sess-test", True)]  # retry pre-ducks like a real wake
 
 
-def test_asleep_retry_ignores_sub_threshold_bursts():
-    # Only bursts whose PEAK clears threshold count. Ambient TV that never reaches the bar must never
+def test_gated_retry_opens_when_awake_over_media():
+    # NEW (2026-06-19): the escape now also fires when AWAKE but the mic is gated by playing media
+    # (_gated_committed True, _force_gated False) — the awake-over-music "peaked 1/2" misses the maintainer hit live.
+    client = FakeBrainClient()
+    g = _gate(client, consec_frames=2, gated_retry_count=2, gated_retry_secs=6.0, escape_count=0)
+    g._force_gated = False         # awake
+    g._gated_committed = True       # but gated because media is playing
+
+    async def near_wake():
+        g._oww.score = 0.9; await g._feed(_CHUNK)   # consec=1 (< awake bar 2) → no direct fire
+        g._oww.score = 0.0; await g._feed(_CHUNK)
+
+    async def go():
+        await near_wake()
+        assert g._open is False
+        await near_wake()           # 2nd hit → retry opens despite being awake
+
+    asyncio.run(go())
+    assert g._open is True
+
+
+def test_gated_retry_ignores_sub_threshold_bursts():
+    # Only bursts whose PEAK clears threshold count. Ambient media that never reaches the bar must never
     # accrue retry hits, no matter how many bursts — else the movie itself would eventually open the gate.
     client = FakeBrainClient()
-    g = _gate(client, asleep_consec_frames=3, asleep_retry_count=2, escape_count=0)
+    g = _gate(client, asleep_consec_frames=3, gated_retry_count=2, escape_count=0)
     g._force_gated = True
+    g._gated_committed = True
 
     async def sub_threshold():       # peaks 0.3 (>= debug_floor 0.2, < threshold 0.5)
         g._oww.score = 0.3; await g._feed(_CHUNK)
@@ -419,14 +445,15 @@ def test_asleep_retry_ignores_sub_threshold_bursts():
 
     asyncio.run(go())
     assert g._open is False
-    assert g._asleep_retry_hits == []
+    assert g._gated_retry_hits == []
 
 
-def test_asleep_retry_inactive_while_awake():
-    # Retry is scoped to the asleep/force-gated state. Awake, repeated sub-bar near-misses must NOT
-    # accrue asleep-retry hits (the awake consec bar owns recall there).
+def test_gated_retry_inactive_when_not_gated():
+    # Open mic (not gated): repeated sub-bar near-misses must NOT accrue retry hits — there's no lockout to
+    # escape, and the consec bar owns recall.
     client = FakeBrainClient()
-    g = _gate(client, consec_frames=2, asleep_retry_count=2, escape_count=0)  # not force-gated → awake
+    g = _gate(client, consec_frames=2, gated_retry_count=2, escape_count=0)
+    g._gated_committed = False  # open mic, not gated
 
     async def near_wake():
         g._oww.score = 0.9; await g._feed(_CHUNK)   # consec=1, awake bar 2 → no fire
@@ -437,16 +464,17 @@ def test_asleep_retry_inactive_while_awake():
 
     asyncio.run(go())
     assert g._open is False
-    assert g._asleep_retry_hits == []
+    assert g._gated_retry_hits == []
 
 
-def test_asleep_retry_hits_expire_outside_window():
-    # A stale hit older than asleep_retry_secs is pruned, so a lone fresh near-wake doesn't ride an old
+def test_gated_retry_hits_expire_outside_window():
+    # A stale hit older than gated_retry_secs is pruned, so a lone fresh near-wake doesn't ride an old
     # one into a spurious open — the two attempts must be close together to count as a deliberate re-wake.
     client = FakeBrainClient()
-    g = _gate(client, asleep_consec_frames=3, asleep_retry_count=2, asleep_retry_secs=6.0, escape_count=0)
+    g = _gate(client, asleep_consec_frames=3, gated_retry_count=2, gated_retry_secs=6.0, escape_count=0)
     g._force_gated = True
-    g._asleep_retry_hits = [time.monotonic() - 100.0]  # one stale hit, far outside the 6s window
+    g._gated_committed = True
+    g._gated_retry_hits = [time.monotonic() - 100.0]  # one stale hit, far outside the 6s window
 
     async def near_wake():
         g._oww.score = 0.9; await g._feed(_CHUNK)
@@ -454,15 +482,16 @@ def test_asleep_retry_hits_expire_outside_window():
 
     asyncio.run(near_wake())
     assert g._open is False                 # stale hit pruned → only 1 fresh hit, not enough
-    assert len(g._asleep_retry_hits) == 1
+    assert len(g._gated_retry_hits) == 1
 
 
-def test_asleep_retry_groups_one_flickering_utterance_as_one_hit():
+def test_gated_retry_groups_one_flickering_utterance_as_one_hit():
     # A single "Aria" whose score dips between frames but stays above the (low, production 0.05) floor is
     # ONE attempt, not several — it must count as a single retry hit so one utterance can't self-open.
     client = FakeBrainClient()
-    g = _gate(client, asleep_consec_frames=3, asleep_retry_count=2, debug_floor=0.05, escape_count=0)
+    g = _gate(client, asleep_consec_frames=3, gated_retry_count=2, debug_floor=0.05, escape_count=0)
     g._force_gated = True
+    g._gated_committed = True
 
     async def go():
         g._oww.score = 0.9; await g._feed(_CHUNK)   # peak
@@ -472,7 +501,7 @@ def test_asleep_retry_groups_one_flickering_utterance_as_one_hit():
 
     asyncio.run(go())
     assert g._open is False
-    assert len(g._asleep_retry_hits) == 1
+    assert len(g._gated_retry_hits) == 1
 
 
 def test_speex_ns_falls_back_when_unavailable(monkeypatch, tmp_path):

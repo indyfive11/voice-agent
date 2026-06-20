@@ -583,6 +583,13 @@ def build_media_duck(llm, gate=None):
     confirm_grace = float(_env("DUCK_CONFIRM_GRACE", "2.5"))
     sustained_secs = float(_env("DUCK_SUSTAINED_SECS", "4.0"))
     max_hold_secs = float(_env("DUCK_MAX_HOLD_SECS", "120.0"))
+    # Conversation-hold: after an addressed reply over media, hold the bed ducked + floor open this long so a
+    # follow-up needs no re-wake and the bed doesn't bob between turns. 0 disables (immediate bot-stopped
+    # restore). Read the SAME WAKE_WINDOW_SECS the gate uses so the controller can clamp the hold to it — the
+    # gate re-arms its command window ~window_secs per reply, keeping the two in lockstep (and its idle-close
+    # is a free second restore guarantee). A hold > window would re-gate/bob mid-conversation, so it's clamped.
+    convo_hold_secs = float(_env("DUCK_CONVO_HOLD_SECS", "15.0"))
+    window_secs = float(_env("WAKE_WINDOW_SECS", "15"))
     require_wake = _env("DUCK_REQUIRE_WAKE", "1") not in ("0", "false", "False")
     gate_duck = gate is not None and require_wake and hasattr(gate, "duck_allowed")
     if gate_duck:
@@ -602,7 +609,8 @@ def build_media_duck(llm, gate=None):
     logger.info(
         f"Media ducking: on VAD speech onset (min_words={min_words}, "
         f"confirm_grace={confirm_grace}s, restore_grace={restore_grace}s, "
-        f"sustained={sustained_secs}s, max_hold={max_hold_secs}s, require_wake={gate_duck})"
+        f"sustained={sustained_secs}s, max_hold={max_hold_secs}s, "
+        f"convo_hold={min(convo_hold_secs, window_secs):.0f}s, require_wake={gate_duck})"
     )
     return MediaDuckController(
         llm.brain_client,
@@ -612,6 +620,8 @@ def build_media_duck(llm, gate=None):
         confirm_grace=confirm_grace,
         sustained_secs=sustained_secs,
         max_hold_secs=max_hold_secs,
+        convo_hold_secs=convo_hold_secs,
+        window_secs=window_secs,
         should_duck=should_duck,
         should_duck_onset=should_duck_onset,
         media_status=build_media_state_provider(llm),  # SHARED with the wake gate (no divergence)
@@ -740,16 +750,17 @@ def build_wake_word_gate(llm):
     # Clamped up to at least consec_frames in the gate. Was 3, but real wake-from-sleep recall over a movie
     # suffered: 2026-06-19 live, waking her from sleep over a film, 7 genuine wakes peaked 2/3 frames (one
     # short) and opened no window — the strict 3-run rejected clean "Aria"s the AEC mic passed but flickered.
-    # Dropped to 2 (catches those) and paired with the asleep-retry escape below so a repeated attempt opens
+    # Dropped to 2 (catches those) and paired with the gated-retry escape below so a repeated attempt opens
     # even when a single burst flickers to 1 frame, without globally weakening the single-shot bar further.
     asleep_consec_frames = int(_env("WAKE_ASLEEP_CONSEC_FRAMES", "2"))
-    # Asleep-retry escape: while asleep, if the user clearly tries AGAIN — `asleep_retry_count` separate
-    # >=threshold near-wakes that each fell short of the asleep sustain, within `asleep_retry_secs` — open the
-    # gate anyway. TV rarely produces two near-perfect "Aria" bursts seconds apart; a user re-waking does.
-    # Catches the residual 1-frame flicker (the 2026-06-19 "peaked 1/2/1/3" misses) the lowered bar can't.
-    # Scoped to the asleep/force-gated state only; awake is unaffected. 0 disables.
-    asleep_retry_count = int(_env("WAKE_ASLEEP_RETRY_COUNT", "2"))
-    asleep_retry_secs = float(_env("WAKE_ASLEEP_RETRY_SECS", "6.0"))
+    # Gated-retry escape: whenever the wake is being GATED (asleep OR awake-with-media-playing — both lock the
+    # mic behind the wake word), if the user clearly tries AGAIN — `gated_retry_count` separate >=threshold
+    # near-wakes that each fell short of the sustain, within `gated_retry_secs` — open the gate anyway. Media
+    # rarely produces two near-perfect "Aria" bursts seconds apart; a user re-waking does. Catches the residual
+    # 1-frame flicker (the 2026-06-19 "peaked 1/2 / 1/3" misses, asleep AND awake-over-music) the lowered bar
+    # can't. Only fires while gated (open mic needs no escape). 0 disables. (Was asleep-only before 2026-06-19.)
+    gated_retry_count = int(_env("WAKE_GATED_RETRY_COUNT", "2"))
+    gated_retry_secs = float(_env("WAKE_GATED_RETRY_SECS", "6.0"))
     # Default 1 = gate VIDEO behind the wake word too (a movie only ducks once you say "Aria"; no duck on
     # asides). Safe to default on because the AEC echo-cancel mic keeps the movie out of the mic, so the
     # wake word is heard cleanly over it (the old over-movie lockout that kept this off is gone). Set 0 on a
@@ -849,7 +860,7 @@ def build_wake_word_gate(llm):
         + (f" escape={escape_count}@{escape_floor}/{escape_secs:.0f}s" if escape_count else " escape=off")
         + (f" consec={consec_frames}" if consec_frames > 1 else "")
         + f" asleep-consec={asleep_consec_frames}"
-        + (f" asleep-retry={asleep_retry_count}@{asleep_retry_secs:.0f}s" if asleep_retry_count else " asleep-retry=off")
+        + (f" gated-retry={gated_retry_count}@{gated_retry_secs:.0f}s" if gated_retry_count else " gated-retry=off")
         + (" inflight-guard=on" if guard_inflight else " inflight-guard=off")
         + (f" min-dwell={min_dwell_secs:.1f}s" if min_dwell_secs > 0 else "")
         + (" window-mute=on" if window_mute else " window-mute=off")
@@ -878,8 +889,8 @@ def build_wake_word_gate(llm):
         escape_secs=escape_secs,
         consec_frames=consec_frames,
         asleep_consec_frames=asleep_consec_frames,
-        asleep_retry_count=asleep_retry_count,
-        asleep_retry_secs=asleep_retry_secs,
+        gated_retry_count=gated_retry_count,
+        gated_retry_secs=gated_retry_secs,
         guard_inflight=guard_inflight,
         min_dwell_secs=min_dwell_secs,
         window_mute=window_mute,

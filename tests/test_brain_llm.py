@@ -463,112 +463,87 @@ def test_vocative_plus_command_is_forwarded_with_wake_word_stripped():
         assert client.respond_calls == [("sess-test", expected)], f"{text!r} → {client.respond_calls}"
 
 
-def test_bare_wake_prompts_when_no_command_follows():
-    # "Hey Aria" with nothing after → after a short wait with no command, ask once. Never forwarded.
+def test_bare_wake_is_silent_by_default_listen_first():
+    # Listen-first (the maintainer, 2026-06-19): a bare wake gets NO spoken greeting by default — she just listens. The
+    # command (if any) is still never forwarded with the wake word; a bare wake forwards nothing.
     client = FakeBrainClient(respond_events=[BrainEvent("token", text="Hi!"), BrainEvent("done")])
     svc, pushed = _service_with_recorder(client)
     svc._bare_wake_delay = 0.01
 
     async def go():
         await svc._process_context(_ctx("Hey Aria"))
-        await asyncio.sleep(0.05)  # let the prompt timer fire
+        await asyncio.sleep(0.05)  # past any (disabled) prompt timer
     asyncio.run(go())
-    assert client.respond_calls == []
+    assert client.respond_calls == []                       # bare wake forwards nothing
+    assert _BARE_WAKE_PROMPT not in _spoken_texts(pushed)   # and she stays silent
+    assert svc._bare_wake_task is None                      # greeting never armed
+
+
+def test_bare_wake_riding_command_still_forwarded_without_wake_word():
+    # Listen-first doesn't change command handling: a wake + command still forwards only the command.
+    client = FakeBrainClient(respond_events=[BrainEvent("token", text="ok"), BrainEvent("done")])
+    svc, pushed = _service_with_recorder(client)
+
+    asyncio.run(svc._process_context(_ctx("Hey Aria, turn it up")))
+    assert client.respond_calls == [("sess-test", "turn it up")]
+
+
+def test_bare_wake_greeting_still_works_when_enabled():
+    # The greeting is kept behind BARE_WAKE_GREET (default off) — when opted in, it still prompts once.
+    client = FakeBrainClient(respond_events=[BrainEvent("token", text="ok"), BrainEvent("done")])
+    svc, pushed = _service_with_recorder(client)
+    svc._bare_wake_greet = True
+    svc._bare_wake_delay = 0.01
+
+    async def go():
+        await svc._process_context(_ctx("Hey Aria"))
+        await asyncio.sleep(0.05)
+    asyncio.run(go())
     assert _spoken_texts(pushed) == [_BARE_WAKE_PROMPT]
 
 
-def test_bare_wake_prompt_cancelled_by_following_command():
-    # The natural pause: a command arriving after the bare wake answers it — the prompt never fires, and
-    # only the command (no wake word) reaches the brain.
+def test_resleep_after_wake_from_sleep_with_no_command():
+    # Woken from sleep by a bare wake, no command follows → return to sleep silently (no goodbye), per the
+    # "listen, wait, then go back to sleep if nothing comes" rule.
     client = FakeBrainClient(respond_events=[BrainEvent("token", text="ok"), BrainEvent("done")])
     svc, pushed = _service_with_recorder(client)
-    svc._bare_wake_delay = 0.05
+    svc._sleeping = True
+    svc._resleep_secs = 0.02
 
     async def go():
-        await svc._process_context(_ctx("Hey Aria"))   # bare → arms the prompt
-        await asyncio.sleep(0.01)                       # command arrives before it fires
-        await svc._process_context(_ctx("turn it up"))
-        await asyncio.sleep(0.1)                        # well past the prompt delay
+        await svc._process_context(_ctx("Hey Aria"))  # wakes from sleep, bare → arms re-sleep
+        assert svc._sleeping is False                  # awake during the listen window
+        await asyncio.sleep(0.06)                       # re-sleep timer fires
     asyncio.run(go())
-    assert client.respond_calls == [("sess-test", "turn it up")]
-    assert _BARE_WAKE_PROMPT not in _spoken_texts(pushed)
+    assert svc._sleeping is True                        # returned to sleep, silently
+    assert _spoken_texts(pushed) == []                 # no greeting, no goodbye
 
 
-def test_bare_wake_greeting_cancelled_by_speech_onset():
-    # 2026-06-18 22:29 over-talk: a bare wake arms the greeting, then the user immediately speaks the command.
-    # The VAD speech onset (a SystemFrame that reaches this service) must cancel the pending greeting so
-    # "Yes? Did you need something?" never lands on top of the command (and never un-ducks mid-repeat).
-    from pipecat.frames.frames import VADUserStartedSpeakingFrame
-    from pipecat.processors.frame_processor import FrameDirection
-
+def test_resleep_cancelled_by_a_following_command():
+    # A command after the wake-from-sleep cancels the re-sleep — she stays awake and serves it.
     client = FakeBrainClient(respond_events=[BrainEvent("token", text="ok"), BrainEvent("done")])
     svc, pushed = _service_with_recorder(client)
-    svc._bare_wake_delay = 0.1
+    svc._sleeping = True
+    svc._resleep_secs = 0.05
 
     async def go():
-        await svc._process_context(_ctx("Hey Aria"))  # bare → arms the greeting timer
+        await svc._process_context(_ctx("Hey Aria"))      # wake from sleep → re-sleep armed
         await asyncio.sleep(0.01)
-        await svc.process_frame(VADUserStartedSpeakingFrame(), FrameDirection.DOWNSTREAM)  # user starts command
-        await asyncio.sleep(0.15)  # well past the greeting delay
+        await svc._process_context(_ctx("turn it up"))    # command → cancels re-sleep
+        await asyncio.sleep(0.08)                          # past the re-sleep delay
     asyncio.run(go())
-    assert _BARE_WAKE_PROMPT not in _spoken_texts(pushed)  # greeting was cancelled by the onset
-    assert svc._user_speaking is True
-
-
-def test_bare_wake_greeting_skipped_when_onset_precedes_transcript():
-    # Edge: the command's VAD onset races ahead of the (Whisper-lagged) bare "Hey Aria" transcript. When the
-    # bare transcript finally lands, _user_speaking is already True → don't arm a greeting over the command.
-    from pipecat.frames.frames import VADUserStartedSpeakingFrame
-    from pipecat.processors.frame_processor import FrameDirection
-
-    client = FakeBrainClient(respond_events=[BrainEvent("token", text="ok"), BrainEvent("done")])
-    svc, pushed = _service_with_recorder(client)
-    svc._bare_wake_delay = 0.05
-
-    async def go():
-        await svc.process_frame(VADUserStartedSpeakingFrame(), FrameDirection.DOWNSTREAM)  # onset first
-        await svc._process_context(_ctx("Hey Aria"))  # bare transcript lands while speaking
-        await asyncio.sleep(0.1)
-    asyncio.run(go())
-    assert _BARE_WAKE_PROMPT not in _spoken_texts(pushed)
-    assert svc._bare_wake_task is None  # never armed
-
-
-def test_bare_wake_no_double_greeting():
-    # The doubling (22:29:40 + 22:29:44 / 11:44:00 + 11:44:04): a second bare wake — including the greeting
-    # TTS bleeding back as "Hey Aria" with no fresh VAD onset — must NOT re-arm a second greeting. The latch
-    # blocks the re-arm; only ONE prompt is spoken.
-    client = FakeBrainClient(respond_events=[BrainEvent("token", text="ok"), BrainEvent("done")])
-    svc, pushed = _service_with_recorder(client)
-    svc._bare_wake_delay = 0.01
-
-    async def go():
-        await svc._process_context(_ctx("Hey Aria"))  # greeting #1
-        await asyncio.sleep(0.03)
-        await svc._process_context(_ctx("Hey Aria"))  # second bare wake (bleed) — latched, no re-arm
-        await asyncio.sleep(0.03)
-    asyncio.run(go())
-    assert _spoken_texts(pushed).count(_BARE_WAKE_PROMPT) == 1
-    assert svc._bare_wake_greeted is True
-
-
-def test_bare_wake_regreets_after_a_real_command_clears_the_latch():
-    # The latch only blocks a re-arm WITHIN one episode. A real command ends the episode (clears the latch),
-    # so a genuine bare wake LATER in the session greets again.
-    client = FakeBrainClient(respond_events=[BrainEvent("token", text="ok"), BrainEvent("done")])
-    svc, pushed = _service_with_recorder(client)
-    svc._bare_wake_delay = 0.01
-
-    async def go():
-        await svc._process_context(_ctx("Hey Aria"))    # greeting #1 → latch set
-        await asyncio.sleep(0.03)
-        await svc._process_context(_ctx("turn it up"))  # real command → clears the latch, forwards
-        await asyncio.sleep(0.01)
-        await svc._process_context(_ctx("Hey Aria"))    # fresh bare wake → greets again
-        await asyncio.sleep(0.03)
-    asyncio.run(go())
-    assert _spoken_texts(pushed).count(_BARE_WAKE_PROMPT) == 2
+    assert svc._sleeping is False                          # stayed awake
     assert ("sess-test", "turn it up") in client.respond_calls
+
+
+def test_no_resleep_when_already_awake():
+    # An already-awake bare wake must NOT arm a re-sleep (she wasn't asleep — nothing to return to).
+    client = FakeBrainClient(respond_events=[BrainEvent("token", text="ok"), BrainEvent("done")])
+    svc, pushed = _service_with_recorder(client)  # _sleeping defaults False
+
+    asyncio.run(svc._process_context(_ctx("Hey Aria")))
+    assert svc._resleep_task is None
+    assert svc._sleeping is False
 
 
 def test_non_vocative_short_turn_still_forwarded():

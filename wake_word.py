@@ -116,8 +116,8 @@ class WakeWordGate(FrameProcessor):
         escape_secs: float = 12.0,
         consec_frames: int = 1,
         asleep_consec_frames: int = 3,
-        asleep_retry_count: int = 2,
-        asleep_retry_secs: float = 6.0,
+        gated_retry_count: int = 2,
+        gated_retry_secs: float = 6.0,
         guard_inflight: bool = True,
         min_dwell_secs: float = 2.0,
         window_mute: bool = True,
@@ -168,16 +168,18 @@ class WakeWordGate(FrameProcessor):
         # "she won't stay asleep" bug (2026-06-15). A longer run rejects the brief 2-frame coincidences that
         # would otherwise open the mic to ambient dialogue. Never weaker than the awake requirement.
         self._asleep_consec_required = max(self._consec_required, asleep_consec_frames)
-        # Asleep-retry escape: a single clean "Aria" over a movie sometimes flickers to 1-2 frames and never
-        # clears the asleep sustain (2026-06-19 live: 7 wakes peaked 2/3, 10 peaked 1/3, opening no window).
-        # Rather than weaken the single-shot bar further (which lets a one-off TV coincidence wake her), open
-        # when the user clearly tries AGAIN: `asleep_retry_count` separate >=threshold near-wakes that each
-        # fell short of the sustain, within `asleep_retry_secs`. TV rarely fires two near-perfect bursts
-        # seconds apart; a person re-waking does. Scoped to the asleep/force-gated state only. 0 disables.
-        self._asleep_retry_count = max(0, asleep_retry_count)
-        self._asleep_retry_secs = max(0.0, asleep_retry_secs)
-        self._asleep_retry_hits: list[float] = []
-        self._retry_peak = 0.0  # peak of the in-progress asleep-retry burst (grouped by debug_floor)
+        # Gated-retry escape: a clean "Aria" over a movie/music sometimes flickers to 1-2 frames and never
+        # clears the sustain (2026-06-19 live: asleep — 7 wakes peaked 2/3, 10 peaked 1/3; awake over music —
+        # spikes peaked 1/2; all opened no window). Rather than weaken the single-shot bar further (which lets
+        # a one-off media coincidence wake her), open when the user clearly tries AGAIN: `gated_retry_count`
+        # separate >=threshold near-wakes that each fell short of the sustain, within `gated_retry_secs`. Media
+        # rarely fires two near-perfect "Aria" bursts seconds apart; a person re-waking does. Applies WHENEVER
+        # the wake is being gated — asleep OR awake-with-media-playing (both lock the mic behind the wake word,
+        # so both flicker the same way); keyed on `_gated_committed`, not just `_force_gated`. 0 disables.
+        self._gated_retry_count = max(0, gated_retry_count)
+        self._gated_retry_secs = max(0.0, gated_retry_secs)
+        self._gated_retry_hits: list[float] = []
+        self._retry_peak = 0.0  # peak of the in-progress gated-retry burst (grouped by debug_floor)
         self._consec = 0
         self._consec_max = 0  # best consecutive ≥threshold run in the current near-miss burst (diagnostic)
         # F3 gate hardening (defense-in-depth; GA's Phase-1 already kills the remote-video kind-flap):
@@ -494,8 +496,8 @@ class WakeWordGate(FrameProcessor):
                     self._track_nearmiss(key, score, in_refractory)
                 if not self._open and self._escape_count > 0:
                     self._track_escape(score, now)  # lockout escape (independent of debug)
-                if not self._open and self._asleep_retry_count > 0:
-                    self._track_asleep_retry(score, now)  # asleep re-wake escape (independent of debug)
+                if not self._open and self._gated_retry_count > 0:
+                    self._track_gated_retry(score, now)  # gated (asleep/media) re-wake escape (debug-independent)
 
     def _interrupt_active(self) -> bool:
         """Whether the interrupt detector should run on this frame: opt-in AND Aria is currently speaking.
@@ -597,19 +599,21 @@ class WakeWordGate(FrameProcessor):
                 f"{self._escape_secs:.0f}s, opening despite sub-threshold"
             )
 
-    def _track_asleep_retry(self, score: float, now: float) -> None:
-        """While ASLEEP, count separate >=threshold near-wakes that fell short of the asleep sustain; after
-        `asleep_retry_count` of them within `asleep_retry_secs`, open the gate — the user is clearly re-waking.
+    def _track_gated_retry(self, score: float, now: float) -> None:
+        """While the wake is being GATED (asleep OR awake-with-media-playing), count separate >=threshold
+        near-wakes that fell short of the sustain; after `gated_retry_count` of them within `gated_retry_secs`,
+        open the gate — the user is clearly re-waking.
 
         A burst is grouped by `debug_floor` (the same low floor the near-miss diagnostic uses) so a single
-        flickering "Aria" — which dips below threshold mid-word (the 2026-06-19 "peaked 1/3" pattern) but stays
-        above the floor — counts as ONE attempt, not several. Only a burst whose PEAK cleared threshold counts:
-        sub-threshold room/TV noise never accrues, and a one-off coincidence that DID clear threshold needs a
-        SECOND one seconds later to open — TV rarely fires two near-perfect bursts apart, a person re-waking
-        does. A burst that reaches the full sustain fires the normal wake path first (we're not `_open` here),
-        so this only ever sees genuine sub-bar attempts. Runs only while force-gated (asleep)."""
-        if not self._force_gated:
-            self._retry_peak = 0.0  # don't carry an in-progress burst across a wake/sleep transition
+        flickering "Aria" — which dips below threshold mid-word (the 2026-06-19 "peaked 1/3" / "1/2" pattern)
+        but stays above the floor — counts as ONE attempt, not several. Only a burst whose PEAK cleared
+        threshold counts: sub-threshold room/media noise never accrues, and a one-off coincidence that DID clear
+        threshold needs a SECOND one seconds later to open — media rarely fires two near-perfect bursts apart, a
+        person re-waking does. A burst that reaches the full sustain fires the normal wake path first (we're not
+        `_open` here), so this only ever sees genuine sub-bar attempts. Runs only while gated (the mic is locked
+        behind the wake word) — `_gated_committed`, which is True asleep AND awake-over-playing-media."""
+        if not self._gated_committed:
+            self._retry_peak = 0.0  # not gated (open mic) → no escape needed; don't carry a stale burst
             return
         if score >= self._debug_floor:
             self._retry_peak = max(self._retry_peak, score)
@@ -620,15 +624,15 @@ class WakeWordGate(FrameProcessor):
         self._retry_peak = 0.0
         if peak < self._threshold:
             return  # never a genuine attempt (peaked under the bar) — ignore, as music/noise does
-        self._asleep_retry_hits.append(now)
-        self._asleep_retry_hits = [t for t in self._asleep_retry_hits if now - t <= self._asleep_retry_secs]
-        _tlog(f"WAKE  | asleep-retry-hit {len(self._asleep_retry_hits)}/{self._asleep_retry_count} "
+        self._gated_retry_hits.append(now)
+        self._gated_retry_hits = [t for t in self._gated_retry_hits if now - t <= self._gated_retry_secs]
+        _tlog(f"WAKE  | gated-retry-hit {len(self._gated_retry_hits)}/{self._gated_retry_count} "
               f"(peak={peak:.2f})")
-        if len(self._asleep_retry_hits) >= self._asleep_retry_count:
-            self._asleep_retry_hits.clear()
+        if len(self._gated_retry_hits) >= self._gated_retry_count:
+            self._gated_retry_hits.clear()
             self._open_window(
-                f"WAKE  | asleep-retry — {self._asleep_retry_count} near-wakes in "
-                f"{self._asleep_retry_secs:.0f}s, opening despite short sustain"
+                f"WAKE  | gated-retry — {self._gated_retry_count} near-wakes in "
+                f"{self._gated_retry_secs:.0f}s, opening despite short sustain"
             )
 
     def _on_wake(self, score: float) -> None:
@@ -669,7 +673,7 @@ class WakeWordGate(FrameProcessor):
         self._escape_run = 0
         self._escape_hits.clear()  # fresh start once we're open
         self._retry_peak = 0.0
-        self._asleep_retry_hits.clear()
+        self._gated_retry_hits.clear()
         self._arm_window()
         # eye: wake/floor open — capturing speech. But while asleep the gate still opens a wake-CANDIDATE
         # window (the nano model false-fires on un-AEC'd room audio); the brain may reject it and STAY

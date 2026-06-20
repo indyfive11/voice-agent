@@ -29,7 +29,8 @@ class _Clock:
         return self.t
 
 
-def _ctrl(client, *, playing: bool, confirm_grace=0.02, restore_grace=0.20, max_hold_secs=120.0):
+def _ctrl(client, *, playing: bool, confirm_grace=0.02, restore_grace=0.20, max_hold_secs=120.0,
+          convo_hold_secs=0.0, window_secs=15.0):
     state = {"playing": playing}
     g = MediaDuckController(
         client,
@@ -37,10 +38,24 @@ def _ctrl(client, *, playing: bool, confirm_grace=0.02, restore_grace=0.20, max_
         confirm_grace=confirm_grace,
         restore_grace=restore_grace,
         max_hold_secs=max_hold_secs,
+        convo_hold_secs=convo_hold_secs,
+        window_secs=window_secs,
         media_status=(lambda: dict(state)),
     )
     g._test_state = state  # tests can flip playback mid-turn
     return g
+
+
+async def _addressed_turn(g):
+    """Drive one full ADDRESSED turn over playing media: onset → confirmed → bot speaks → bot stops."""
+    g._handle(VADUserStartedSpeakingFrame())
+    await _drain()
+    g._handle(_transcript("play something"))
+    await _drain()
+    g._handle(BotStartedSpeakingFrame())
+    await _drain()
+    g._handle(BotStoppedSpeakingFrame())
+    await _drain()
 
 
 def _transcript(text):
@@ -353,3 +368,151 @@ def test_think_hold_ceiling_restores_after_max_hold():
     asyncio.run(go())
     assert client.duck_calls == [("sess-test", True), ("sess-test", False)]
     assert g._ducked is False
+
+
+# --- conversation-hold over media (2026-06-19) ------------------------------------------------------
+
+def test_convo_hold_keeps_bed_ducked_after_addressed_reply():
+    # After an addressed reply over media, the bed stays ducked (no `off` at bot-stopped) and a hold timer
+    # is armed — the floor stays open for a follow-up.
+    client = FakeBrainClient()
+    g = _ctrl(client, playing=True, convo_hold_secs=5.0)
+
+    asyncio.run(_addressed_turn(g))
+    assert client.duck_calls == [("sess-test", True)]  # ducked, never restored
+    assert g._ducked is True
+    assert g._convo_task is not None
+
+
+def test_convo_hold_follow_up_no_bob_and_rearms():
+    # A follow-up within the hold needs no re-wake: its onset cancels the hold, the bed never bobs up between
+    # turns, and the second reply re-arms the hold.
+    client = FakeBrainClient()
+    g = _ctrl(client, playing=True, convo_hold_secs=5.0)
+
+    async def go():
+        await _addressed_turn(g)                       # turn 1 → hold armed
+        g._handle(VADUserStartedSpeakingFrame())       # follow-up onset (no re-wake)
+        await _drain()
+        assert g._convo_task is None                   # hold cancelled by the follow-up
+        g._handle(_transcript("and tomorrow"))
+        await _drain()
+        g._handle(BotStartedSpeakingFrame())
+        await _drain()
+        g._handle(BotStoppedSpeakingFrame())           # turn 2 → hold re-armed
+        await _drain()
+
+    asyncio.run(go())
+    assert client.duck_calls == [("sess-test", True)]  # one duck on, no bob across both turns
+    assert g._ducked is True
+    assert g._convo_task is not None
+
+
+def test_convo_hold_restores_on_idle_expiry():
+    # The conversation goes quiet → the hold timer fires → the bed restores (the primary restore guarantee).
+    client = FakeBrainClient()
+    g = _ctrl(client, playing=True, convo_hold_secs=0.05)
+
+    async def go():
+        await _addressed_turn(g)
+        assert g._ducked is True
+        await asyncio.sleep(0.12)                       # convo idle (0.05) elapses
+        await _drain()
+
+    asyncio.run(go())
+    assert client.duck_calls == [("sess-test", True), ("sess-test", False)]
+    assert g._ducked is False
+
+
+def test_convo_hold_restores_on_sleep():
+    # Going to sleep mid-hold must restore the bed (a held duck must never survive sleep).
+    from wake_word import WakeSleepFrame
+
+    client = FakeBrainClient()
+    g = _ctrl(client, playing=True, convo_hold_secs=5.0)
+
+    async def go():
+        await _addressed_turn(g)
+        assert g._ducked is True
+        g._handle(WakeSleepFrame(asleep=True))
+        await _drain()
+
+    asyncio.run(go())
+    assert client.duck_calls == [("sess-test", True), ("sess-test", False)]
+    assert g._ducked is False
+    assert g._convo_task is None
+
+
+def test_convo_hold_restores_on_shutdown():
+    # Pipeline teardown mid-hold must restore the bed (best-effort) — closes the stuck-duck-at-shutdown gap.
+    from pipecat.frames.frames import EndFrame
+
+    client = FakeBrainClient()
+    g = _ctrl(client, playing=True, convo_hold_secs=5.0)
+
+    async def go():
+        await _addressed_turn(g)
+        assert g._ducked is True
+        g._handle(EndFrame())
+        await _drain()
+
+    asyncio.run(go())
+    assert client.duck_calls == [("sess-test", True), ("sess-test", False)]
+    assert g._ducked is False
+    assert g._convo_task is None
+
+
+def test_aside_does_not_enter_convo_hold():
+    # An aside (not addressed → no bot speech) must NOT enter the hold; it restores normally.
+    client = FakeBrainClient()
+    g = _ctrl(client, playing=True, convo_hold_secs=5.0)
+
+    async def go():
+        g._handle(VADUserStartedSpeakingFrame())       # duck on
+        await _drain()
+        g._handle(VADUserStoppedSpeakingFrame())       # short utterance (not sustained)
+        await _drain()
+        g._handle(DuckReleaseFrame())                  # aside → immediate restore
+        await _drain()
+
+    asyncio.run(go())
+    assert client.duck_calls == [("sess-test", True), ("sess-test", False)]
+    assert g._ducked is False
+    assert g._convo_task is None
+
+
+def test_no_convo_hold_when_nothing_ducked():
+    # Open-mic / nothing playing: the duck never engages, so bot-stopped enters no hold and nothing is stuck.
+    client = FakeBrainClient()
+    g = _ctrl(client, playing=False, convo_hold_secs=5.0)
+
+    async def go():
+        g._handle(VADUserStartedSpeakingFrame())       # _fire skips (nothing playing) → _ducked clears
+        await _drain()
+        g._handle(BotStartedSpeakingFrame())
+        await _drain()
+        g._handle(BotStoppedSpeakingFrame())
+        await _drain()
+
+    asyncio.run(go())
+    assert g._ducked is False
+    assert g._convo_task is None
+    assert client.duck_calls == []
+
+
+def test_convo_hold_disabled_restores_immediately():
+    # convo_hold_secs=0 → the pre-2026-06-19 behavior: restore the instant Aria stops speaking.
+    client = FakeBrainClient()
+    g = _ctrl(client, playing=True, convo_hold_secs=0.0)
+
+    asyncio.run(_addressed_turn(g))
+    assert client.duck_calls == [("sess-test", True), ("sess-test", False)]
+    assert g._ducked is False
+    assert g._convo_task is None
+
+
+def test_convo_hold_clamps_to_window_secs():
+    # A hold longer than the wake window would re-gate mid-conversation, so it's clamped to window_secs.
+    client = FakeBrainClient()
+    g = _ctrl(client, playing=True, convo_hold_secs=30.0, window_secs=15.0)
+    assert g._convo_secs == 15.0

@@ -272,6 +272,18 @@ class BrainLLMService(LLMService):
         # 22:29:44). Cleared by the next real spoken turn (_process_context), so a genuine fresh bare wake
         # later in the session still greets normally.
         self._bare_wake_greeted = False
+        # Listen-first (the maintainer, 2026-06-19): a bare wake gets NO spoken greeting by default — she opens the floor
+        # and listens (the eye shows 'listening'), and speaks only in response to an actual command. A fixed
+        # timer greeting can't help a user who pauses to formulate (4s pause → greeting fired right as he began
+        # his command → barge-in cut her, 22:10:51 live). Default OFF; set BARE_WAKE_GREET=1 to restore the
+        # old "Yes? Did you need something?" prompt (kept behind the flag, still speech-aware when on).
+        self._bare_wake_greet = os.environ.get("BARE_WAKE_GREET", "0") not in ("0", "false", "False")
+        # Re-sleep: when she's woken FROM SLEEP by a bare wake and no command follows, return to sleep silently
+        # rather than lingering awake — "listen, wait, then go back to sleep if nothing comes" (the maintainer). A real
+        # command cancels it. Only armed on a wake-from-sleep bare wake (an already-awake bare wake just lets
+        # the gate's window idle-close). >= the wake window so a slow command still lands first.
+        self._resleep_secs = float(os.environ.get("BARE_WAKE_RESLEEP_SECS", "15.0"))
+        self._resleep_task: asyncio.Task | None = None
         # The in-flight reply turn, run as a cancellable task (NOT inline) so a mid-generation barge-in can
         # cancel it. Cancelling raises CancelledError inside `_consume` → POST /cancel reaches the brain AND
         # the token stream stops feeding TTS (she stays stopped, no resume). 2026-06-16: when this ran inline,
@@ -435,6 +447,8 @@ class BrainLLMService(LLMService):
           off a second bare "Hey Aria" / TTS bleed (the cause of the double greeting). Cleared by the next real
           spoken turn in _process_context.
         """
+        if not self._bare_wake_greet:
+            return  # listen-first: no spoken greeting on a bare wake (default)
         if self._user_speaking or self._bare_wake_greeted:
             return
         self._cancel_bare_wake_prompt()
@@ -444,6 +458,29 @@ class BrainLLMService(LLMService):
         if self._bare_wake_task is not None and not self._bare_wake_task.done():
             self._bare_wake_task.cancel()
         self._bare_wake_task = None
+
+    def _arm_resleep(self) -> None:
+        """Woken from sleep by a bare wake → if no command follows within `_resleep_secs`, return to sleep
+        silently (listen-first: she waited, nothing came). A real command/confirm cancels it (_cancel_resleep
+        at the command point); a fresh bare wake re-arms it. No spoken goodbye — going back to sleep is quiet."""
+        self._cancel_resleep()
+        self._resleep_task = asyncio.create_task(self._resleep())
+
+    def _cancel_resleep(self) -> None:
+        if self._resleep_task is not None and not self._resleep_task.done():
+            self._resleep_task.cancel()
+        self._resleep_task = None
+
+    async def _resleep(self) -> None:
+        try:
+            await asyncio.sleep(self._resleep_secs)
+        except asyncio.CancelledError:
+            return
+        if not self._sleeping:
+            self._sleeping = True
+            await self._set_sleep_gate(True)
+            _tlog("WAKE  | no command after wake-from-sleep — returning to sleep (silent)")
+        self._resleep_task = None
 
     async def _bare_wake_prompt(self) -> None:
         try:
@@ -562,6 +599,7 @@ class BrainLLMService(LLMService):
             # own denylist (arid/arise/…) and a wake token/phrase is still REQUIRED, so nameless chatter is
             # rejected exactly as before. After waking we DON'T greet: the shared wake-word handling below
             # (awake or just-woken) forwards a riding command and only prompts on a truly bare wake.
+            woke_from_sleep = False
             if self._sleeping:
                 tokens = low_norm.split()
                 has_wake = (any(_looks_like_vocative(v) for v in tokens)
@@ -571,6 +609,7 @@ class BrainLLMService(LLMService):
                     _tlog(f"ASLEEP| ignoring: {user_text!r}")
                     return
                 self._sleeping = False
+                woke_from_sleep = True
                 await self._set_sleep_gate(False)
                 _tlog(f"WAKE  | {user_text!r}")
                 # fall through to the shared wake-word handling below
@@ -580,6 +619,7 @@ class BrainLLMService(LLMService):
             # A stray sleep is self-correcting (wake up); the session-killing risk was shutdown-only.
             if not is_meta and not is_dictation and any(p in low_norm for p in _SLEEP_PHRASES):
                 self._sleeping = True
+                self._cancel_resleep()  # explicit sleep supersedes any pending wake-from-sleep re-sleep
                 await self._set_sleep_gate(True)
                 _tlog(f"SLEEP | {user_text!r}")
                 await self._speak("Going to sleep. Say 'wake up' when you need me.")
@@ -602,8 +642,14 @@ class BrainLLMService(LLMService):
             if self._pending_confirm is None:
                 had_wake, command, is_bare = _strip_leading_wake(user_text, low_norm)
                 if is_bare:
-                    self._arm_bare_wake_prompt()
-                    _tlog(f"VOCATIVE| {user_text!r} (bare wake — awaiting command, prompt if none follows)")
+                    # Listen-first: open the floor and LISTEN (the eye shows 'listening'); no spoken greeting
+                    # unless BARE_WAKE_GREET=1 (then _arm_bare_wake_prompt speaks). If this was a wake FROM
+                    # SLEEP, arm a silent re-sleep so she returns to sleep when no command follows.
+                    self._arm_bare_wake_prompt()  # no-op when listen-first (greeting disabled)
+                    if woke_from_sleep:
+                        self._arm_resleep()
+                    _tlog(f"VOCATIVE| {user_text!r} (bare wake — listening"
+                          f"{', re-sleep armed' if woke_from_sleep else ''})")
                     return
                 if had_wake:
                     user_text = command  # forward only what followed the wake word
@@ -611,8 +657,9 @@ class BrainLLMService(LLMService):
             # A real command / confirm answer is being processed → the bare-wake episode is genuinely over.
             # Clear the greeted latch here (not on every non-empty turn) so a fresh bare wake LATER greets
             # again, while a second bare wake WITHIN the episode stays latched (returns above before reaching
-            # this point).
+            # this point). A command also means the wake-from-sleep produced a real turn → cancel any re-sleep.
             self._bare_wake_greeted = False
+            self._cancel_resleep()
 
             # --- normal turn / confirm resume ---
             if self._pending_confirm is not None:

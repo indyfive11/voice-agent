@@ -43,6 +43,7 @@ from loguru import logger
 from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
     BotStoppedSpeakingFrame,
+    EndFrame,
     Frame,
     InterimTranscriptionFrame,
     SystemFrame,
@@ -80,6 +81,8 @@ class MediaDuckController(FrameProcessor):
         confirm_grace: float = 2.5,
         sustained_secs: float = 4.0,
         max_hold_secs: float = 120.0,
+        convo_hold_secs: float = 0.0,
+        window_secs: float = 15.0,
         should_duck: Callable[[], bool] | None = None,
         should_duck_onset: Callable[[], bool] | None = None,
         media_status: Callable[[], "dict|None"] | None = None,
@@ -108,6 +111,17 @@ class MediaDuckController(FrameProcessor):
         self._max_hold_secs = max_hold_secs
         self._bot_thinking = False
         self._hold_task: asyncio.Task | None = None
+        # Conversation-hold (2026-06-19): after an ADDRESSED reply over playing media, keep the bed ducked +
+        # the floor open across follow-up turns so the user can continue without re-waking and the bed doesn't
+        # bob down→up→down between turns. Owned here (the duck owner) with its OWN timer — the idle-grace can't
+        # serve: after a reply `_bot_spoke` is True, which gates `_arm_restore` off. Clamped to the wake
+        # `window_secs`: the gate already re-arms its command window for ~window_secs on every reply and its
+        # idle-close fires its own `_fire_duck(False)`, so keeping the hold ≤ window keeps the two in lockstep
+        # (they end together) AND gives a free second restore guarantee — no wake_word change, no stuck-window.
+        # 0 disables (today's immediate bot-stopped restore). Ended by: idle timer, sleep, or shutdown — every
+        # path calls `_restore` (a held duck with no pending restore is the one regression this guards against).
+        self._convo_secs = max(0.0, min(convo_hold_secs, window_secs)) if convo_hold_secs > 0 else 0.0
+        self._convo_task: asyncio.Task | None = None
         self._time = time_source or time.monotonic
         self._duck_started_at = 0.0
         # How long after speech *stops* to wait for a confirming transcription before treating the
@@ -170,10 +184,30 @@ class MediaDuckController(FrameProcessor):
                 if self._ducked and not self._bot_spoke:
                     self._arm_restore()
             return
+        # Sleep / shutdown: a held conversation-duck (or any in-flight duck) must not survive either. Both clear
+        # the hold and restore. WakeSleepFrame is pushed UPSTREAM by the brain and flows through here; lazy
+        # import avoids an import cycle (wake_word never imports this module). EndFrame is the pipeline-teardown
+        # frame — best-effort restore (fire-and-forget may not land before teardown; the brain owns the final
+        # volume restore), and it closes a pre-existing "duck left on at shutdown" gap the hold would worsen.
+        from wake_word import WakeSleepFrame
+
+        if isinstance(frame, WakeSleepFrame):
+            if frame.asleep and self._ducked:
+                self._cancel_convo()
+                self._restore("sleep")
+            return
+        if isinstance(frame, EndFrame):
+            if self._ducked:
+                self._cancel_convo()
+                self._restore("shutdown")
+            return
         if isinstance(frame, VADUserStartedSpeakingFrame):
             # Speech onset — duck immediately. Cancel any pending false-onset restore (still talking).
+            # Also cancel a pending conversation-hold restore: the user is following up, so the bed must
+            # stay ducked through this turn (its eventual BotStopped re-arms the hold).
             self._speech_in_flight = True
             self._cancel_confirm()
+            self._cancel_convo()
             self._duck_on("speech onset", allow=self._should_duck_onset)
         elif isinstance(frame, VADUserStoppedSpeakingFrame):
             # Speech segment ended. If this onset hasn't been confirmed by real words yet, start the
@@ -198,7 +232,17 @@ class MediaDuckController(FrameProcessor):
         elif isinstance(frame, BotStoppedSpeakingFrame):
             _tlog(f"DUCK  | bot-stopped (ducked={self._ducked})")
             if self._ducked:
-                self._restore("bot-stopped")
+                # Conversation-hold: an ADDRESSED reply (bot actually spoke) over still-ducked media → hold the
+                # bed ducked + floor open for a follow-up instead of restoring now. Asides (`_bot_spoke=False`)
+                # and the disabled case (`_convo_secs==0`) fall through to the normal immediate restore.
+                if self._convo_secs > 0 and self._bot_spoke:
+                    # Reset the per-turn flags so the next follow-up is a clean duck episode (the duck stays
+                    # physically on; `_duck_on` will no-op on it). The hold's own timer owns restore from here.
+                    self._bot_spoke = False
+                    self._confirmed = False
+                    self._arm_convo()
+                else:
+                    self._restore("bot-stopped")
         elif isinstance(frame, DuckReleaseFrame):
             # Brain says this turn was an aside (not addressed) → no reply is coming. Release the
             # pre-duck now rather than holding it for the idle grace. Keyed on the frame TYPE, which the
@@ -352,10 +396,35 @@ class MediaDuckController(FrameProcessor):
             self._hold_task.cancel()
         self._hold_task = None
 
+    # --- conversation-hold timer -------------------------------------------
+    def _arm_convo(self) -> None:
+        """Hold the bed ducked + floor open after an addressed reply, so a follow-up needs no re-wake and the
+        bed doesn't bob between turns. Refreshed (cancelled + re-armed) per turn: a follow-up's onset cancels
+        it, that turn's BotStopped re-arms it. On expiry (the conversation went quiet) restore — the primary
+        of the design's restore guarantees (the gate's own idle-close ~window_secs later is the backstop)."""
+        self._cancel_convo()
+        _tlog(f"DUCK  | convo-hold ({self._convo_secs:.0f}s) — bed stays ducked for a follow-up")
+
+        async def _later():
+            try:
+                await asyncio.sleep(self._convo_secs)
+                if self._ducked:
+                    self._restore("convo idle")
+            except asyncio.CancelledError:
+                pass
+
+        self._convo_task = asyncio.create_task(_later())
+
+    def _cancel_convo(self) -> None:
+        if self._convo_task is not None and not self._convo_task.done():
+            self._convo_task.cancel()
+        self._convo_task = None
+
     def _restore(self, reason: str = "?") -> None:
         self._cancel_restore()
         self._cancel_confirm()
         self._cancel_hold_ceiling()
+        self._cancel_convo()
         if self._ducked:
             self._ducked = False
             self._confirmed = False
