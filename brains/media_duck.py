@@ -230,6 +230,11 @@ class MediaDuckController(FrameProcessor):
             self._speech_in_flight = True
             self._cancel_confirm()
             self._cancel_convo()
+            # Clear any stale brain release intent at the start of every user turn. The flag is normally
+            # consumed at BotStopped, but a turn that ended another way (barge-in mid-reply, sleep, shutdown)
+            # never reaches that consume point — resetting on each onset stops it leaking into the next turn
+            # and wrongly suppressing that turn's conversation-hold.
+            self._convo_release_pending = False
             self._duck_on("speech onset", allow=self._should_duck_onset)
         elif isinstance(frame, VADUserStoppedSpeakingFrame):
             # Speech segment ended. If this onset hasn't been confirmed by real words yet, start the

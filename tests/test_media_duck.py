@@ -613,3 +613,31 @@ def test_convo_release_noop_when_disabled():
         assert g._convo_release_pending is False
 
     asyncio.run(go())
+
+
+def test_convo_release_flag_does_not_leak_across_turns():
+    # A release hint whose turn ends WITHOUT a BotStopped (here: sleep mid-reply) must not leak the flag into
+    # the next turn — that next addressed turn must still enter the conversation-hold normally.
+    from wake_word import WakeSleepFrame
+
+    client = FakeBrainClient()
+    g = _ctrl(client, playing=True, convo_hold_secs=5.0)
+
+    async def go():
+        g._handle(VADUserStartedSpeakingFrame())       # turn 1
+        await _drain()
+        g._handle(_transcript("what time is it"))
+        await _drain()
+        g._handle(ConvoReleaseFrame())                 # brain: terminal → flag set
+        await _drain()
+        assert g._convo_release_pending is True
+        g._handle(WakeSleepFrame(asleep=True))         # turn ends via sleep, NOT BotStopped
+        await _drain()
+        assert g._ducked is False
+        # turn 2: a fresh addressed turn must hold (flag must have been cleared by the new onset)
+        await _addressed_turn(g)
+
+    asyncio.run(go())
+    assert g._convo_release_pending is False
+    assert g._ducked is True
+    assert g._convo_task is not None                    # hold engaged — no leak
