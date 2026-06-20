@@ -79,6 +79,7 @@ class MediaDuckController(FrameProcessor):
         restore_grace: float = 8.0,
         confirm_grace: float = 2.5,
         sustained_secs: float = 4.0,
+        max_hold_secs: float = 120.0,
         should_duck: Callable[[], bool] | None = None,
         should_duck_onset: Callable[[], bool] | None = None,
         media_status: Callable[[], "dict|None"] | None = None,
@@ -96,6 +97,17 @@ class MediaDuckController(FrameProcessor):
         # an aside and let the idle-grace restore own it (fires ~restore_grace after speech truly stops); the
         # immediate aside-release then applies only to SHORT asides (the ambient-blip case it was built for).
         self._sustained_secs = sustained_secs
+        # Hold the bed ducked across the WHOLE brain think (BotThinkingFrame active=True → active=False),
+        # not just the `restore_grace` after speech stops. Media/TIDAL lookups run 15–60s (worst seen 64s,
+        # 2026-06-19 audit §1) — far longer than the 8s idle grace — so the grace fired mid-think and the
+        # music popped to full volume, then re-ducked when she finally replied (the "bob-up" the maintainer reported).
+        # `max_hold_secs` is a pure safety ceiling: BotThinkingFrame bracketing is bounded by the brain only
+        # by convention (per-tool timeouts, no single turn-level cap — gabagent audit 2026-06-19 Q1), so a
+        # pathological unbounded-but-finite turn could otherwise hold the bed ducked indefinitely. The ceiling
+        # restores the bed if a think runs absurdly long; it never fires on a real turn (120s ≫ 64s worst).
+        self._max_hold_secs = max_hold_secs
+        self._bot_thinking = False
+        self._hold_task: asyncio.Task | None = None
         self._time = time_source or time.monotonic
         self._duck_started_at = 0.0
         # How long after speech *stops* to wait for a confirming transcription before treating the
@@ -133,6 +145,31 @@ class MediaDuckController(FrameProcessor):
 
     # --- frame handling ----------------------------------------------------
     def _handle(self, frame: Frame) -> None:
+        # BotThinkingFrame brackets the whole brain turn (pushed UPSTREAM by BrainLLMService._set_thinking at
+        # turn start/finally). Imported lazily to avoid an import cycle at module load (turn_mute imports only
+        # dataclasses + pipecat, so this is safe). Checked first so the think-hold owns restore timing through
+        # a slow lookup. NOT keyed before the VAD branches because a BotThinkingFrame is never also a VAD frame.
+        from turn_mute import BotThinkingFrame
+
+        if isinstance(frame, BotThinkingFrame):
+            if frame.active:
+                # The brain accepted a real turn and is working; a reply (BotStopped) or an aside
+                # (DuckReleaseFrame) is coming however long it takes. Hold the duck: kill the false-onset
+                # confirm AND the idle-restore so neither pops the bed mid-think. Arm the safety ceiling.
+                self._bot_thinking = True
+                self._cancel_confirm()
+                self._cancel_restore()
+                if self._ducked:
+                    self._arm_hold_ceiling()
+            else:
+                # Think ended. A spoken reply already restored via BotStopped (not ducked here → no-op). A
+                # silent turn (empty model turn, or a turn that produced no bot speech and no aside) leaves the
+                # bed ducked — re-arm the idle grace as the safety net so it still restores.
+                self._bot_thinking = False
+                self._cancel_hold_ceiling()
+                if self._ducked and not self._bot_spoke:
+                    self._arm_restore()
+            return
         if isinstance(frame, VADUserStartedSpeakingFrame):
             # Speech onset — duck immediately. Cancel any pending false-onset restore (still talking).
             self._speech_in_flight = True
@@ -157,6 +194,7 @@ class MediaDuckController(FrameProcessor):
             self._bot_spoke = True
             self._cancel_confirm()
             self._cancel_restore()
+            self._cancel_hold_ceiling()  # she's replying — the think-hold ceiling is no longer needed
         elif isinstance(frame, BotStoppedSpeakingFrame):
             _tlog(f"DUCK  | bot-stopped (ducked={self._ducked})")
             if self._ducked:
@@ -291,9 +329,33 @@ class MediaDuckController(FrameProcessor):
             self._confirm_task.cancel()
         self._confirm_task = None
 
+    # --- think-hold safety ceiling ----------------------------------------
+    def _arm_hold_ceiling(self) -> None:
+        """Backstop the think-hold: if the brain stays "thinking" pathologically long (no reply, no aside, no
+        error — the unbounded-but-finite turn the gabagent audit flagged), restore the bed rather than hold it
+        ducked forever. Never fires on a real turn (max_hold_secs ≫ worst observed think)."""
+        self._cancel_hold_ceiling()
+
+        async def _later():
+            try:
+                await asyncio.sleep(self._max_hold_secs)
+                if self._ducked and not self._bot_spoke:
+                    _tlog(f"DUCK  | think-hold ceiling ({self._max_hold_secs:.0f}s) — restoring")
+                    self._restore("think-hold ceiling")
+            except asyncio.CancelledError:
+                pass
+
+        self._hold_task = asyncio.create_task(_later())
+
+    def _cancel_hold_ceiling(self) -> None:
+        if self._hold_task is not None and not self._hold_task.done():
+            self._hold_task.cancel()
+        self._hold_task = None
+
     def _restore(self, reason: str = "?") -> None:
         self._cancel_restore()
         self._cancel_confirm()
+        self._cancel_hold_ceiling()
         if self._ducked:
             self._ducked = False
             self._confirmed = False

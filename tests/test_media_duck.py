@@ -12,10 +12,13 @@ import asyncio
 from brains.brain_client import FakeBrainClient
 from brains.media_duck import DuckReleaseFrame, MediaDuckController
 from pipecat.frames.frames import (
+    BotStartedSpeakingFrame,
+    BotStoppedSpeakingFrame,
     TranscriptionFrame,
     VADUserStartedSpeakingFrame,
     VADUserStoppedSpeakingFrame,
 )
+from turn_mute import BotThinkingFrame
 
 
 class _Clock:
@@ -26,13 +29,14 @@ class _Clock:
         return self.t
 
 
-def _ctrl(client, *, playing: bool, confirm_grace=0.02, restore_grace=0.20):
+def _ctrl(client, *, playing: bool, confirm_grace=0.02, restore_grace=0.20, max_hold_secs=120.0):
     state = {"playing": playing}
     g = MediaDuckController(
         client,
         session_id="sess-test",
         confirm_grace=confirm_grace,
         restore_grace=restore_grace,
+        max_hold_secs=max_hold_secs,
         media_status=(lambda: dict(state)),
     )
     g._test_state = state  # tests can flip playback mid-turn
@@ -264,4 +268,88 @@ def test_short_aside_still_restores_immediately():
 
     asyncio.run(go())
     assert client.duck_calls == [("sess-test", True), ("sess-test", False)]  # restored (A1 preserved)
+    assert g._ducked is False
+
+
+# --- hold the duck through the WHOLE brain think (BotThinkingFrame), with a safety ceiling (2026-06-19) ---
+def test_thinking_holds_duck_past_restore_grace():
+    # The bob-up fix: a confirmed command arms the short idle restore, but the brain then starts a slow
+    # lookup (BotThinkingFrame active). The think-hold must cancel that restore so the bed stays ducked past
+    # restore_grace — no pop to full volume mid-think.
+    client = FakeBrainClient()
+    g = _ctrl(client, playing=True, confirm_grace=5.0, restore_grace=0.03)
+
+    async def go():
+        g._handle(VADUserStartedSpeakingFrame())     # duck on
+        await _drain()
+        g._handle(_transcript("play my playlist"))    # confirmed → arms the 0.03 idle restore
+        await _drain()
+        g._handle(BotThinkingFrame(active=True))      # brain working → cancel restore, hold the duck
+        await asyncio.sleep(0.08)                      # well past restore_grace
+        await _drain()
+    asyncio.run(go())
+    assert client.duck_calls == [("sess-test", True)]  # still ducked — no mid-think restore
+    assert g._ducked is True and g._bot_thinking is True
+
+
+def test_thinking_end_rearms_restore_for_silent_turn():
+    # A turn that thinks then produces NO bot speech and no aside (empty model turn) must not leave the bed
+    # stuck ducked: active=False re-arms the idle grace, which then restores.
+    client = FakeBrainClient()
+    g = _ctrl(client, playing=True, confirm_grace=5.0, restore_grace=0.03)
+
+    async def go():
+        g._handle(VADUserStartedSpeakingFrame())
+        await _drain()
+        g._handle(VADUserStoppedSpeakingFrame())        # user finished speaking the command
+        g._handle(_transcript("what's the weather"))
+        await _drain()
+        g._handle(BotThinkingFrame(active=True))        # hold
+        await asyncio.sleep(0.06)
+        g._handle(BotThinkingFrame(active=False))        # think ended, no bot speech → re-arm restore
+        await asyncio.sleep(0.06)                        # restore_grace elapses
+        await _drain()
+    asyncio.run(go())
+    assert client.duck_calls == [("sess-test", True), ("sess-test", False)]
+    assert g._ducked is False and g._bot_thinking is False
+
+
+def test_normal_fast_turn_restores_exactly_once():
+    # No regression on a normal turn: duck → think → bot speaks → bot stops → exactly one ON and one OFF.
+    client = FakeBrainClient()
+    g = _ctrl(client, playing=True, confirm_grace=5.0, restore_grace=5.0)
+
+    async def go():
+        g._handle(VADUserStartedSpeakingFrame())
+        await _drain()
+        g._handle(_transcript("pause the music"))
+        await _drain()
+        g._handle(BotThinkingFrame(active=True))        # hold through the think
+        await _drain()
+        g._handle(BotStartedSpeakingFrame())            # reply begins
+        g._handle(BotThinkingFrame(active=False))        # think ends as she speaks (bot_spoke → no re-arm)
+        await _drain()
+        g._handle(BotStoppedSpeakingFrame())            # reply ends → restore
+        await _drain()
+    asyncio.run(go())
+    assert client.duck_calls == [("sess-test", True), ("sess-test", False)]
+    assert g._ducked is False
+
+
+def test_think_hold_ceiling_restores_after_max_hold():
+    # The safety ceiling: if the brain stays "thinking" pathologically long (no reply, no aside, no error),
+    # restore rather than hold the bed ducked forever. Short max_hold so the test exercises the backstop.
+    client = FakeBrainClient()
+    g = _ctrl(client, playing=True, confirm_grace=5.0, restore_grace=5.0, max_hold_secs=0.05)
+
+    async def go():
+        g._handle(VADUserStartedSpeakingFrame())
+        await _drain()
+        g._handle(_transcript("play something"))
+        await _drain()
+        g._handle(BotThinkingFrame(active=True))         # hold + arm the 0.05s ceiling
+        await asyncio.sleep(0.12)                          # ceiling fires (no reply ever came)
+        await _drain()
+    asyncio.run(go())
+    assert client.duck_calls == [("sess-test", True), ("sess-test", False)]
     assert g._ducked is False

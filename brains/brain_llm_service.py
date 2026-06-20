@@ -30,6 +30,8 @@ from pipecat.frames.frames import (
     LLMFullResponseStartFrame,
     LLMTextFrame,
     TTSSpeakFrame,
+    VADUserStartedSpeakingFrame,
+    VADUserStoppedSpeakingFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.llm_service import LLMService
@@ -258,6 +260,18 @@ class BrainLLMService(LLMService):
         # asking "did you need something?" — a following command cancels the wait (see _arm/_cancel).
         self._bare_wake_delay = float(os.environ.get("BARE_WAKE_PROMPT_DELAY", "3.5"))
         self._bare_wake_task: asyncio.Task | None = None
+        # The blind bare-wake timer used to fire even while the user was mid-command (it only cancelled on a
+        # NEW transcript, which Whisper delivers seconds late) → "Yes? Did you need something?" talked OVER the
+        # command and its bot-stop un-ducked the music mid-repeat (2026-06-18 22:29). Track in-flight user
+        # speech off VADUserStartedSpeakingFrame (a SystemFrame that reaches this service unmuted at onset —
+        # the same onset the upstream duck controller acts on) so the greeting can be cancelled/skipped the
+        # instant the user starts answering, not only once the transcript lands.
+        self._user_speaking = False
+        # Refractory latch: once we've greeted (or are awaiting the command after a bare wake), don't RE-ARM
+        # the timer off a second bare "Hey Aria" / TTS bleed — that re-arm is what double-greeted (22:29:40 +
+        # 22:29:44). Cleared by the next real spoken turn (_process_context), so a genuine fresh bare wake
+        # later in the session still greets normally.
+        self._bare_wake_greeted = False
         # The in-flight reply turn, run as a cancellable task (NOT inline) so a mid-generation barge-in can
         # cancel it. Cancelling raises CancelledError inside `_consume` → POST /cancel reaches the brain AND
         # the token stream stops feeding TTS (she stays stopped, no resume). 2026-06-16: when this ran inline,
@@ -290,6 +304,20 @@ class BrainLLMService(LLMService):
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         """Handle LLMContextFrame by streaming the brain's reply; forward everything else."""
         await super().process_frame(frame, direction)
+
+        # Observe user-speech VAD onset/stop so the bare-wake greeting is speech-aware (see _user_speaking).
+        # These are SystemFrames — observe and push through (do NOT consume); the duck controller / aggregators
+        # downstream still need them. Onset also cancels any pending greeting outright: the user is answering,
+        # so a "did you need something?" must never land on top of the command.
+        if isinstance(frame, VADUserStartedSpeakingFrame):
+            self._user_speaking = True
+            self._cancel_bare_wake_prompt()
+            await self.push_frame(frame, direction)
+            return
+        if isinstance(frame, VADUserStoppedSpeakingFrame):
+            self._user_speaking = False
+            await self.push_frame(frame, direction)
+            return
 
         from wake_word import StopWordFrame
 
@@ -398,8 +426,17 @@ class BrainLLMService(LLMService):
 
     def _arm_bare_wake_prompt(self) -> None:
         """User said only the wake word: wait `_bare_wake_delay`, then ask "did you need something?" — but
-        a command arriving first cancels it (the natural pause before you answer a hanging name). Re-arming
-        resets the wait (a second "Hey Aria" means keep waiting)."""
+        a command arriving first cancels it (the natural pause before you answer a hanging name).
+
+        Two guards stop the greeting from talking over a command or doubling (2026-06-18 22:29):
+        - `_user_speaking`: a speech onset already arrived (the user is answering, but the command transcript
+          lags behind the bare-wake transcript) — skip; don't greet over the command.
+        - `_bare_wake_greeted`: we've already greeted / are awaiting the command this episode — skip the re-arm
+          off a second bare "Hey Aria" / TTS bleed (the cause of the double greeting). Cleared by the next real
+          spoken turn in _process_context.
+        """
+        if self._user_speaking or self._bare_wake_greeted:
+            return
         self._cancel_bare_wake_prompt()
         self._bare_wake_task = asyncio.create_task(self._bare_wake_prompt())
 
@@ -419,6 +456,9 @@ class BrainLLMService(LLMService):
         self._reply_buf = []
         await self._speak(_BARE_WAKE_PROMPT, immediate=True)
         _tlog("BOT   | " + _BARE_WAKE_PROMPT)
+        # Latch: greeted this episode — a second bare wake / TTS bleed must not re-arm a second greeting.
+        # Cleared by the next real spoken turn (_process_context).
+        self._bare_wake_greeted = True
         self._bare_wake_task = None
 
     async def _hold_wake(self, hold: bool) -> None:
@@ -486,6 +526,10 @@ class BrainLLMService(LLMService):
         try:
             # A new spoken turn answers any pending "did you need something?" prompt, so cancel it (a bare
             # wake below re-arms the wait). A blank/blip turn isn't a real utterance — leave it pending.
+            # NOTE: the greeted latch is NOT cleared here — a *second bare wake* (incl. greeting TTS bleeding
+            # back as "Hey Aria" with no fresh VAD onset, the 22:29:40 / 11:44:00 double) is also a non-empty
+            # turn, and clearing here would let it re-arm a second greeting. The latch is cleared only on a
+            # real command / confirm turn below (the episode is genuinely over there).
             if user_text.strip():
                 self._cancel_bare_wake_prompt()
 
@@ -563,6 +607,12 @@ class BrainLLMService(LLMService):
                     return
                 if had_wake:
                     user_text = command  # forward only what followed the wake word
+
+            # A real command / confirm answer is being processed → the bare-wake episode is genuinely over.
+            # Clear the greeted latch here (not on every non-empty turn) so a fresh bare wake LATER greets
+            # again, while a second bare wake WITHIN the episode stays latched (returns above before reaching
+            # this point).
+            self._bare_wake_greeted = False
 
             # --- normal turn / confirm resume ---
             if self._pending_confirm is not None:
