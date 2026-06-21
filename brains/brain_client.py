@@ -86,8 +86,14 @@ class BrainEvent:
 class BrainClient(Protocol):
     """What voice-agent needs from any brain. Implementations are async generators."""
 
-    def respond(self, session_id: str, text: str) -> AsyncIterator[BrainEvent]:
-        """Stream the brain's reply to a user utterance."""
+    def respond(self, session_id: str, text: str, wake: dict | None = None) -> AsyncIterator[BrainEvent]:
+        """Stream the brain's reply to a user utterance.
+
+        `wake` (item C, optional): the out-of-band acoustic wake signal, attached only when the voice-side
+        wake-strip failed to find the name in a garbled transcript ("Hey Aria"→"how are you?"). Shape:
+        {"bare_wake_likelihood": 0..1, "confidence": 0..1, "post_wake_voiced_ms"?: int, "speech_dur_ms"?: int}.
+        The brain uses `bare_wake_likelihood` to move a wake-suspect turn off the zero-latency fast-pass into a
+        careful listen-first classify. Absent → exact prior behavior (back-compat)."""
         ...
 
     def confirm(
@@ -142,6 +148,7 @@ class FakeBrainClient:
         self._delay = delay
         self.closed = False
         self.respond_calls: list[tuple[str, str]] = []
+        self.respond_wake: list[dict | None] = []  # item C: the `wake` obj carried on each respond() call
         self.confirm_calls: list[tuple[str, str, bool, str | None]] = []
         self.cancel_calls: list[str] = []
         self.duck_calls: list[tuple[str, bool]] = []
@@ -151,8 +158,9 @@ class FakeBrainClient:
         self.media_state_calls = 0  # how many times media_state() was queried (debounce tests)
         self.media_state_bot_speaking: list[bool] = []  # bot_speaking carried on each media_state() poll
 
-    async def respond(self, session_id: str, text: str) -> AsyncIterator[BrainEvent]:
+    async def respond(self, session_id: str, text: str, wake: dict | None = None) -> AsyncIterator[BrainEvent]:
         self.respond_calls.append((session_id, text))
+        self.respond_wake.append(wake)
         for ev in self._respond_events:
             if self._delay:
                 await asyncio.sleep(self._delay)

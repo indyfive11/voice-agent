@@ -61,6 +61,19 @@ run, same as v1.
   **heartbeat refresh**, so a long reply's TTS — which produces no incoming user speech — can't outlive
   the brain's watchdog grace and pop the ducked bed mid-narration. Coupled invariant: the brain's
   `duck_watchdog_secs` must stay **above** the voice `convo_hold` (currently 20 > 8).
+- **`wake` object on `/respond` (item C — out-of-band acoustic wake signal):** STT fluently mis-expands a
+  bare "Hey Aria" into "how are you?"/"Hey!" — an eval over 225 model-confirmed wake clips found ~80% of
+  wakes over music lose the name in the transcript in a text-unrecoverable way (no STT engine fixes it;
+  the evidence only survives in the audio). So on the strip-failed path (the common case — the voice-side
+  wake-strip found no name, `had_wake=False`) the voice side attaches an optional `wake` object to the
+  `/respond` body: `{bare_wake_likelihood (0..1, duration-dominant fusion of the detector score + the VAD
+  speech span), confidence, post_wake_voiced_ms?, speech_dur_ms?}`. The brain uses `bare_wake_likelihood`
+  to move a wake-suspect turn OFF its zero-latency fast-pass INTO a careful listen-first classify — it can
+  never directly eat a turn (two-key: the audio likelihood + the brain's text-LLM must both agree it's
+  content-free), so a real short command ("Aria, stop") still answers. Emitted only on a FRESH acoustic
+  wake (a `WakeEventFrame` the gate pushes downstream), consumed per-turn. Producer gated by
+  `WAKE_SIGNAL_FORWARD` (default on); brain threshold `GABAI_VOICE_BARE_WAKE_THRESHOLD` (default 0.8),
+  kill-switch `GABAI_VOICE_WAKE_CONFIDENCE_FILTER`. Absent `wake` → exact prior behavior (back-compat).
 - **Naming debt:** the contract still carries brain-specific names (`gabagent.duck_exclude`,
   `/media/*`). Decoupling is tracked publicly as GitHub #1.
 

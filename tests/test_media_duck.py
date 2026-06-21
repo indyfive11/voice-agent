@@ -29,6 +29,36 @@ class _Clock:
         return self.t
 
 
+def test_onset_duck_stands_down_during_provisional_wake_from_sleep():
+    # 2026-06-20: a FAILED wake-from-sleep (she wakes on "Hey Aria", re-sleep armed, no command lands, dozes
+    # again) must NOT dip the music. config wires should_duck_ONSET to stand down while is_resleep_pending,
+    # while should_duck (confirmed-speech) does NOT — so a real command after the wake still ducks.
+    import config
+    from brains.brain_llm_service import BrainLLMService
+
+    class _Gate:
+        def duck_allowed(self):
+            return True
+
+        def duck_onset_allowed(self):
+            return True
+
+    svc = BrainLLMService(FakeBrainClient(), session_id="s")
+    g = config.build_media_duck(svc, gate=_Gate())
+
+    async def go():
+        assert g._should_duck_onset() is True          # awake, no resleep → onset ducks normally
+        svc._arm_resleep()                              # provisional wake-from-sleep window
+        assert svc.is_resleep_pending is True
+        assert g._should_duck_onset() is False          # onset stands down (failed wake won't dip music)
+        assert g._should_duck() is True                 # but a confirmed command still ducks
+        svc._cancel_resleep()                           # a real command cancels the re-sleep
+        assert svc.is_resleep_pending is False
+        assert g._should_duck_onset() is True           # back to normal ducking
+
+    asyncio.run(go())
+
+
 def _ctrl(client, *, playing: bool, confirm_grace=0.02, restore_grace=0.20, max_hold_secs=120.0,
           convo_hold_secs=0.0, window_secs=15.0):
     state = {"playing": playing}

@@ -18,6 +18,7 @@ import asyncio
 import os
 import re
 import shutil
+import time
 import uuid
 
 from loguru import logger
@@ -177,7 +178,10 @@ _WAKE_LEADINS = frozenset(("hey", "ok", "okay", "yo", "hi", "hello", "um", "uh",
 # Spoken only when the user says the wake word alone and never follows with a command (after a short wait).
 # Natural-conversation flow: you answer the command after your name, not the name itself — and you ask
 # "did you need something?" only when the name is left hanging (2026-06-15, the maintainer).
-_BARE_WAKE_PROMPT = "Yes? Did you need something?"
+# Spoken on a bare wake ("Hey Aria" with no command) ONLY when no media is playing and BARE_WAKE_GREET=1
+# — a short, prompt name-acknowledgment (the user, 2026-06-20: a quick "Yes?", not a chatty line). Override with
+# BARE_WAKE_GREET_PHRASE.
+_BARE_WAKE_PROMPT = os.environ.get("BARE_WAKE_GREET_PHRASE", "Yes?")
 
 # Spoken when a turn fails because the brain dropped mid-request (crash / connection lost). Without an
 # audible signal the turn just vanishes into dead air and the user waits on a reply that will never come
@@ -220,6 +224,36 @@ def _strip_leading_wake(user_text: str, low_norm: str) -> tuple[bool, str, bool]
     residual = [w for w in toks[consumed:] if w not in _COMMAND_FILLERS and not _looks_like_vocative(w)]
     command = " ".join(user_text.split()[consumed:])
     return True, command, not residual
+
+
+def _fuse_bare_wake_likelihood(score: float, post_wake_ms: float | None, speech_dur_ms: float | None, *,
+                               post_floor: float, post_ceil: float,
+                               dur_floor: float, dur_ceil: float) -> float:
+    """Fuse the acoustic wake into a 0..1 likelihood this utterance was NOTHING but the wake word (item C).
+
+    POST-WAKE-DOMINANT — the discriminator the brain physically can't compute (it never sees audio): a bare
+    wake = the wake fires and then ~nothing follows (small post-wake span); a command = the wake then the
+    command words (large post-wake span). post_wake separates them even when TOTAL durations overlap (a slow
+    bare wake can run longer than a fast command, so total duration alone inverts — bare 0.49 < command 0.67,
+    live 2026-06-20). Below `post_floor` → ~bare; above `post_ceil` → ~command. Falls back to total
+    speech_dur only when post can't be measured (wake at/after the VAD stop, e.g. the name trailing a
+    sentence). conf gates it (a marginal wake can't yield a high likelihood). Neither measurable → 0.5*conf
+    (deliberately under the brain's 0.8 suppress floor — never aggressively suppress on a blind guess).
+
+    The band is a CROSS-HARDWARE DEFAULT — a best guess from our condenser + reSpeaker data (bare post ~130ms;
+    command post ~1000-4100ms), tunable per deployment. On a clean mic this path rarely fires (STT recognizes
+    the bare wake → it never reaches here); it's the backstop for setups where STT garbles "Hey Aria". The
+    brain's LLM is the second key on every high score, so the band only needs to be roughly right."""
+    conf = max(0.0, min(1.0, score))
+    if post_wake_ms is not None:
+        span = max(1.0, post_ceil - post_floor)
+        x = max(0.0, min(1.0, (post_ceil - post_wake_ms) / span))
+        return round(x * conf, 3)
+    if speech_dur_ms is not None:
+        span = max(1.0, dur_ceil - dur_floor)
+        x = max(0.0, min(1.0, (dur_ceil - speech_dur_ms) / span))
+        return round(x * conf, 3)
+    return round(0.5 * conf, 3)
 
 
 def _tlog(message: str) -> None:
@@ -290,6 +324,23 @@ class BrainLLMService(LLMService):
         # `broadcast_interruption()` flushed the current TTS buffer but never cancelled this service's own
         # task, so a long reply kept streaming and she resumed ~5s after the barge.
         self._turn_task: asyncio.Task | None = None
+        # Item C — out-of-band acoustic wake signal. A fresh WakeEventFrame (from the upstream gate) stamps
+        # _pending_wake; consumed by exactly the next turn. VAD edges give the turn's speech duration, which
+        # fuses (duration-dominant) into a `bare_wake_likelihood` forwarded on /respond when the voice-side
+        # wake-strip fails to find the name in a garbled transcript ("Hey Aria"→"how are you?"). Lets the
+        # brain's listen-first guard trust the audio over the text. No emitting gate → _pending_wake stays
+        # None → exact current behavior (back-compat).
+        self._pending_wake: dict | None = None  # {"score": float, "ts": monotonic}
+        self._vad_start_ts: float | None = None
+        self._vad_stop_ts: float | None = None
+        # Post-wake-dominant fusion band (cross-hardware default; see _fuse_bare_wake_likelihood). post = speech
+        # after the wake fires: bare wake ~130ms, command ~1000ms+. dur_* is the fallback when post is
+        # unmeasurable (name trailing a sentence).
+        self._wake_post_floor_ms = float(os.environ.get("WAKE_BARE_POST_FLOOR_MS", "250"))
+        self._wake_post_ceil_ms = float(os.environ.get("WAKE_BARE_POST_CEIL_MS", "1000"))
+        self._wake_dur_floor_ms = float(os.environ.get("WAKE_BARE_DUR_FLOOR_MS", "400"))
+        self._wake_dur_ceil_ms = float(os.environ.get("WAKE_BARE_DUR_CEIL_MS", "1500"))
+        self._wake_signal_max_age = 30.0  # ignore a stale pending wake that produced no prompt turn
         # Log the correlation key so the transcript can be lined up with the brain's own logs.
         _tlog(f"BRAIN | gabagent session_id={self._session_id}")
 
@@ -313,6 +364,16 @@ class BrainLLMService(LLMService):
         """True while asleep (used to gate media ducking — nothing to make room for)."""
         return self._sleeping
 
+    @property
+    def is_resleep_pending(self) -> bool:
+        """True in the provisional window after a wake-FROM-SLEEP bare wake, before any command lands (a
+        re-sleep timer is armed; she's listening but will doze again if nothing comes). Gates the media
+        ONSET duck only: a FAILED wake-from-sleep (she wakes on "Hey Aria", no command follows, re-sleeps)
+        shouldn't dip the music for nothing (2026-06-20 — the user heard the bed flap on each failed wake). A real
+        command cancels the re-sleep, and its confirmed-speech still ducks via should_duck (not gated here)."""
+        t = self._resleep_task
+        return t is not None and not t.done()
+
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         """Handle LLMContextFrame by streaming the brain's reply; forward everything else."""
         await super().process_frame(frame, direction)
@@ -323,15 +384,31 @@ class BrainLLMService(LLMService):
         # so a "did you need something?" must never land on top of the command.
         if isinstance(frame, VADUserStartedSpeakingFrame):
             self._user_speaking = True
+            # item C: capture the FIRST onset of the turn only — a multi-segment utterance (VAD flickers on
+            # internal pauses) must measure the full span, not just the last fragment. (Bug 2026-06-20: resetting
+            # on every onset made "Play some Led Zeppelin" measure 227ms = just "...Zeppelin".) Reset to None at
+            # the turn boundary (_process_context finally), so the next turn captures its own first onset.
+            if self._vad_start_ts is None:
+                self._vad_start_ts = time.monotonic()
             self._cancel_bare_wake_prompt()
             await self.push_frame(frame, direction)
             return
         if isinstance(frame, VADUserStoppedSpeakingFrame):
             self._user_speaking = False
+            self._vad_stop_ts = time.monotonic()  # last stop wins → span = first onset … last stop
             await self.push_frame(frame, direction)
             return
 
-        from wake_word import StopWordFrame
+        from wake_word import StopWordFrame, WakeEventFrame
+
+        if isinstance(frame, WakeEventFrame):
+            # Item C: a FRESH acoustic wake fired upstream. Stamp it for the next turn (consume-and-clear in
+            # _process_context). Carries the detector score; combined with this turn's VAD span it tells the
+            # brain whether the (often garbled) transcript was really just the wake word. Push through — it's
+            # a harmless SystemFrame to everything downstream.
+            self._pending_wake = {"score": float(frame.score), "ts": time.monotonic()}
+            await self.push_frame(frame, direction)
+            return
 
         if isinstance(frame, StopWordFrame):
             # The wake gate detected the interrupt/stop word mid bot-turn. Two actions, both needed:
@@ -487,6 +564,17 @@ class BrainLLMService(LLMService):
             await asyncio.sleep(self._bare_wake_delay)
         except asyncio.CancelledError:
             return
+        # The user (2026-06-20): NEVER greet while ANY media is playing — the auto-duck already signals she's
+        # listening, and a spoken "Yes?" inevitably talks over the command. Greet only in a quiet room. Poll
+        # is best-effort; None (no media capability / brain unreachable) → treat as not-playing and greet (the
+        # "generally nice to hear something" default). Checked at FIRE time so a track that started during the
+        # delay is honored.
+        ms = await self._client.media_state(self._session_id)
+        if ms and ms.get("playing"):
+            _tlog("WAKE  | bare wake — media playing, duck is the ack (no greeting)")
+            self._bare_wake_greeted = True
+            self._bare_wake_task = None
+            return
         # No command followed the bare wake — prompt once. immediate=True so the short standalone phrase
         # isn't held in the TTS sentence aggregator (see _speak). Logged as its own BOT line.
         _tlog("WAKE  | bare wake unanswered — prompting")
@@ -553,6 +641,37 @@ class BrainLLMService(LLMService):
         from tts_gain import VoiceVolumeFrame
 
         await self.push_frame(VoiceVolumeFrame(op=op or "set", value=value), FrameDirection.DOWNSTREAM)
+
+    def _consume_wake_signal(self) -> dict | None:
+        """Pop a fresh acoustic wake (item C) and fuse it into a `wake` object for /respond. Consume-and-clear:
+        a wake initiates exactly ONE turn. Returns None if there's no fresh wake or it's stale. Built only on
+        the strip-failed path (the caller gates that), so a clean wake/command never carries a redundant signal."""
+        pw = self._pending_wake
+        self._pending_wake = None
+        if pw is None:
+            return None
+        if time.monotonic() - pw["ts"] > self._wake_signal_max_age:
+            return None  # the wake never produced a prompt turn → drop it
+        # This turn's speech span (VAD onset→offset) and the speech AFTER the wake fired (raw features for the
+        # brain to calibrate the threshold against receipts; the likelihood is duration-dominant).
+        speech_dur_ms = post_wake_ms = None
+        if (self._vad_start_ts is not None and self._vad_stop_ts is not None
+                and self._vad_stop_ts >= self._vad_start_ts):
+            speech_dur_ms = round((self._vad_stop_ts - self._vad_start_ts) * 1000)
+        if self._vad_stop_ts is not None and self._vad_stop_ts >= pw["ts"]:
+            post_wake_ms = round((self._vad_stop_ts - pw["ts"]) * 1000)
+            if speech_dur_ms is not None:
+                post_wake_ms = min(post_wake_ms, speech_dur_ms)  # post-wake is a subset of total — clamp frame jitter
+        likelihood = _fuse_bare_wake_likelihood(
+            pw["score"], post_wake_ms, speech_dur_ms,
+            post_floor=self._wake_post_floor_ms, post_ceil=self._wake_post_ceil_ms,
+            dur_floor=self._wake_dur_floor_ms, dur_ceil=self._wake_dur_ceil_ms)
+        wake = {"bare_wake_likelihood": likelihood, "confidence": round(float(pw["score"]), 3)}
+        if post_wake_ms is not None:
+            wake["post_wake_voiced_ms"] = post_wake_ms
+        if speech_dur_ms is not None:
+            wake["speech_dur_ms"] = speech_dur_ms
+        return wake
 
     async def _process_context(self, context):
         user_text = self._latest_user_text(context)
@@ -661,6 +780,7 @@ class BrainLLMService(LLMService):
                     # Listen-first: open the floor and LISTEN (the eye shows 'listening'); no spoken greeting
                     # unless BARE_WAKE_GREET=1 (then _arm_bare_wake_prompt speaks). If this was a wake FROM
                     # SLEEP, arm a silent re-sleep so she returns to sleep when no command follows.
+                    self._pending_wake = None  # clean bare wake — STT got the name; handled voice-side
                     self._arm_bare_wake_prompt()  # no-op when listen-first (greeting disabled)
                     if woke_from_sleep:
                         self._arm_resleep()
@@ -669,6 +789,7 @@ class BrainLLMService(LLMService):
                     return
                 if had_wake:
                     user_text = command  # forward only what followed the wake word
+                    self._pending_wake = None  # name survived in the text → no out-of-band signal needed
 
             # A real command / confirm answer is being processed → the bare-wake episode is genuinely over.
             # Clear the greeted latch here (not on every non-empty turn) so a fresh bare wake LATER greets
@@ -694,10 +815,22 @@ class BrainLLMService(LLMService):
                     _tlog(f"USER  | {user_text!r}  (confirm decision: approved={approved})")
                     stream = self._client.confirm(self._session_id, pending["id"], approved)
             else:
-                _tlog(f"USER  | {user_text!r}")
-                stream = self._client.respond(self._session_id, user_text)
+                # Item C: on the strip-failed path (the COMMON case over music — STT lost/garbled the name,
+                # `had_wake=False`) forward the out-of-band acoustic wake signal so the brain's listen-first
+                # guard can trust the audio over the text. Clean wake/command turns cleared _pending_wake
+                # above, so this is None for them (back-compat).
+                wake_obj = None if had_wake else self._consume_wake_signal()
+                _tlog(f"USER  | {user_text!r}" + (
+                    f"  (wake-signal bwl={wake_obj['bare_wake_likelihood']:.2f} "
+                    f"conf={wake_obj['confidence']:.2f} dur={wake_obj.get('speech_dur_ms')}ms "
+                    f"post={wake_obj.get('post_wake_voiced_ms')}ms)" if wake_obj else ""))
+                stream = self._client.respond(self._session_id, user_text, wake=wake_obj)
             await self._consume(stream)
         finally:
+            # Turn boundary: clear the VAD span so the NEXT turn captures its own first-onset … last-stop
+            # (item C — the span must not bleed across turns; runs on every exit path, incl. early returns).
+            self._vad_start_ts = None
+            self._vad_stop_ts = None
             if self._reply_buf:
                 _tlog("BOT   | " + " ".join(self._reply_buf))
 

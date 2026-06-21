@@ -592,20 +592,25 @@ def build_media_duck(llm, gate=None):
     window_secs = float(_env("WAKE_WINDOW_SECS", "15"))
     require_wake = _env("DUCK_REQUIRE_WAKE", "1") not in ("0", "false", "False")
     gate_duck = gate is not None and require_wake and hasattr(gate, "duck_allowed")
+    # The ONSET duck (raw VAD onset) additionally stands down while a wake-from-sleep is PROVISIONAL
+    # (is_resleep_pending): she woke on "Hey Aria" but no command has landed, so a FAILED wake-from-sleep
+    # mustn't dip the music for nothing (2026-06-20 — the bed flapped on each failed wake). A real command
+    # cancels the re-sleep and still ducks via the confirmed-speech path (should_duck, NOT gated on resleep).
     if gate_duck:
         should_duck = lambda: not llm.is_sleeping and gate.duck_allowed()
         # Raw VAD-onset duck uses the STRICTER gate (duck_onset_allowed): over playing media it ducks only
         # in a fresh-wake window, not the keepalive/idle tail (where the held-open window over the song the
         # user just started would otherwise make the music's own VAD onsets dip the bed — 2026-06-16). A real
-        # follow-up command still ducks via the confirmed-speech path (should_duck). Older gates without the
-        # method fall back to should_duck (no behaviour change).
+        # follow-up command still ducks via the confirmed-speech path (should_duck).
         if hasattr(gate, "duck_onset_allowed"):
-            should_duck_onset = lambda: not llm.is_sleeping and gate.duck_onset_allowed()
+            should_duck_onset = lambda: (not llm.is_sleeping and not llm.is_resleep_pending
+                                         and gate.duck_onset_allowed())
         else:
-            should_duck_onset = should_duck
+            should_duck_onset = lambda: (not llm.is_sleeping and not llm.is_resleep_pending
+                                         and gate.duck_allowed())
     else:
         should_duck = lambda: not llm.is_sleeping
-        should_duck_onset = should_duck
+        should_duck_onset = lambda: not llm.is_sleeping and not llm.is_resleep_pending
     logger.info(
         f"Media ducking: on VAD speech onset (min_words={min_words}, "
         f"confirm_grace={confirm_grace}s, restore_grace={restore_grace}s, "
@@ -802,6 +807,11 @@ def build_wake_word_gate(llm):
     interrupt_consec_frames = int(_env("WAKE_INTERRUPT_CONSEC", "2"))
     interrupt_refractory_secs = float(_env("WAKE_INTERRUPT_REFRACTORY", "1.0"))
     interrupt_arm_delay_secs = float(_env("WAKE_INTERRUPT_ARM_DELAY", "1.0"))
+    # Item C: emit a WakeEventFrame on a fresh acoustic wake so the brain can trust the audio over an STT
+    # transcript that mis-expands "Hey Aria"→"how are you?" (eval: ~80% of wakes over music lose the name in
+    # the text). Default on; WAKE_SIGNAL_FORWARD=0 disables the producer (brain then sees no `wake` → current
+    # behavior). Mirrors GA's GABAI_VOICE_WAKE_CONFIDENCE_FILTER kill-switch.
+    emit_wake_events = _env("WAKE_SIGNAL_FORWARD", "1") not in ("0", "false", "False")
     speex_ns = False  # openWakeWord-only; set below when that engine is selected
     extra_log = ""
 
@@ -872,6 +882,7 @@ def build_wake_word_gate(llm):
         + (f" interrupt=on@{interrupt_threshold if interrupt_threshold is not None else threshold}"
            f"/consec{interrupt_consec_frames}/arm{interrupt_arm_delay_secs:.1f}s" if interrupt_enabled else "")
         + (" speex_ns=on" if speex_ns else "")
+        + (" wake-signal=on" if emit_wake_events else " wake-signal=off")
         + extra_log
         + (f" debug=on floor={debug_floor}" if debug else "")
     )
@@ -904,6 +915,7 @@ def build_wake_word_gate(llm):
         interrupt_consec_frames=interrupt_consec_frames,
         interrupt_refractory_secs=interrupt_refractory_secs,
         interrupt_arm_delay_secs=interrupt_arm_delay_secs,
+        emit_wake_events=emit_wake_events,
     )
 
 

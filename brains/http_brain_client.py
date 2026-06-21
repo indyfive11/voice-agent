@@ -105,11 +105,12 @@ class HttpBrainClient:
                     continue
                 yield BrainEvent(**{k: v for k, v in obj.items() if k in _EVENT_FIELDS})
 
-    async def respond(self, session_id: str, text: str) -> AsyncIterator[BrainEvent]:
+    async def respond(self, session_id: str, text: str, wake: dict | None = None) -> AsyncIterator[BrainEvent]:
         self._active_session = session_id
-        async for ev in self._sse(
-            "/respond", {"session_id": session_id, "text": text, "override_token": None}
-        ):
+        payload = {"session_id": session_id, "text": text, "override_token": None}
+        if wake is not None:  # item C: out-of-band acoustic wake signal (optional, back-compat)
+            payload["wake"] = wake
+        async for ev in self._sse("/respond", payload):
             yield ev
 
     async def confirm(

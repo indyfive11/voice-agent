@@ -498,6 +498,7 @@ def test_bare_wake_is_silent_by_default_listen_first():
     # command (if any) is still never forwarded with the wake word; a bare wake forwards nothing.
     client = FakeBrainClient(respond_events=[BrainEvent("token", text="Hi!"), BrainEvent("done")])
     svc, pushed = _service_with_recorder(client)
+    svc._bare_wake_greet = False  # listen-first (explicit, so the test doesn't depend on the ambient .env)
     svc._bare_wake_delay = 0.01
 
     async def go():
@@ -521,6 +522,37 @@ def test_bare_wake_riding_command_still_forwarded_without_wake_word():
 def test_bare_wake_greeting_still_works_when_enabled():
     # The greeting is kept behind BARE_WAKE_GREET (default off) — when opted in, it still prompts once.
     client = FakeBrainClient(respond_events=[BrainEvent("token", text="ok"), BrainEvent("done")])
+    svc, pushed = _service_with_recorder(client)
+    svc._bare_wake_greet = True
+    svc._bare_wake_delay = 0.01
+
+    async def go():
+        await svc._process_context(_ctx("Hey Aria"))
+        await asyncio.sleep(0.05)
+    asyncio.run(go())
+    assert _spoken_texts(pushed) == [_BARE_WAKE_PROMPT]
+
+
+def test_bare_wake_greeting_suppressed_while_media_playing():
+    # The user 2026-06-20: NEVER greet while media plays — the auto-duck is the ack, a spoken "Yes?" talks over
+    # the command. Greeting enabled + media playing → stays silent.
+    client = FakeBrainClient(respond_events=[BrainEvent("done")])
+    client.media_state_value = {"playing": True, "state": "playing"}
+    svc, pushed = _service_with_recorder(client)
+    svc._bare_wake_greet = True
+    svc._bare_wake_delay = 0.01
+
+    async def go():
+        await svc._process_context(_ctx("Hey Aria"))
+        await asyncio.sleep(0.05)
+    asyncio.run(go())
+    assert _spoken_texts(pushed) == []  # media playing → no greeting
+
+
+def test_bare_wake_greeting_fires_when_media_idle():
+    # The complement: greeting enabled + nothing playing → she acknowledges with the prompt.
+    client = FakeBrainClient(respond_events=[BrainEvent("done")])
+    client.media_state_value = {"playing": False, "state": "idle"}
     svc, pushed = _service_with_recorder(client)
     svc._bare_wake_greet = True
     svc._bare_wake_delay = 0.01
@@ -1364,7 +1396,7 @@ class _CrashingClient(FakeBrainClient):
         super().__init__()
         self.mode = "fail"  # "fail" → raise; "ok" → stream a normal reply
 
-    async def respond(self, session_id, text):
+    async def respond(self, session_id, text, wake=None):
         self.respond_calls.append((session_id, text))
         if self.mode == "fail":
             raise RuntimeError("peer closed connection without sending complete message body")

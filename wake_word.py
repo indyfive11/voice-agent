@@ -89,6 +89,24 @@ class StopWordFrame(SystemFrame):
     from below the mute → TTS flushes + the brain turn is cancelled. SystemFrame so it propagates promptly."""
 
 
+@dataclass
+class WakeEventFrame(SystemFrame):
+    """Pushed DOWNSTREAM by the wake gate on a FRESH acoustic wake-open (item C, 2026-06-20).
+
+    Carries the acoustic wake-detector `score` so the brain (BrainLLMService, downstream) knows a real wake
+    initiated this turn — independent of the STT transcript, which fluently mis-expands the bare "Hey Aria"
+    into "how are you?"/"Hey!" ~80% of the time over music (eval: no STT engine recovers this; the evidence
+    only survives in the audio). The brain stamps it per-turn and, when the voice-side wake-strip fails to
+    find the name in the garbled text, fuses it (+ VAD-derived duration) into a `bare_wake_likelihood` it
+    forwards on /respond so the listen-first guard trusts the audio over the text.
+
+    Emitted ONLY from `_on_wake` (a confirmed acoustic detection) — NOT on keepalive/hold window re-opens
+    (those aren't fresh user wakes). SystemFrame so the half-duplex user-mute can't drop it (same reasoning
+    as StopWordFrame). Gated by WAKE_SIGNAL_FORWARD; no consumer → harmless."""
+
+    score: float = 0.0
+
+
 def _tlog(message: str) -> None:
     """One line to the transcript log (greppable alongside USER/BOT/DUCK/WAKE)."""
     logger.bind(transcript=True).info(message)
@@ -129,6 +147,7 @@ class WakeWordGate(FrameProcessor):
         interrupt_consec_frames: int = 2,
         interrupt_refractory_secs: float = 1.0,
         interrupt_arm_delay_secs: float = 0.0,
+        emit_wake_events: bool = False,
         time_source: Callable[[], float] | None = None,
         **kwargs,
     ):
@@ -280,6 +299,7 @@ class WakeWordGate(FrameProcessor):
         # interrupt happens later (live: 7.5s in), so a short delay kills the onset self-trips losslessly.
         self._interrupt_arm_delay = max(0.0, interrupt_arm_delay_secs)
         self._bot_speaking_since = 0.0
+        self._emit_wake_events = emit_wake_events  # item C: push WakeEventFrame on a fresh acoustic wake
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
@@ -296,8 +316,13 @@ class WakeWordGate(FrameProcessor):
                 # While Aria speaks, detect the interrupt word instead of waking (mutually exclusive). Runs
                 # regardless of `gated` so it works in a quiet room (no media). Routing below is unchanged.
                 await self._feed_interrupt(frame.audio)
-            elif gated:
-                await self._feed(frame.audio)
+            else:
+                # Run the wake detector whether or not we're GATING. While gating it opens the command window
+                # (over media); in pass-through (open mic, media idle) it does EMIT-ONLY — the WakeEventFrame
+                # still fires so the brain gets the acoustic wake signal even when no media forces a wake. The
+                # wake-expansion bug ("Hey Aria"→"how are you?") is media-independent, so the signal must be
+                # too (item C: open-mic turns leaked unguarded when the detector only ran while gating).
+                await self._feed(frame.audio, gated)
             if gated and not self._open:
                 return  # swallow: muted until the wake word
             await self.push_frame(frame, direction)
@@ -476,7 +501,7 @@ class WakeWordGate(FrameProcessor):
         """Consecutive ≥threshold frames required to fire — stricter while asleep (force-gated)."""
         return self._asleep_consec_required if self._force_gated else self._consec_required
 
-    async def _feed(self, audio: bytes) -> None:
+    async def _feed(self, audio: bytes, gated: bool = True) -> None:
         self._buf.extend(audio)
         loop = asyncio.get_running_loop()
         while len(self._buf) >= _CHUNK_BYTES:
@@ -496,7 +521,7 @@ class WakeWordGate(FrameProcessor):
                 self._last_wake = now
                 self._consec = 0
                 self._reset_nearmiss()
-                self._on_wake(score)
+                await self._on_wake(score, gated)
             else:
                 if self._debug:
                     # A >=threshold frame can land here for two very different reasons: it failed to sustain
@@ -504,9 +529,9 @@ class WakeWordGate(FrameProcessor):
                     # window (a duplicate, not a recall failure). Capture which, for an accurate near-miss label.
                     in_refractory = (now - self._last_wake) <= self._refractory
                     self._track_nearmiss(key, score, in_refractory)
-                if not self._open and self._escape_count > 0:
+                if gated and not self._open and self._escape_count > 0:
                     self._track_escape(score, now)  # lockout escape (independent of debug)
-                if not self._open and self._gated_retry_count > 0:
+                if gated and not self._open and self._gated_retry_count > 0:
                     self._track_gated_retry(score, now)  # gated (asleep/media) re-wake escape (debug-independent)
 
     def _interrupt_active(self) -> bool:
@@ -645,8 +670,21 @@ class WakeWordGate(FrameProcessor):
                 f"{self._gated_retry_secs:.0f}s, opening despite short sustain"
             )
 
-    def _on_wake(self, score: float) -> None:
-        self._open_window(f"WAKE  | wake word ({score:.2f}) — opening command window")
+    async def _on_wake(self, score: float, gated: bool = True) -> None:
+        # Item C: tell the brain (downstream) a FRESH acoustic wake fired, carrying the detector score, so it
+        # can trust the audio over an STT transcript that mis-expands "Hey Aria" → "how are you?". Pushed
+        # BEFORE opening the window (and before the command's own transcript), so it arrives ahead of this
+        # turn's LLMContextFrame and the brain can stamp it per-turn. Fresh-wake-only by construction — this
+        # method is reached only on a confirmed acoustic detection, never on keepalive/hold re-opens.
+        if self._emit_wake_events:
+            await self.push_frame(WakeEventFrame(score=score), FrameDirection.DOWNSTREAM)
+        if gated:
+            self._open_window(f"WAKE  | wake word ({score:.2f}) — opening command window")
+        else:
+            # Open mic (media idle): the mic already passes audio through, and there's nothing playing to
+            # duck — so this is EMIT-ONLY. No window/pre-duck; the WakeEventFrame is the whole point, giving
+            # the brain the acoustic wake signal for an open-mic "Hey Aria" that STT would otherwise garble.
+            _tlog(f"WAKE  | wake word ({score:.2f}) — open mic, signal only")
 
     async def _on_interrupt(self, score: float) -> None:
         """Confirmed interrupt word while Aria speaks → cut her TTS and hand the floor back (stop-and-listen).
@@ -676,9 +714,17 @@ class WakeWordGate(FrameProcessor):
         if not self._open:
             self._open = True
             _tlog(log_msg)
-            self._fire_duck(True)  # pre-duck so the command lands on already-ducked media
-            if not self._hold:
-                self._arm_preduck()  # release the pre-duck if no speech follows (not while held for a confirm)
+            # While ASLEEP the acoustic wake is only a CANDIDATE — the brain still requires a text wake to
+            # actually wake (be93d0f), and the nano model false-fires hard on ordinary speech (live 2026-06-20:
+            # 256 fires / 507 spikes at 1.00 on non-wake talk while dozing). Pre-ducking each candidate dipped
+            # the music ~6s for nothing (the brain text-gates it and stays asleep). So skip the pre-duck while
+            # force-gated: the window still opens (STT transcribes for the text gate), but the bed isn't dipped
+            # until a wake is actually confirmed and the normal awake flow ducks. (media_duck already skips
+            # while asleep via `not llm.is_sleeping`, so the wake pre-duck was the sole asleep dipper.)
+            if not self._force_gated:
+                self._fire_duck(True)  # pre-duck so the command lands on already-ducked media
+                if not self._hold:
+                    self._arm_preduck()  # release the pre-duck if no speech follows (not while held for a confirm)
         self._escape_peak = 0.0
         self._escape_run = 0
         self._escape_hits.clear()  # fresh start once we're open

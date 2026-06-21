@@ -94,6 +94,26 @@ def test_respond_streams_events_and_ends_on_confirm():
     asyncio.run(client.aclose())
 
 
+def test_respond_omits_wake_when_absent():
+    # Item C: no wake signal → payload is exactly the pre-item-C shape (back-compat).
+    app, calls = make_stub()
+    client = _client(app)
+    _collect(lambda: client.respond("s1", "play jazz"))
+    assert "wake" not in calls["respond"][0]
+    asyncio.run(client.aclose())
+
+
+def test_respond_includes_wake_when_present():
+    # Item C: the out-of-band acoustic wake signal rides the /respond POST body.
+    app, calls = make_stub()
+    client = _client(app)
+    wake = {"bare_wake_likelihood": 0.81, "confidence": 0.99, "speech_dur_ms": 600, "post_wake_voiced_ms": 120}
+    _collect(lambda: client.respond("s1", "how are you", wake=wake))
+    assert calls["respond"][0]["wake"] == wake
+    assert calls["respond"][0]["text"] == "how are you"
+    asyncio.run(client.aclose())
+
+
 def test_confirm_returns_continuation_sse():
     app, calls = make_stub()
     client = _client(app)

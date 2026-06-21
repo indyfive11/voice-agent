@@ -184,6 +184,34 @@ def test_asleep_requires_stricter_consec():
     assert g._open is True
 
 
+def test_asleep_wake_opens_window_but_does_not_preduck():
+    # 2026-06-20: aria_nano false-fires at 1.00 on ordinary speech while asleep; pre-ducking each candidate
+    # dipped the music ~6s for nothing (the brain text-gates it and stays asleep). Asleep → open the candidate
+    # window (so STT can transcribe for the text gate) but DON'T fire the pre-duck. media_duck already skips
+    # while asleep, so the wake pre-duck was the sole asleep dipper.
+    client = FakeBrainClient()
+    g = _gate(client, asleep_consec_frames=2)
+    g._force_gated = True  # brain asleep
+
+    async def go():
+        g._oww.score = 0.9; await g._feed(_CHUNK)   # consec=1
+        g._oww.score = 0.9; await g._feed(_CHUNK)   # consec=2 → asleep wake
+
+    asyncio.run(go())
+    assert g._open is True          # candidate window opens (STT transcribes for the text gate)
+    assert client.duck_calls == []  # but NO pre-duck while asleep — music isn't dipped on a false candidate
+
+
+def test_awake_wake_still_preducks_regression():
+    # Regression: awake, a wake still pre-ducks (the asleep guard must not suppress the real awake duck).
+    client = FakeBrainClient()
+    g = _gate(client)  # not force-gated → awake
+    g._oww.score = 0.9
+    asyncio.run(g._feed(_CHUNK))
+    assert g._open is True
+    assert client.duck_calls == [("sess-test", True)]
+
+
 def test_awake_uses_normal_consec_not_asleep_bar():
     # The stricter bar applies ONLY while asleep: awake, consec_frames=2 still fires on two frames.
     client = FakeBrainClient()
@@ -455,7 +483,11 @@ def test_gated_retry_opens_after_repeated_near_wakes_asleep():
 
     asyncio.run(go())
     assert g._open is True
-    assert client.duck_calls == [("sess-test", True)]  # retry pre-ducks like a real wake
+    # 2026-06-20: asleep window-opens no longer pre-duck (the asleep stopgap — a wake while asleep is a
+    # candidate the brain text-gates, and the nano model false-fires hard on ordinary speech). The retry still
+    # opens the candidate window for STT, but doesn't dip the music. (The awake-over-media retry below DOES
+    # pre-duck — see test_gated_retry_opens_when_awake_over_media.)
+    assert client.duck_calls == []
 
 
 def test_gated_retry_opens_when_awake_over_media():
