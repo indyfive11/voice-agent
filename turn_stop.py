@@ -27,8 +27,12 @@ Env `TURN_HONOR_INCOMPLETE=0` reverts to the stock behavior (A/B / kill-switch).
 
 from __future__ import annotations
 
+import time
+
 from loguru import logger
 
+from pipecat.frames.frames import Frame, VADUserStoppedSpeakingFrame
+from pipecat.turns.types import ProcessFrameResult
 from pipecat.turns.user_stop.turn_analyzer_user_turn_stop_strategy import (
     TurnAnalyzerUserTurnStopStrategy,
 )
@@ -39,15 +43,43 @@ def _tlog(message: str) -> None:
 
 
 class SmartTurnHonoringStopStrategy(TurnAnalyzerUserTurnStopStrategy):
-    """`TurnAnalyzerUserTurnStopStrategy` that never ends a turn while SmartTurn still judges it INCOMPLETE."""
+    """`TurnAnalyzerUserTurnStopStrategy` that never ends a turn while SmartTurn still judges it INCOMPLETE.
 
-    def __init__(self, *, turn_analyzer, **kwargs):
+    Also emits a per-turn **finalization-latency** line (the #60 endpointing instrumentation): the felt lag
+    between the user going quiet and the turn closing (so the brain can answer). The line attributes the
+    latency to its cause so a live ear-test produces a tunable number instead of a guess:
+      * ``prompt COMPLETE, no hold`` — SmartTurn fired COMPLETE right at the VAD-stop; the ``Nms from last
+        speech`` figure is then mostly the SmartTurn **inference** cost (the suspect on weak HW like a Pi-4,
+        where neural inference is slow — if this is large, the lever is offloading/lightening endpointing,
+        NOT ``stop_secs``).
+      * ``held …ms on INCOMPLETE → stop_secs silence fallback`` — SmartTurn kept the turn open and only the
+        ``stop_secs`` (default 4s) silence timer ended it: this IS the ``SMART_TURN_STOP_SECS`` latency tax,
+        the knob to lower (trading against mid-thought-pause fragmentation).
+      * ``held …ms on INCOMPLETE → COMPLETE verdict`` — a real COMPLETE arrived during the pause well before
+        ``stop_secs``: honor-incomplete did its job (don't lower ``stop_secs`` on account of these).
+    """
+
+    def __init__(self, *, turn_analyzer, stop_secs: float = 4.0, **kwargs):
         super().__init__(turn_analyzer=turn_analyzer, **kwargs)
+        self._stop_secs = stop_secs
         self._suppressed_logged = False
+        self._hold_started: float | None = None  # monotonic ts of the first INCOMPLETE suppression this turn
+        self._last_vad_stop: float | None = None  # monotonic ts of the most recent VAD stop this turn
 
     async def reset(self):
         await super().reset()
         self._suppressed_logged = False
+        self._hold_started = None
+        self._last_vad_stop = None
+
+    async def process_frame(self, frame: Frame) -> ProcessFrameResult:
+        # Timestamp the latest VAD-stop BEFORE delegating: the base handler can synchronously trigger the
+        # turn-stop on a prompt COMPLETE verdict within this very call, so recording after super() would
+        # leave _last_vad_stop=None for no-hold turns (the "?ms" gap). Set it first so the finalization
+        # line reports the real end-to-end dead air (the latency a person feels).
+        if isinstance(frame, VADUserStoppedSpeakingFrame):
+            self._last_vad_stop = time.monotonic()
+        return await super().process_frame(frame)
 
     async def trigger_user_turn_stopped(self):
         # The single funnel for every stop path in the base. Suppress it while SmartTurn is mid-turn (last
@@ -55,8 +87,25 @@ class SmartTurnHonoringStopStrategy(TurnAnalyzerUserTurnStopStrategy):
         # both clear speech_triggered, so legitimate turn-ends pass straight through. We deliberately do NOT
         # exempt finalized transcripts: Whisper finalizes every segment, so that exemption made this a no-op.
         if getattr(self._turn_analyzer, "speech_triggered", False):
+            if self._hold_started is None:
+                self._hold_started = time.monotonic()
             if not self._suppressed_logged:
                 self._suppressed_logged = True
                 _tlog("TURN  | holding — SmartTurn INCOMPLETE (waiting for end-of-turn, not cutting mid-pause)")
             return
+        self._log_finalization()
         await super().trigger_user_turn_stopped()
+
+    def _log_finalization(self) -> None:
+        """Attribute this turn's finalization latency to its cause (see the class docstring)."""
+        now = time.monotonic()
+        lead = f"{(now - self._last_vad_stop) * 1000:.0f}ms" if self._last_vad_stop is not None else "?ms"
+        if self._hold_started is not None:
+            held_ms = (now - self._hold_started) * 1000
+            # Held ~stop_secs ⇒ the silence fallback ended it (the tax); a clearly shorter hold ⇒ a real
+            # COMPLETE verdict released the pause early (honor-incomplete working as intended).
+            via = "stop_secs silence fallback" if held_ms >= self._stop_secs * 1000 * 0.9 else "COMPLETE verdict"
+            tail = f" (held {held_ms:.0f}ms on INCOMPLETE → {via})"
+        else:
+            tail = " (prompt COMPLETE, no hold)"
+        _tlog(f"TURN  | finalized — {lead} from last speech{tail}")

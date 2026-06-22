@@ -300,8 +300,11 @@ async def run() -> None:
                     # STT-p99 timeout can end a turn the model judged unfinished, cutting the user off on a
                     # natural mid-sentence pause (2026-06-20). The honoring subclass suppresses that until a
                     # real COMPLETE verdict or the stop_secs(4s) silence. TURN_HONOR_INCOMPLETE=0 reverts.
-                    (SmartTurnHonoringStopStrategy
-                     if honor_incomplete else TurnAnalyzerUserTurnStopStrategy)(turn_analyzer=turn_analyzer),
+                    # It's also passed stop_secs so its per-turn finalization-latency log (#60) can tell a
+                    # stop_secs-fallback turn (the latency tax) apart from a prompt COMPLETE.
+                    (SmartTurnHonoringStopStrategy(turn_analyzer=turn_analyzer, stop_secs=smart_turn_stop_secs)
+                     if honor_incomplete
+                     else TurnAnalyzerUserTurnStopStrategy(turn_analyzer=turn_analyzer)),
                     # Safety cap so a long continuous ramble can't hang the turn (SmartTurn won't
                     # end it; this force-completes past max_turn_secs when there's transcribed text).
                     MaxTurnDurationUserTurnStopStrategy(max_turn_secs=max_turn_secs),
