@@ -20,6 +20,16 @@ returning we log `INPUT RESUMED`. **Honest caveat:** if the echo-cancel *module*
 stream), the in-process kick may not revive it — pinning the output sink (prevention) is the primary lever;
 this watchdog guarantees the failure is *visible and actionable* instead of 89s of silence.
 
+**Last-resort escalation (`on_unrecoverable`, added 2026-06-22):** when the in-process kicks are exhausted on
+a source that NEVER resumes (e.g. the EM reSpeaker that came up all-silent at boot — 2026-06-22 it stalled at
+07:30, burned all 3 kicks, then sat inert until a manual restart at 08:07), the detector would otherwise latch
+forever: the only un-latch path (`INPUT RESUMED`) needs a non-silent frame the dead source never sends, so a
+LATER total capture death can't be recovered either. So on give-up we call an injected `on_unrecoverable`
+(main.py exits the process), letting systemd `Restart=on-failure` do a clean full device re-init —
+auto-recovery instead of a permanent 48%-CPU silent spin. `None` = stay log-only (the default / opt-in via
+`INPUT_STALL_EXIT_ON_FAIL=1` — for bare/interactive runs or transient units with no supervisor to restart us,
+where exiting would just leave Aria dead).
+
 Sits FIRST in the pipeline (right after `transport.input()`, before the resampler) so it times the rawest
 mic frames and is blind to downstream wake-gate swallowing (it measures capture health, not gating).
 """
@@ -27,6 +37,7 @@ mic frames and is blind to downstream wake-gate swallowing (it measures capture 
 from __future__ import annotations
 
 import asyncio
+import inspect
 import time
 
 import numpy as np
@@ -52,6 +63,7 @@ class InputStallDetector(FrameProcessor):
         silence_eps: int = 4,
         restart=None,  # async callable(start_frame) -> bool; None = log-only
         max_restarts: int = 3,
+        on_unrecoverable=None,  # callable() run once when restarts are exhausted; None = stay log-only
         heartbeat_secs: float = 10.0,  # periodic liveness line; 0 = off
         gate_state=None,  # optional callable → {"gated","open","wake_peak"} for the heartbeat
         **kwargs,
@@ -62,6 +74,7 @@ class InputStallDetector(FrameProcessor):
         self._silence_eps = silence_eps
         self._restart = restart
         self._max_restarts = max_restarts
+        self._on_unrecoverable = on_unrecoverable
         self._hb_secs = heartbeat_secs
         self._gate_state = gate_state
 
@@ -156,11 +169,12 @@ class InputStallDetector(FrameProcessor):
             return
         if self._restarts >= self._max_restarts:
             if self._restarts == self._max_restarts:
-                self._restarts += 1  # log the give-up exactly once
+                self._restarts += 1  # run the give-up path exactly once
                 _tlog(
                     f"INPUT STALL | still dead after {self._max_restarts} restart attempts — "
                     "manual restart likely needed (echo-cancel source may be gone)"
                 )
+                await self._escalate()
             return
         self._restarts += 1
         try:
@@ -169,6 +183,20 @@ class InputStallDetector(FrameProcessor):
                   f"({'kicked capture' if ok else 'no stream to kick'})")
         except Exception as e:  # noqa: BLE001 - recovery must never crash the pipeline
             _tlog(f"INPUT STALL | restart attempt {self._restarts} FAILED: {type(e).__name__}: {e}")
+
+    async def _escalate(self) -> None:
+        """Last resort once in-process kicks are exhausted: hand off to `on_unrecoverable` (main.py exits
+        so systemd does a clean full re-init). None = stay log-only — the historical behavior, for runs with
+        no supervisor to restart us. Note: an exiting handler does not return; the `await`/log won't run."""
+        if self._on_unrecoverable is None:
+            return
+        _tlog("INPUT STALL | escalating — exiting for a clean restart (capture unrecoverable in-process)")
+        try:
+            result = self._on_unrecoverable()
+            if inspect.isawaitable(result):
+                await result
+        except Exception as e:  # noqa: BLE001 - escalation must never crash the watch loop silently
+            _tlog(f"INPUT STALL | escalation FAILED: {type(e).__name__}: {e}")
 
     async def cleanup(self):
         await super().cleanup()

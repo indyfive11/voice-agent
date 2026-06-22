@@ -346,8 +346,19 @@ async def run() -> None:
         stream.start_stream()
         return True
 
+    # Last resort when the in-process capture kicks can't revive the mic (e.g. the reSpeaker came up
+    # all-silent and never recovers): exit hard so systemd (Restart=on-failure) does a clean full device
+    # re-init, instead of the watchdog latching inert and spinning at ~48% CPU. os._exit bypasses teardown
+    # on purpose — the pipeline is wedged, a graceful stop could hang on the same dead capture task.
+    def _exit_for_clean_restart():
+        logger.bind(transcript=True).critical(
+            "INPUT STALL | capture unrecoverable — exiting (rc=1) so the supervisor re-inits the device"
+        )
+        os._exit(1)
+
     input_watchdog = config.build_input_watchdog(
         restart=_restart_capture,
+        on_unrecoverable=_exit_for_clean_restart,
         gate_state=(wake_gate.hb_state if wake_gate else None),  # heartbeat shows gate state too
     )
 

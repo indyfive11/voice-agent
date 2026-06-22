@@ -655,26 +655,36 @@ def build_input_resampler():
     return InputResampler(target_rate=PIPELINE_AUDIO_RATE)
 
 
-def build_input_watchdog(restart=None, gate_state=None):
+def build_input_watchdog(restart=None, on_unrecoverable=None, gate_state=None):
     """Input-stall watchdog (goes first, right after transport.input()), or None if disabled.
 
     Detects a mic-capture freeze — both 'no frames' and 'frames but silent' (the 2026-06-03 echo-cancel
     stall) — logs it loudly, and calls `restart` (best-effort capture kick) instead of hanging silently.
     Also emits a periodic heartbeat (with optional `gate_state`) so freeze vs lockout is one glance.
     Default ON; set `INPUT_STALL_SECS=0` to disable. See input_watchdog.InputStallDetector.
+
+    `on_unrecoverable` (e.g. exit the process) runs once when the in-process kicks are exhausted on a source
+    that won't revive, so a supervisor (systemd `Restart=on-failure`) can do a clean full re-init instead of
+    the watchdog latching inert (2026-06-22 reSpeaker silent-stall). **Opt-in** (`INPUT_STALL_EXIT_ON_FAIL=1`):
+    default OFF keeps the historical log-only no-op, since exiting only helps where a supervisor restarts us
+    on non-zero exit — on a bare/interactive run or a transient unit with no auto-restart, exiting would just
+    leave Aria dead. Enable it on supervised deployments (the EM systemd unit has `Restart=on-failure`).
     """
     stall_secs = float(_env("INPUT_STALL_SECS", "5.0"))
     if stall_secs <= 0:
         return None
     silent_secs = float(_env("INPUT_SILENT_SECS", "8.0"))
     heartbeat_secs = float(_env("INPUT_HEARTBEAT_SECS", "10.0"))
+    exit_on_fail = _env("INPUT_STALL_EXIT_ON_FAIL", "0") not in ("0", "false", "False")
+    escalate = on_unrecoverable if exit_on_fail else None
     from input_watchdog import InputStallDetector
 
     logger.info(f"Input watchdog: ON (stall={stall_secs}s, silent={silent_secs}s, "
-                f"heartbeat={heartbeat_secs}s, recover={'yes' if restart else 'log-only'})")
+                f"heartbeat={heartbeat_secs}s, recover={'yes' if restart else 'log-only'}, "
+                f"escalate={'exit-for-restart' if escalate else 'log-only'})")
     return InputStallDetector(
         stall_secs=stall_secs, silent_secs=silent_secs, restart=restart,
-        heartbeat_secs=heartbeat_secs, gate_state=gate_state,
+        on_unrecoverable=escalate, heartbeat_secs=heartbeat_secs, gate_state=gate_state,
     )
 
 

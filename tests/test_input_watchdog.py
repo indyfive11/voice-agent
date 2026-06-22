@@ -120,6 +120,75 @@ def test_gives_up_after_max_restarts():
     assert any("still dead after 2 restart attempts" in ln for ln in lines)
 
 
+def test_escalates_once_after_restarts_exhausted():
+    # When in-process kicks are exhausted on a source that won't revive, the watchdog hands off to
+    # on_unrecoverable (main.py exits → systemd re-inits) — exactly once, at the give-up point.
+    restarts, escalations = [], []
+
+    async def restart(_):
+        restarts.append(1)
+        return True
+
+    d = InputStallDetector(stall_secs=5.0, restart=restart, max_restarts=2,
+                           on_unrecoverable=lambda: escalations.append(1))
+    d._armed = True
+    now = time.monotonic()
+    d._last = now - 10            # no frames → stalled, never resumes
+    d._last_nonsilent = now - 10
+
+    lines, remove = _capture_transcript()
+    try:
+        async def go():
+            for _ in range(6):    # tick past the restart cap
+                await d._tick()
+        asyncio.run(go())
+    finally:
+        remove()
+
+    assert len(restarts) == 2          # bounded at max_restarts
+    assert len(escalations) == 1       # escalated exactly once, not every tick after
+    assert any("escalating" in ln for ln in lines)
+
+
+def test_no_escalation_when_handler_is_none():
+    # Default / INPUT_STALL_EXIT_ON_FAIL=0: log-only, no crash, no escalation (bare/interactive runs).
+    async def restart(_):
+        return True
+
+    d = InputStallDetector(stall_secs=5.0, restart=restart, max_restarts=1, on_unrecoverable=None)
+    d._armed = True
+    now = time.monotonic()
+    d._last = now - 10
+    d._last_nonsilent = now - 10
+
+    lines, remove = _capture_transcript()
+    try:
+        async def go():
+            for _ in range(4):
+                await d._tick()
+        asyncio.run(go())
+    finally:
+        remove()
+
+    assert any("still dead after 1 restart attempts" in ln for ln in lines)
+    assert not any("escalating" in ln for ln in lines)
+
+
+def test_no_escalation_before_restarts_exhausted():
+    # A single stall tick that still has restart budget must NOT escalate.
+    d = InputStallDetector(stall_secs=5.0, restart=(lambda _: _async_true()), max_restarts=3,
+                           on_unrecoverable=lambda: (_ for _ in ()).throw(AssertionError("escalated early")))
+    d._armed = True
+    now = time.monotonic()
+    d._last = now - 10
+    d._last_nonsilent = now - 10
+    asyncio.run(d._tick())        # one attempt; budget remains → no escalation (handler would raise)
+
+
+async def _async_true():
+    return True
+
+
 def test_heartbeat_emits_frame_and_gate_state():
     g = {"gated": True, "open": False, "wake_peak": 0.18}
     d = InputStallDetector(stall_secs=5.0, heartbeat_secs=10.0, gate_state=lambda: g)
