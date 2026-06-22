@@ -20,7 +20,9 @@ import tempfile
 # on a noexec mount ("failed to map segment from shared object"). Redirect TMPDIR to an
 # exec-friendly dir in $HOME BEFORE anything touches tempfile (phonemizer uses
 # tempfile.mkdtemp(), which honors TMPDIR).
-_EXEC_TMP = os.path.expanduser("~/.cache/voice-agent/tmp")
+_EXEC_TMP = os.path.join(
+    os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "voice-agent", "tmp"
+)
 os.makedirs(_EXEC_TMP, exist_ok=True)
 os.environ["TMPDIR"] = _EXEC_TMP
 tempfile.tempdir = None  # drop any cached value so TMPDIR is re-read

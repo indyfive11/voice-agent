@@ -17,7 +17,7 @@ from brains.http_brain_client import HttpBrainClient
 # --- a minimal gabagent-voice-server stub --------------------------------------------------
 def make_stub():
     """Returns (asgi_app, calls) where calls records posted bodies per path."""
-    calls = {"respond": [], "confirm": [], "cancel": []}
+    calls = {"respond": [], "confirm": [], "cancel": [], "attach": []}
 
     def sse(*events: dict) -> bytes:
         return b"".join(f"data: {json.dumps(e)}\n\n".encode() for e in events)
@@ -64,6 +64,9 @@ def make_stub():
         elif path == "/cancel":
             calls["cancel"].append(payload)
             await json_resp({"ok": True})
+        elif path == "/attach":
+            calls["attach"].append(payload)
+            await json_resp({"status": "ok", "brain": {"version": "0.6.0", "accepts_room_id": True}})
         else:
             await json_resp({"error": "not found"}, status=404)
 
@@ -72,6 +75,27 @@ def make_stub():
 
 def _client(app):
     return HttpBrainClient("http://brain.test", transport=httpx.ASGITransport(app=app))
+
+
+def make_header_stub():
+    """Like make_stub but records the Authorization header seen per path (Pi bearer-token seam)."""
+    seen = {"authorization": []}
+
+    async def app(scope, receive, send):
+        assert scope["type"] == "http"
+        headers = dict(scope.get("headers") or ())
+        seen["authorization"].append(headers.get(b"authorization", b"").decode("latin-1"))
+        # drain body
+        while True:
+            msg = await receive()
+            if not msg.get("more_body"):
+                break
+        data = json.dumps({"status": "ok", "mode": "voice"}).encode()
+        await send({"type": "http.response.start", "status": 200,
+                    "headers": [(b"content-type", b"application/json")]})
+        await send({"type": "http.response.body", "body": data})
+
+    return app, seen
 
 
 def _collect(agen_factory):
@@ -156,9 +180,79 @@ def test_start_attaches_when_brain_already_healthy():
     asyncio.run(client.aclose())
 
 
+def test_bearer_token_sent_on_every_request_when_configured():
+    # Pi satellite (Topology B): a configured GAB_AUTH_TOKEN rides as Authorization: Bearer <tok>.
+    app, seen = make_header_stub()
+    client = HttpBrainClient(
+        "http://brain.test", auth_token="s3cret", transport=httpx.ASGITransport(app=app))
+    _collect(lambda: client.respond("s1", "hi"))
+    asyncio.run(client._is_healthy())  # /health is open but still carries the default header
+    assert seen["authorization"] == ["Bearer s3cret", "Bearer s3cret"]
+    asyncio.run(client.aclose())
+
+
+def test_no_bearer_header_when_token_absent():
+    # Loopback default: no token → no Authorization header (back-compat, brain runs unauthenticated).
+    app, seen = make_header_stub()
+    client = HttpBrainClient("http://brain.test", transport=httpx.ASGITransport(app=app))
+    _collect(lambda: client.respond("s1", "hi"))
+    assert seen["authorization"] == [""]
+    asyncio.run(client.aclose())
+
+
 def test_aclose_cancels_active_session():
     app, calls = make_stub()
     client = _client(app)
     _collect(lambda: client.respond("s9", "hi"))
     asyncio.run(client.aclose())
-    assert calls["cancel"] == [{"session_id": "s9"}]  # aclose cancels the active turn
+    assert calls["cancel"] == [{"session_id": "s9"}]  # aclose cancels the active turn (no room_id set)
+
+
+# --- multi-room foundation: room_id stamping + /attach --------------------------------------
+
+def test_room_id_stamped_on_payloads_when_set():
+    # A configured room_id rides every payload (durable per-room routing key), like the wake field.
+    app, calls = make_stub()
+    client = HttpBrainClient("http://brain.test", room_id="kitchen", transport=httpx.ASGITransport(app=app))
+    _collect(lambda: client.respond("s1", "play jazz"))
+    assert calls["respond"][0]["room_id"] == "kitchen"
+    asyncio.run(client.cancel("s1"))
+    assert calls["cancel"][0]["room_id"] == "kitchen"
+    asyncio.run(client.aclose())
+
+
+def test_room_id_absent_when_unset():
+    # No room_id configured → field omitted entirely (back-compat; brain stays single-room).
+    app, calls = make_stub()
+    client = _client(app)
+    _collect(lambda: client.respond("s1", "play jazz"))
+    assert "room_id" not in calls["respond"][0]
+    asyncio.run(client.aclose())
+
+
+def test_attach_posts_room_and_caps_and_returns_brain_info():
+    app, calls = make_stub()
+    caps = {"wake": True, "vad": True, "stt": "remote", "tts": True}
+    client = HttpBrainClient(
+        "http://brain.test", room_id="kitchen", capabilities=caps, transport=httpx.ASGITransport(app=app))
+    info = asyncio.run(client.attach("sess-1"))
+    assert calls["attach"][0] == {"session_id": "sess-1", "capabilities": caps, "room_id": "kitchen"}
+    assert info["brain"]["accepts_room_id"] is True  # bidirectional handshake consumed
+    asyncio.run(client.aclose())
+
+
+def test_attach_tolerant_when_endpoint_missing():
+    # An older brain has no /attach route → 404 → attach() is a logged no-op returning {}, never raises.
+    async def app404(scope, receive, send):
+        while True:
+            msg = await receive()
+            if not msg.get("more_body"):
+                break
+        await send({"type": "http.response.start", "status": 404,
+                    "headers": [(b"content-type", b"application/json")]})
+        await send({"type": "http.response.body", "body": b'{"error":"not found"}'})
+
+    client = HttpBrainClient(
+        "http://brain.test", room_id="kitchen", transport=httpx.ASGITransport(app=app404))
+    assert asyncio.run(client.attach("sess-1")) == {}
+    asyncio.run(client.aclose())

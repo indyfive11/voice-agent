@@ -33,6 +33,12 @@ def _env_int(key: str) -> int | None:
     return int(val) if val is not None else None
 
 
+def _room_id() -> str:
+    """The durable per-room/device routing key, resolved ONCE so the STT request and the brain payloads
+    always agree. ROOM_ID env wins; default = the hostname (a sensible per-device room name)."""
+    return _env("ROOM_ID") or os.uname().nodename
+
+
 # Canonical pipeline audio rate. Whisper STT and the Silero VAD both want 16 kHz; the mic is
 # captured at whatever rate the device can open and resampled to this once, up front (see
 # audio_resample.InputResampler + build_transport). Pin STT/VAD to this so they never adopt the
@@ -54,7 +60,12 @@ SYSTEM_PROMPT = (
 
 # --------------------------------------------------------------------------- STT factory
 def build_stt():
-    """Speech-to-text. whisper (local, default) | deepgram (cloud)."""
+    """Speech-to-text. whisper (local, default) | deepgram (cloud) | remote (offload to an STT service).
+
+    `remote` keeps wake/VAD/endpointing/TTS on this device and offloads only STT to a standalone service
+    (stt_service/server.py) over HTTP — for a thin client too slow for local Whisper (a Pi-4 is ~40s/
+    utterance). See RemoteSTTService.
+    """
     provider = (_env("STT_PROVIDER", "whisper") or "whisper").lower()
 
     if provider == "whisper":
@@ -81,12 +92,37 @@ def build_stt():
         logger.info("STT: Deepgram (cloud)")
         return DeepgramSTTService(api_key=os.environ["DEEPGRAM_API_KEY"])
 
-    raise ValueError(f"Unknown STT_PROVIDER={provider!r} (expected whisper|deepgram)")
+    if provider == "remote":
+        from remote_stt import RemoteSTTService
+
+        url = _env("STT_REMOTE_URL")
+        if not url:
+            raise ValueError(
+                "STT_PROVIDER=remote requires STT_REMOTE_URL (e.g. http://192.168.1.100:8770)"
+            )
+        room_id = _room_id()
+        token = _env("STT_REMOTE_TOKEN")
+        timeout = float(_env("STT_REMOTE_TIMEOUT", "30") or 30)
+        logger.info(f"STT: remote offload url={url} room={room_id} auth={'on' if token else 'off'}")
+        # Pin sample_rate to the pipeline rate — the segmented WAV we POST is at this rate, and the
+        # EM service reads it from the WAV header; never adopt the device's native rate here.
+        return RemoteSTTService(
+            url, room_id=room_id, auth_token=token, timeout=timeout, sample_rate=PIPELINE_AUDIO_RATE
+        )
+
+    raise ValueError(f"Unknown STT_PROVIDER={provider!r} (expected whisper|deepgram|remote)")
 
 
 # --------------------------------------------------------------------------- TTS factory
 def build_tts():
-    """Text-to-speech. kokoro (local, default) | cartesia | elevenlabs (cloud)."""
+    """TTS. kokoro (local, default) | piper (local, fast/weak-HW) | remote (offload Kokoro to a service) |
+    cartesia | elevenlabs (cloud).
+
+    `piper` = lightweight local CPU TTS for thin clients too slow for Kokoro (a Pi-4 is ~16s/utterance), but
+    lower voice quality. `remote` = offload to a standalone Kokoro service (tts_service/server.py) on a fast
+    host — Kokoro's good voice for a thin client that can't run it locally (the Pi-4-class reference profile:
+    STT + TTS both on the brain host). See RemoteTTSService.
+    """
     provider = (_env("TTS_PROVIDER", "kokoro") or "kokoro").lower()
 
     if provider == "kokoro":
@@ -96,8 +132,60 @@ def build_tts():
         # explicit voice — default to af_heart; override with TTS_VOICE (54 voices in
         # voices-v1.0.bin, e.g. af_bella, af_sarah, am_michael, bf_emma).
         voice = _env("TTS_VOICE", "af_heart")
-        logger.info(f"TTS: local Kokoro (onnx) voice={voice}")
-        return KokoroTTSService(settings=KokoroTTSService.Settings(voice=voice))
+        # Pin Kokoro's EMIT-rate only when AUDIO_OUTPUT_SAMPLE_RATE is set (a fixed-rate output device, e.g.
+        # the Pi's EMEET = 48 kHz-only). It MUST equal build_transport's audio_out_sample_rate: Kokoro
+        # resamples its 24 kHz model output to this once (kokoro/tts.py), the device opens at the same rate,
+        # and pipecat does NOT re-resample the TTS to the transport rate — so matching the two ends is the
+        # whole fix (a mismatch plays the audio at the wrong clock = chipmunk). Unset (EM) → omit the kwarg →
+        # framework default, byte-for-byte the known-good path. Never auto-probed.
+        out_rate = _env_int("AUDIO_OUTPUT_SAMPLE_RATE")
+        tts_kwargs = {"settings": KokoroTTSService.Settings(voice=voice)}
+        if out_rate:
+            tts_kwargs["sample_rate"] = out_rate  # → base TTSService _init_sample_rate (via **kwargs)
+        logger.info(
+            f"TTS: local Kokoro (onnx) voice={voice}"
+            + (f" emit_rate={out_rate}Hz (pinned)" if out_rate else "")
+        )
+        return KokoroTTSService(**tts_kwargs)
+
+    if provider == "piper":
+        from pipecat.services.piper.tts import PiperTTSService  # extra: [piper]
+
+        # Fast CPU TTS for weak hardware (Pi-4). piper voice-id namespace (en_US-lessac-medium etc.), NOT
+        # Kokoro's; the .onnx voice auto-downloads on first use. Same emit-rate pin as Kokoro for a
+        # fixed-rate device (EMEET 48k) — piper resamples its output to self.sample_rate, like Kokoro.
+        voice = _env("TTS_VOICE", "en_US-lessac-medium")
+        out_rate = _env_int("AUDIO_OUTPUT_SAMPLE_RATE")
+        tts_kwargs = {"voice_id": voice}
+        if out_rate:
+            tts_kwargs["sample_rate"] = out_rate
+        logger.info(
+            f"TTS: local Piper voice={voice}"
+            + (f" emit_rate={out_rate}Hz (pinned)" if out_rate else "")
+        )
+        return PiperTTSService(**tts_kwargs)
+
+    if provider == "remote":
+        from remote_tts import RemoteTTSService
+
+        url = _env("TTS_REMOTE_URL")
+        if not url:
+            raise ValueError(
+                "TTS_PROVIDER=remote requires TTS_REMOTE_URL (e.g. http://192.168.1.100:8771)"
+            )
+        voice = _env("TTS_VOICE", "af_heart")  # a Kokoro voice (the remote service runs Kokoro)
+        room_id = _room_id()
+        token = _env("TTS_REMOTE_TOKEN")
+        timeout = float(_env("TTS_REMOTE_TIMEOUT", "30") or 30)
+        out_rate = _env_int("AUDIO_OUTPUT_SAMPLE_RATE")
+        logger.info(
+            f"TTS: remote offload url={url} voice={voice} room={room_id} auth={'on' if token else 'off'}"
+            + (f" emit_rate={out_rate}Hz (pinned)" if out_rate else "")
+        )
+        tts_kwargs = {"voice": voice, "room_id": room_id, "auth_token": token, "timeout": timeout}
+        if out_rate:
+            tts_kwargs["sample_rate"] = out_rate  # resample the remote Kokoro audio to the device rate (EMEET 48k)
+        return RemoteTTSService(url, **tts_kwargs)
 
     if provider == "cartesia":
         from pipecat.services.cartesia.tts import CartesiaTTSService  # extra: [cartesia]
@@ -117,7 +205,7 @@ def build_tts():
             voice_id=_env("TTS_VOICE", ""),
         )
 
-    raise ValueError(f"Unknown TTS_PROVIDER={provider!r} (expected kokoro|cartesia|elevenlabs)")
+    raise ValueError(f"Unknown TTS_PROVIDER={provider!r} (expected kokoro|piper|cartesia|elevenlabs)")
 
 
 # --------------------------------------------------------------------------- LLM factory
@@ -136,13 +224,46 @@ def build_llm():
         from brains.brain_llm_service import BrainLLMService
         from brains.http_brain_client import HttpBrainClient
 
-        gab_bin = _env("GAB_BIN", os.path.expanduser("~/dev/gabagent/.venv/bin/gab"))
+        # SOP (no install-specific hardcode): GAB_BIN override → `gab` on PATH → legacy home fallback.
+        import shutil
+        gab_bin = (
+            _env("GAB_BIN")
+            or shutil.which("gab")
+            or os.path.expanduser("~/dev/gabagent/.venv/bin/gab")
+        )
+        host = _env("GAB_HOST", "127.0.0.1")
         port = _env("GAB_PORT", "8765")
         project = _env("GAB_PROJECT_DIR", os.getcwd())
-        base_url = f"http://127.0.0.1:{port}"
-        launch = [gab_bin, "--voice-serve", "--port", str(port), "--cwd", project]
-        logger.info(f"Brain: gabagent (HTTP/SSE {base_url}, project={project})")
-        return BrainLLMService(HttpBrainClient(base_url, launch=launch, cwd=project))
+        base_url = f"http://{host}:{port}"
+        # A LAN bearer token for a remote brain (Pi satellite, Topology B) — must match the brain's
+        # GABAI_VOICE_AUTH_TOKEN. None on loopback (the default), where the brain runs unauthenticated.
+        auth_token = _env("GAB_AUTH_TOKEN")
+        # Attach vs spawn: a remote brain can't be spawned from here, so a non-loopback GAB_HOST
+        # defaults to attach-only (the brain runs on the other box). Loopback defaults to connect-or-
+        # spawn (HttpBrainClient.start() attaches if one is already healthy, else launches its own).
+        # GAB_LAUNCH overrides either way (0 = attach-only even on loopback).
+        is_remote = host not in ("127.0.0.1", "localhost", "::1")
+        do_launch = _env("GAB_LAUNCH", "0" if is_remote else "1") not in ("0", "false", "False")
+        launch = [gab_bin, "--voice-serve", "--port", str(port), "--cwd", project] if do_launch else None
+        logger.info(
+            f"Brain: gabagent (HTTP/SSE {base_url}, project={project}, "
+            f"{'spawn' if launch else 'attach'}, auth={'on' if auth_token else 'off'})"
+        )
+        # Multi-room foundation: ROOM_ID is the durable per-room/device routing key (default = hostname);
+        # capabilities is this client's profile (what it does locally vs offloads), declared once at /attach.
+        room_id = _room_id()
+        stt_provider = (_env("STT_PROVIDER", "whisper") or "whisper").lower()
+        capabilities = {
+            "wake": (_env("WAKE_WORD_ENGINE", "nano") or "nano").lower() != "off",
+            "vad": True,
+            "stt": "remote" if stt_provider == "remote" else "local",
+            "tts": True,
+        }
+        logger.info(f"Brain: room_id={room_id} capabilities={capabilities}")
+        return BrainLLMService(HttpBrainClient(
+            base_url, launch=launch, cwd=project, auth_token=auth_token,
+            room_id=room_id, capabilities=capabilities,
+        ))
     if brain != "local":
         raise ValueError(f"Unknown BRAIN={brain!r} (expected local|gabagent)")
 
@@ -412,6 +533,19 @@ def build_transport():
             f"Audio input: device can't open at {PIPELINE_AUDIO_RATE}Hz — capturing at "
             f"{capture_rate}Hz and resampling to {PIPELINE_AUDIO_RATE}Hz (InputResampler)."
         )
+    # Pin the output device OPEN-rate (and optionally channels) only when explicitly configured, for a
+    # fixed-rate device (Pi EMEET = 48000). MUST equal the Kokoro emit-rate — AUDIO_OUTPUT_SAMPLE_RATE drives
+    # BOTH so they can't diverge (divergence = chipmunk). Unset (EM) → omit → framework default (known-good).
+    # NEVER auto-probed: auto-probing the system-default device is exactly what misfired and chipmunked EM.
+    out_rate = _env_int("AUDIO_OUTPUT_SAMPLE_RATE")
+    out_channels = _env_int("AUDIO_OUTPUT_CHANNELS")
+    out_kwargs = {}
+    if out_rate:
+        out_kwargs["audio_out_sample_rate"] = out_rate
+    if out_channels:
+        out_kwargs["audio_out_channels"] = out_channels
+    if out_kwargs:
+        logger.info(f"Audio output: pinned {out_kwargs} (fixed-rate device; must match Kokoro emit_rate).")
     return LocalAudioTransport(
         LocalAudioTransportParams(
             audio_in_enabled=True,
@@ -419,6 +553,7 @@ def build_transport():
             audio_in_sample_rate=capture_rate,
             input_device_index=in_idx,
             output_device_index=out_idx,
+            **out_kwargs,
         )
     )
 
@@ -929,6 +1064,12 @@ async def start_brain(llm) -> None:
     start = getattr(client, "start", None)
     if start is not None:
         await start()
+    # Foundation: declare this client's room_id + capabilities once, after the brain is healthy. Tolerant
+    # — a brain without /attach is a logged no-op (never blocks startup, no deploy-order coupling).
+    attach = getattr(client, "attach", None)
+    session_id = getattr(llm, "session_id", None)
+    if attach is not None and session_id is not None:
+        await attach(session_id)
 
 
 async def stop_brain(llm) -> None:

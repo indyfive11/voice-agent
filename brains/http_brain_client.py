@@ -35,17 +35,31 @@ class HttpBrainClient:
         cwd: str | None = None,
         start_timeout: float = 30.0,
         transport: httpx.AsyncBaseTransport | None = None,
+        auth_token: str | None = None,
+        room_id: str | None = None,
+        capabilities: dict | None = None,
     ):
         self._base_url = base_url.rstrip("/")
         self._launch = list(launch) if launch else None
         self._cwd = cwd
         self._start_timeout = start_timeout
+        # Multi-room foundation: room_id is the durable per-room routing key (one per deployment), stamped
+        # onto every brain payload (absent when None → back-compat, like `wake`). The brain reads it via
+        # body.get("room_id"); it's the key it'll multiplex per-room history on. capabilities = this client's
+        # declared profile (wake/vad/stt/tts), sent once at /attach.
+        self._room_id = room_id or None
+        self._capabilities = capabilities or {}
+        # A LAN/remote brain (Pi satellite, Topology B) requires a shared-secret bearer token on
+        # every endpoint but /health; a loopback brain leaves it None and the header is omitted.
+        # Set once on the client so it rides every request (httpx merges these defaults per call).
+        headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else None
         # No overall read timeout — turns can run long (tools / model). Keep a connect timeout.
         # `transport` lets tests inject an in-process ASGI app (httpx.ASGITransport).
         self._http = httpx.AsyncClient(
             base_url=self._base_url,
             timeout=httpx.Timeout(None, connect=10.0),
             transport=transport,
+            headers=headers,
         )
         self._proc: asyncio.subprocess.Process | None = None
         self._active_session: str | None = None
@@ -105,12 +119,18 @@ class HttpBrainClient:
                     continue
                 yield BrainEvent(**{k: v for k, v in obj.items() if k in _EVENT_FIELDS})
 
+    def _with_room(self, d: dict) -> dict:
+        """Stamp the durable room_id onto an outgoing payload/params (absent when None → back-compat)."""
+        if self._room_id:
+            d["room_id"] = self._room_id
+        return d
+
     async def respond(self, session_id: str, text: str, wake: dict | None = None) -> AsyncIterator[BrainEvent]:
         self._active_session = session_id
         payload = {"session_id": session_id, "text": text, "override_token": None}
         if wake is not None:  # item C: out-of-band acoustic wake signal (optional, back-compat)
             payload["wake"] = wake
-        async for ev in self._sse("/respond", payload):
+        async for ev in self._sse("/respond", self._with_room(payload)):
             yield ev
 
     async def confirm(
@@ -119,14 +139,35 @@ class HttpBrainClient:
         self._active_session = session_id
         async for ev in self._sse(
             "/confirm",
-            {"session_id": session_id, "id": confirm_id, "approved": approved, "passphrase": passphrase},
+            self._with_room(
+                {"session_id": session_id, "id": confirm_id, "approved": approved, "passphrase": passphrase}
+            ),
         ):
             yield ev
+
+    async def attach(self, session_id: str) -> dict:
+        """Declare this client's room_id + capabilities to the brain once at startup (after /health).
+
+        Net-new capability handshake (no-op on an older brain: a 404/error is a logged no-op, like
+        media_state — never hard-couples deploy order). Bidirectional: returns the brain's reply
+        (e.g. {"status":"ok","brain":{"version":..,"accepts_room_id":true}}) so the client learns what
+        the brain supports. Idempotent on the brain side (safe to re-call on reconnect)."""
+        payload = self._with_room({"session_id": session_id, "capabilities": self._capabilities})
+        try:
+            r = await self._http.post("/attach", json=payload, timeout=httpx.Timeout(5.0))
+            if r.status_code == 200:
+                info = r.json()
+                logger.info(f"Brain: attached (room={self._room_id}, caps={self._capabilities}) → {info}")
+                return info
+            logger.info(f"Brain: /attach returned {r.status_code} (older brain?) — capabilities not registered")
+        except Exception as e:  # noqa: BLE001 - tolerant: attach is best-effort, never blocks startup
+            logger.debug(f"Brain: /attach unavailable (ignored): {type(e).__name__}: {e}")
+        return {}
 
     async def cancel(self, session_id: str) -> None:
         """Abort the in-flight turn (barge-in). Keeps the client/subprocess alive."""
         try:
-            await self._http.post("/cancel", json={"session_id": session_id})
+            await self._http.post("/cancel", json=self._with_room({"session_id": session_id}))
         except Exception as e:  # noqa: BLE001
             logger.debug(f"Brain: /cancel failed (already done?): {type(e).__name__}: {e}")
 
@@ -136,7 +177,7 @@ class HttpBrainClient:
         Best-effort: a brain without `/media/duck` (404) or no active media is a harmless no-op."""
         try:
             await self._http.post(
-                "/media/duck", json={"session_id": session_id, "on": on, "mute": mute},
+                "/media/duck", json=self._with_room({"session_id": session_id, "on": on, "mute": mute}),
                 timeout=httpx.Timeout(5.0),
             )
         except Exception as e:  # noqa: BLE001
@@ -153,7 +194,7 @@ class HttpBrainClient:
         try:
             r = await self._http.get(
                 "/media/state",
-                params={"session_id": session_id, "bot_speaking": str(bot_speaking).lower()},
+                params=self._with_room({"session_id": session_id, "bot_speaking": str(bot_speaking).lower()}),
                 timeout=httpx.Timeout(2.0),
             )
             if r.status_code == 200:

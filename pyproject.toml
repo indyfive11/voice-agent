@@ -14,6 +14,8 @@ dependencies = [
     "onnxruntime",
     "python-dotenv",
     "loguru",
+    "httpx",                   # brain client + RemoteSTTService (async, non-blocking) — was transitive
+    "aiohttp",                 # stt_service/server.py (standalone STT service) — was transitive via pipecat
     "websockets>=13.1,<16.0",  # relaxed from >=16.0 (vestigial — nothing imports it) for pipecat-ai-tail compat
     "openwakeword>=0.4.0",
     "nanowakeword>=2.1.3",  # alt wake engine (WAKE_WORD_ENGINE=nano); durable wake-over-music model
@@ -33,6 +35,12 @@ swap = [
 # project isn't pinned to 3.12. Install with `uv sync --extra speex` on 3.12 (builds from sdist elsewhere).
 speex = [
     "speexdsp-ns>=0.1.2",
+]
+# piper TTS — a FAST local CPU TTS for weak thin-client hardware (a Pi-4 is ~16s/utterance on Kokoro).
+# Per-device by design: install ONLY where TTS_PROVIDER=piper (the Pi satellite) with `uv sync --extra piper`;
+# EM keeps Kokoro and never installs this. config.py imports PiperTTSService lazily, so it's absent-safe.
+piper = [
+    "pipecat-ai[piper]==1.3.0",
 ]
 
 [dependency-groups]

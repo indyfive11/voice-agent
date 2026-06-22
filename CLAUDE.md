@@ -18,3 +18,19 @@ Quick orientation:
 - **Default:** local Whisper + Kokoro + Claude (`claude-sonnet-4-6`); LLM can swap to OpenAI-compatible or local Ollama on the RX 7900 XT.
 - **Env:** isolated **Python 3.12–3.13 venv via `uv`** (`requires-python >=3.12,<3.14`; uv provisions it regardless of the 3.14 system python). 3.13 verified 2026-06; the old 3.12-only cap was solely `speexdsp-ns` (cp312 wheel) — now an optional `[speex]` extra. Needs `portaudio` + `espeak-ng`; `ANTHROPIC_API_KEY` only for the default local-Anthropic brain (none for `LLM_PROVIDER=ollama` or an external `BRAIN`).
 - **Safety:** full machine control ships with a 3-tier guardrail (hard denylist → verbal-confirmation gate → read-only auto-run). Review the denylist before the first "full control" run.
+
+## Hardware / install portability (hard SOP)
+
+No hardware-type or installation-specific value may be a **bare constant in code**. It must run on any user's
+machine with zero code edits. Every such value MUST be:
+1. **A config field / env with a SAFE UNIVERSAL DEFAULT = the historical no-op** — unset/empty is valid and behaves
+   exactly as today, never worse (an unconfigured install is never broken by the knob existing).
+2. **Detected ONCE by an explicit, inspectable setup/detect step that WRITES config** — NOT a fragile per-startup
+   auto-probe. (A per-startup audio auto-probe via pipecat `is_format_supported` is exactly what misfired and shipped
+   the 1.84× chipmunk TTS.) Detect from the AUTHORITATIVE OS source: ALSA/PipeWire (`/proc/asound`, `pactl`) for audio
+   rates/devices/channels, `rocminfo`/`nvidia-smi`/`lspci` for GPU, the primary route iface for the LAN IP.
+3. **User-overridable afterward** (the env/config always wins over detection).
+
+**Principle: the running app reads config (dumb) · the setup step detects-and-writes (smart) · the user edits (in
+control).** Genuinely-universal constants (e.g. the 16 kHz `PIPELINE_AUDIO_RATE` ↔ Whisper/Silero training) may stay
+hardcoded — just comment WHY. Mirrored in `gabagent/CLAUDE.md` (cross-repo SOP).
