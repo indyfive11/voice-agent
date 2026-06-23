@@ -244,14 +244,21 @@ def build_llm():
         # GAB_LAUNCH overrides either way (0 = attach-only even on loopback).
         is_remote = host not in ("127.0.0.1", "localhost", "::1")
         do_launch = _env("GAB_LAUNCH", "0" if is_remote else "1") not in ("0", "false", "False")
-        launch = [gab_bin, "--voice-serve", "--port", str(port), "--cwd", project] if do_launch else None
+        # Multi-room foundation: ROOM_ID is the durable per-room/device routing key (default = hostname);
+        # capabilities is this client's profile (what it does locally vs offloads), declared once at /attach.
+        room_id = _room_id()
+        # Key a SPAWNED brain to this room at launch (--room-id) so its TMI Tier-1 buckets under the room,
+        # not the brain's implicit 'default'. This just makes explicit-at-launch the room_id the client
+        # already sends per turn; default=hostname keeps EM-local on its existing bucket, no migration
+        # (process-per-room: one brain per room — see the brain-topology decision).
+        launch = (
+            [gab_bin, "--voice-serve", "--port", str(port), "--cwd", project, "--room-id", room_id]
+            if do_launch else None
+        )
         logger.info(
             f"Brain: gabagent (HTTP/SSE {base_url}, project={project}, "
             f"{'spawn' if launch else 'attach'}, auth={'on' if auth_token else 'off'})"
         )
-        # Multi-room foundation: ROOM_ID is the durable per-room/device routing key (default = hostname);
-        # capabilities is this client's profile (what it does locally vs offloads), declared once at /attach.
-        room_id = _room_id()
         stt_provider = (_env("STT_PROVIDER", "whisper") or "whisper").lower()
         capabilities = {
             "wake": (_env("WAKE_WORD_ENGINE", "nano") or "nano").lower() != "off",
