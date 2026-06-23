@@ -341,6 +341,14 @@ class BrainLLMService(LLMService):
         self._wake_dur_floor_ms = float(os.environ.get("WAKE_BARE_DUR_FLOOR_MS", "400"))
         self._wake_dur_ceil_ms = float(os.environ.get("WAKE_BARE_DUR_CEIL_MS", "1500"))
         self._wake_signal_max_age = 30.0  # ignore a stale pending wake that produced no prompt turn
+        # Lever A (is_addressed fast-pass): a turn that LED with the wake word (voice side stripped the
+        # vocative the brain can't see) is addressed by definition → forward a `wake.fresh` marker so the
+        # brain's is_addressed gate can skip its arya LLM classify. Gated OFF by default until the brain
+        # consumer is live (flip WAKE_FRESH_MARKER=1 jointly); unset = today's behavior, no marker.
+        self._wake_fresh_enabled = os.environ.get("WAKE_FRESH_MARKER", "0") not in ("0", "false", "False")
+        self._this_turn_led_with_wake = False  # reset per turn in _process_context
+        self._this_turn_wake_conf: float | None = None
+        self._this_turn_residual_words = 0  # command words after the stripped wake (aside-safety hint)
         # Log the correlation key so the transcript can be lined up with the brain's own logs.
         _tlog(f"BRAIN | gabagent session_id={self._session_id}")
 
@@ -673,9 +681,21 @@ class BrainLLMService(LLMService):
             wake["speech_dur_ms"] = speech_dur_ms
         return wake
 
+    def _fresh_wake_marker(self) -> dict:
+        """Lever A: this turn led with the wake word → addressed by definition. Emit `{fresh: true}` (plus
+        the acoustic confidence when available) so the brain's is_addressed gate fast-passes without an arya
+        LLM classify. Only built when WAKE_FRESH_MARKER is on AND the turn led with the wake word."""
+        marker: dict = {"fresh": True, "residual_words": self._this_turn_residual_words}
+        if self._this_turn_wake_conf is not None:
+            marker["confidence"] = self._this_turn_wake_conf
+        return marker
+
     async def _process_context(self, context):
         user_text = self._latest_user_text(context)
         self._reply_buf = []
+        self._this_turn_led_with_wake = False  # Lever A: set when this turn's text led with the wake word
+        self._this_turn_wake_conf = None
+        self._this_turn_residual_words = 0
         self._last_status: str | None = None  # suppress repeated identical status spam
         self._suppress_next_status = False  # skip the transitional fallback status after an error
         low = user_text.strip().lower()
@@ -789,6 +809,13 @@ class BrainLLMService(LLMService):
                     return
                 if had_wake:
                     user_text = command  # forward only what followed the wake word
+                    # Lever A: capture that this turn led with the wake word (addressed by definition) before
+                    # clearing the pending acoustic wake — used to mark `wake.fresh` for the brain's
+                    # is_addressed fast-pass. The brain can't see the stripped vocative otherwise.
+                    self._this_turn_led_with_wake = True
+                    self._this_turn_residual_words = len(command.split())  # aside-safety hint for the gate
+                    if self._pending_wake is not None:
+                        self._this_turn_wake_conf = round(float(self._pending_wake["score"]), 3)
                     self._pending_wake = None  # name survived in the text → no out-of-band signal needed
 
             # A real command / confirm answer is being processed → the bare-wake episode is genuinely over.
@@ -819,11 +846,22 @@ class BrainLLMService(LLMService):
                 # `had_wake=False`) forward the out-of-band acoustic wake signal so the brain's listen-first
                 # guard can trust the audio over the text. Clean wake/command turns cleared _pending_wake
                 # above, so this is None for them (back-compat).
-                wake_obj = None if had_wake else self._consume_wake_signal()
-                _tlog(f"USER  | {user_text!r}" + (
-                    f"  (wake-signal bwl={wake_obj['bare_wake_likelihood']:.2f} "
-                    f"conf={wake_obj['confidence']:.2f} dur={wake_obj.get('speech_dur_ms')}ms "
-                    f"post={wake_obj.get('post_wake_voiced_ms')}ms)" if wake_obj else ""))
+                # Lever A: a wake-led turn (clean strip) forwards a `wake.fresh` marker so the brain's
+                # is_addressed gate fast-passes (skips its arya classify). The strip-failed path still
+                # forwards the bare_wake_likelihood backstop. Mutually exclusive per turn.
+                if self._wake_fresh_enabled and self._this_turn_led_with_wake:
+                    wake_obj = self._fresh_wake_marker()
+                else:
+                    wake_obj = None if had_wake else self._consume_wake_signal()
+                if not wake_obj:
+                    wake_detail = ""
+                elif wake_obj.get("fresh"):
+                    wake_detail = f"  (wake fresh — addressed conf={wake_obj.get('confidence')})"
+                else:
+                    wake_detail = (f"  (wake-signal bwl={wake_obj['bare_wake_likelihood']:.2f} "
+                                   f"conf={wake_obj['confidence']:.2f} dur={wake_obj.get('speech_dur_ms')}ms "
+                                   f"post={wake_obj.get('post_wake_voiced_ms')}ms)")
+                _tlog(f"USER  | {user_text!r}{wake_detail}")
                 stream = self._client.respond(self._session_id, user_text, wake=wake_obj)
             await self._consume(stream)
         finally:

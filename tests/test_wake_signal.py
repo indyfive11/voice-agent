@@ -287,3 +287,49 @@ def test_stale_wake_dropped():
     svc._pending_wake["ts"] -= svc._wake_signal_max_age + 5  # age it out
     asyncio.run(svc._process_context(_ctx("how are you")))
     assert client.respond_wake[-1] is None
+
+
+# ── Lever A: wake.fresh addressed-fast-pass marker (clean-strip path) ────────────────────────────
+def test_fresh_marker_on_clean_command_when_enabled():
+    # Flag ON + a wake-led command ("aria play jazz") → forward {fresh:true, confidence} so the brain's
+    # is_addressed gate fast-passes (the brain can't see the stripped vocative otherwise).
+    client = FakeBrainClient(respond_events=[BrainEvent("done")])
+    svc = _svc(client)
+    svc._wake_fresh_enabled = True
+    _stamp_wake(svc, score=0.99)
+    asyncio.run(svc._process_context(_ctx("aria play jazz")))
+    assert client.respond_calls[-1][1] == "play jazz"             # wake stripped, command forwarded
+    # fresh marker + aside-safety hint (residual_words = command word count after the strip; "play jazz" = 2)
+    assert client.respond_wake[-1] == {"fresh": True, "residual_words": 2, "confidence": 0.99}
+    assert svc._pending_wake is None
+
+
+def test_fresh_marker_off_by_default_clean_command():
+    # Default (flag off) → a clean wake-led command sends NO marker (exact prior behavior, back-compat).
+    client = FakeBrainClient(respond_events=[BrainEvent("done")])
+    svc = _svc(client)
+    assert svc._wake_fresh_enabled is False
+    _stamp_wake(svc, score=0.99)
+    asyncio.run(svc._process_context(_ctx("aria play jazz")))
+    assert client.respond_wake[-1] is None
+
+
+def test_fresh_marker_not_on_strip_failed_path():
+    # Flag ON but the name garbled (had_wake=False) → the bare_wake_likelihood backstop, NOT the fresh
+    # marker. The two are mutually exclusive per turn.
+    client = FakeBrainClient(respond_events=[BrainEvent("done")])
+    svc = _svc(client)
+    svc._wake_fresh_enabled = True
+    _stamp_wake(svc, score=0.99, dur_ms=600)
+    asyncio.run(svc._process_context(_ctx("how are you")))
+    w = client.respond_wake[-1]
+    assert w is not None and "bare_wake_likelihood" in w and not w.get("fresh")
+
+
+def test_fresh_marker_not_on_in_window_followon():
+    # Aside-safety: a follow-on with no wake-led text and no fresh wake → no marker, even with the flag on.
+    client = FakeBrainClient(respond_events=[BrainEvent("done")])
+    svc = _svc(client)
+    svc._wake_fresh_enabled = True
+    asyncio.run(svc._process_context(_ctx("what about now")))
+    assert client.respond_wake[-1] is None
