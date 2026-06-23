@@ -27,15 +27,23 @@ os.makedirs(_EXEC_TMP, exist_ok=True)
 os.environ["TMPDIR"] = _EXEC_TMP
 tempfile.tempdir = None  # drop any cached value so TMPDIR is re-read
 
-# Stamp a stable, collision-proof property on every PipeWire stream this process opens (mic + TTS output)
+# Stamp a stable, collision-proof property on every audio stream this process opens (mic + TTS output)
 # so the gabagent brain's universal local-media duck can EXCLUDE Aria's own TTS output exactly (vs a
-# node-name heuristic) and never mute her. PipeWire reads PIPEWIRE_PROPS at stream-connect, so — like
-# TMPDIR above — it must be set BEFORE any audio stream opens. The brain skips any sink-input whose
-# `pactl list sink-inputs` Properties block contains gabagent.duck_exclude = "1". NB: the ALSA→PipeWire
-# path (our PyAudio output, node alsa_playback.python3.12) honours PIPEWIRE_PROPS, NOT PULSE_PROP —
-# verified on this box 2026-06-04. The mic source-output also gets it (harmless: the duck only scans
-# sink-inputs). setdefault so an explicit override wins.
+# node-name heuristic) and never mute her, AND so the brain's media-state detection never counts Aria's
+# own voice as "media playing". The brain skips any sink-input whose `pactl list sink-inputs` Properties
+# block contains gabagent.duck_exclude = "1". Like TMPDIR above, both must be set BEFORE any stream opens.
+#
+# CRITICAL: the stamp must land regardless of which output PATH the stream takes, because that path is
+# config-dependent (AUDIO_OUTPUT_DEVICE_NAME):
+#   - NATIVE PipeWire client (e.g. the old node alsa_playback.python3.x): honours PIPEWIRE_PROPS only.
+#   - libpulse path (AUDIO_OUTPUT_DEVICE_NAME=pulse → ALSA `pulse` PCM → pipewire-pulse, node
+#     "ALSA plug-in [pythonX.Y]"): honours PULSE_PROP only — PIPEWIRE_PROPS is IGNORED here.
+# Set BOTH so the exclude is path-independent. (2026-06-22: the EM audio fix switched output to the
+# libpulse path, which silently dropped the PIPEWIRE_PROPS-only stamp → the brain counted Aria's own TTS
+# sink as playing media. Verified: PIPEWIRE_PROPS confirmed native 2026-06-04; PULSE_PROP covers `pulse`.)
+# The mic stream also gets it (harmless: the duck only scans sink-inputs). setdefault so an override wins.
 os.environ.setdefault("PIPEWIRE_PROPS", "{ gabagent.duck_exclude = 1 }")
+os.environ.setdefault("PULSE_PROP", "gabagent.duck_exclude=1")
 
 from dotenv import load_dotenv
 from loguru import logger
