@@ -2,19 +2,20 @@
 
 Drop-in for KokoroTTSService when the device can't run Kokoro fast enough locally (a Pi-4 is ~16s/utterance)
 but piper's local voice quality isn't good enough. The Pi keeps wake/VAD/endpointing/audio-I/O; only TTS is
-offloaded. ``run_tts`` POSTs the reply text to the EM TTS service (``tts_service/server.py``), gets back a WAV
-in Kokoro's good voice, resamples it to the output rate, and yields a ``TTSAudioRawFrame`` — exactly mirroring
-KokoroTTSService (which resamples its create_stream output to ``self.sample_rate``).
+offloaded. ``run_tts`` POSTs the reply text to the EM TTS service (``tts_service/server.py``) and **streams**
+the audio back: it consumes ``POST /tts/stream`` (chunked raw PCM, emitted sentence-by-sentence as Kokoro
+synthesizes), resamples each chunk to the output rate, and yields a ``TTSAudioRawFrame`` per chunk — so
+first-audio lands on sentence 1 instead of waiting for the whole reply to synthesize (the satellite's biggest
+latency lever; token→audio drops from full-reply to first-sentence). Mirrors KokoroTTSService's incremental
+create_stream behaviour, just over the wire.
 
-Async ``httpx`` (non-blocking) with a read timeout; a failure yields an ``ErrorFrame`` (the turn degrades, the
-existing brain-error apology covers a dead service). ``room_id`` rides as ``X-Room-Id``; bearer as
-``Authorization``. ``transport`` is injectable for tests (in-process ASGI stub, no network).
+Async ``httpx`` streaming (non-blocking) with a read timeout; a failure yields an ``ErrorFrame`` (the turn
+degrades, the existing brain-error apology covers a dead service). ``room_id`` rides as ``X-Room-Id``; bearer
+as ``Authorization``. ``transport`` is injectable for tests (in-process ASGI stub, no network).
 """
 
 from __future__ import annotations
 
-import io
-import wave
 from collections.abc import AsyncGenerator
 
 import httpx
@@ -71,26 +72,36 @@ class RemoteTTSService(TTSService):
         )
 
     async def run_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame, None]:
-        logger.debug(f"{self}: Generating TTS (remote) [{text}]")
+        logger.debug(f"{self}: Generating TTS (remote, streaming) [{text}]")
         await self.start_tts_usage_metrics(text)
+        leftover = b""  # carry an odd trailing byte across chunks (PCM is 16-bit; never split a sample)
+        first = True
         try:
-            resp = await self._http.post(
-                "/tts", json={"text": text, "voice": self._voice},
+            async with self._http.stream(
+                "POST", "/tts/stream", json={"text": text, "voice": self._voice},
                 headers={"Content-Type": "application/json"},
-            )
-            resp.raise_for_status()
-            wav = resp.content
+            ) as resp:
+                resp.raise_for_status()
+                # Rate rides in the header (Kokoro native, e.g. 24k); resample each chunk to our output rate.
+                src_rate = int(resp.headers.get("X-Sample-Rate") or 24000)
+                async for chunk in resp.aiter_bytes():
+                    if not chunk:
+                        continue
+                    buf = leftover + chunk
+                    cut = len(buf) - (len(buf) % 2)
+                    pcm, leftover = buf[:cut], buf[cut:]
+                    if not pcm:
+                        continue
+                    if first:
+                        await self.stop_ttfb_metrics()  # first audio = first sentence, not full reply
+                        first = False
+                    audio = await self._resampler.resample(pcm, src_rate, self.sample_rate)
+                    if audio:
+                        yield TTSAudioRawFrame(audio, self.sample_rate, 1)
         except Exception as e:  # noqa: BLE001 - network/timeout/HTTP: degrade to ErrorFrame, never stall the loop
-            logger.warning(f"TTS: remote synth failed ({type(e).__name__}: {e})")
+            logger.warning(f"TTS: remote stream failed ({type(e).__name__}: {e})")
             yield ErrorFrame(f"Remote TTS unavailable: {type(e).__name__}")
             return
-        # WAV is self-describing — read the rate from the header, resample to our output rate (like Kokoro).
-        with wave.open(io.BytesIO(wav), "rb") as w:
-            src_rate = w.getframerate()
-            pcm = w.readframes(w.getnframes())
-        await self.stop_ttfb_metrics()
-        audio = await self._resampler.resample(pcm, src_rate, self.sample_rate)
-        yield TTSAudioRawFrame(audio, self.sample_rate, 1)
 
     async def cleanup(self) -> None:
         await super().cleanup()
