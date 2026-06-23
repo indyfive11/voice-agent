@@ -18,8 +18,16 @@ Design (foundation for multi-room, hot-pluggable thin clients):
   ``small.en``, ``device=auto``.
 
 Run:  ``uv run python -m stt_service.server --host 192.168.1.100 --port 8770``
-Env:  ``STT_MODEL`` (small.en), ``STT_SERVICE_DEVICE`` (auto), ``STT_SERVICE_COMPUTE_TYPE`` (default),
+Env:  ``STT_SERVICE_BACKEND`` (faster | whispercpp; default faster), ``WHISPER_CPP_URL``
+      (http://127.0.0.1:8079, the warm GPU whisper-server when backend=whispercpp),
+      ``STT_MODEL`` (small.en), ``STT_SERVICE_DEVICE`` (auto), ``STT_SERVICE_COMPUTE_TYPE`` (default),
       ``STT_SERVICE_AUTH_TOKEN``, ``EM_STT_MAX_CONCURRENCY`` (1), ``STT_SERVICE_HOST``/``STT_SERVICE_PORT``.
+
+Backends: faster-whisper is CPU-only here (CTranslate2 has no AMD/ROCm build). For GPU on the EM
+RX 7900 XT, run a loopback ``whisper-server`` (whisper.cpp, Vulkan) and set ``STT_SERVICE_BACKEND=
+whispercpp`` — this service then proxies each utterance to it (warm inference ~30-50ms vs ~1.3s CPU),
+staying the LAN-facing bearer-guarded, room-keyed layer. Default unchanged so CPU/single-box installs
+behave exactly as before.
 """
 
 from __future__ import annotations
@@ -31,6 +39,7 @@ import io
 import os
 import wave
 
+import aiohttp
 import numpy as np
 from aiohttp import web
 from loguru import logger
@@ -62,17 +71,95 @@ def wav_to_float32(wav_bytes: bytes) -> tuple[np.ndarray, int]:
     return audio, sample_rate
 
 
+def float32_to_wav(audio: np.ndarray, sample_rate: int) -> bytes:
+    """Encode a float32 [-1, 1] mono array → a 16-bit mono WAV (for backends that want a file upload)."""
+    pcm = (np.clip(audio, -1.0, 1.0) * 32767.0).astype(np.int16).tobytes()
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(sample_rate)
+        w.writeframes(pcm)
+    return buf.getvalue()
+
+
 def _transcribe(model, audio: np.ndarray, language: str | None) -> str:
     """Blocking transcribe (run via asyncio.to_thread). Mirrors whisper/stt.py text assembly."""
     segments, _ = model.transcribe(audio, language=language)
     return "".join(seg.text for seg in segments).strip()
 
 
+# --- transcribe backends -----------------------------------------------------------------------
+# A backend exposes ``async transcribe(audio, sample_rate, language) -> str``. Two ship today:
+#   * faster-whisper (CPU) — the default; CTranslate2 has no AMD/ROCm path, so it's CPU-bound here.
+#   * whisper.cpp (GPU) — proxies to a local warm ``whisper-server`` (Vulkan/ROCm). On the EM RX 7900 XT
+#     this is ~25x faster (warm inference ~30-50ms vs ~1.3s CPU for a 2s utterance). Default stays
+#     faster-whisper so a CPU-only / single-box install is byte-for-byte unchanged (no-hardcodes SOP).
+
+class FasterWhisperBackend:
+    """CPU faster-whisper. Runs the blocking transcribe in a thread so the event loop stays free."""
+
+    def __init__(self, model):
+        self._model = model
+
+    async def transcribe(self, audio: np.ndarray, sample_rate: int, language: str | None) -> str:
+        return await asyncio.to_thread(_transcribe, self._model, audio, language)
+
+    async def close(self) -> None:
+        pass
+
+
+class WhisperCppBackend:
+    """GPU whisper.cpp via a local ``whisper-server`` /inference endpoint (multipart WAV → {"text": …}).
+
+    The whisper-server keeps the model warm on the GPU; we just forward each utterance over loopback
+    HTTP (no thread needed — network I/O is naturally non-blocking). The server is loopback-only; THIS
+    service remains the LAN-facing, bearer-guarded, room-keyed layer.
+    """
+
+    def __init__(self, url: str, *, session: aiohttp.ClientSession | None = None, timeout: float = 30.0):
+        self._url = url.rstrip("/") + "/inference"
+        self._session = session
+        self._timeout = aiohttp.ClientTimeout(total=timeout)
+
+    async def _ensure_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession()
+        return self._session
+
+    async def transcribe(self, audio: np.ndarray, sample_rate: int, language: str | None) -> str:
+        session = await self._ensure_session()
+        form = aiohttp.FormData()
+        form.add_field("file", float32_to_wav(audio, sample_rate),
+                       filename="audio.wav", content_type="audio/wav")
+        form.add_field("response_format", "json")
+        if language:
+            form.add_field("language", language)
+        async with session.post(self._url, data=form, timeout=self._timeout) as r:
+            r.raise_for_status()
+            data = await r.json()
+        return (data.get("text") or "").strip()
+
+    async def close(self) -> None:
+        if self._session is not None and not self._session.closed:
+            await self._session.close()
+
+
+def _load_backend():
+    """Select the transcribe backend from STT_SERVICE_BACKEND (faster | whispercpp). Default faster."""
+    backend = (os.environ.get("STT_SERVICE_BACKEND") or "faster").lower()
+    if backend in ("whispercpp", "whisper.cpp", "whisper-cpp", "gpu"):
+        url = os.environ.get("WHISPER_CPP_URL") or "http://127.0.0.1:8079"
+        logger.info(f"STT service: backend=whispercpp (GPU) proxying to whisper-server {url}")
+        return WhisperCppBackend(url)
+    return FasterWhisperBackend(_load_model())
+
+
 class SttApp:
     """The STT request handlers. Holds the shared model + a concurrency gate; no per-request state."""
 
-    def __init__(self, model, *, token: str = "", max_concurrency: int = 1):
-        self._model = model
+    def __init__(self, backend, *, token: str = "", max_concurrency: int = 1):
+        self._backend = backend
         self._token = (token or "").strip()
         self._expected = f"Bearer {self._token}" if self._token else ""
         self._sem = asyncio.Semaphore(max(1, max_concurrency))
@@ -101,8 +188,8 @@ class SttApp:
             return web.json_response({"error": "bad audio"}, status=400)
         async with self._sem:
             try:
-                text = await asyncio.to_thread(_transcribe, self._model, audio, language)
-            except Exception as e:  # noqa: BLE001 - a model failure is a 500, the client degrades gracefully
+                text = await self._backend.transcribe(audio, sample_rate, language)
+            except Exception as e:  # noqa: BLE001 - a backend failure is a 500, the client degrades gracefully
                 logger.error(f"STT[{room_id}]: transcribe failed ({type(e).__name__}: {e})")
                 return web.json_response({"error": "stt failed"}, status=500)
         dur = len(audio) / sample_rate if sample_rate else 0.0
@@ -110,15 +197,19 @@ class SttApp:
         return web.json_response({"text": text, "room_id": room_id})
 
 
-def build_app(model, *, token: str = "", max_concurrency: int = 1) -> web.Application:
-    """Build the aiohttp app. `model` is injectable so tests pass a fake (no model load)."""
-    handlers = SttApp(model, token=token, max_concurrency=max_concurrency)
+def build_app(model=None, *, token: str = "", max_concurrency: int = 1, backend=None) -> web.Application:
+    """Build the aiohttp app. Pass either a faster-whisper `model` (wrapped in FasterWhisperBackend) or a
+    ready `backend` directly; both are injectable so tests pass a fake (no model load / no GPU server)."""
+    if backend is None:
+        backend = FasterWhisperBackend(model)
+    handlers = SttApp(backend, token=token, max_concurrency=max_concurrency)
     # client_max_size: utterances are small, but a long ramble at 16k mono is ~2MB/min — give headroom.
     app = web.Application(client_max_size=64 * 1024 * 1024)
     app.add_routes([
         web.get("/health", handlers.health),
         web.post("/stt", handlers.stt),
     ])
+    app.on_cleanup.append(lambda _app: backend.close())  # close any backend HTTP session on shutdown
     return app
 
 
@@ -137,8 +228,8 @@ def main() -> None:
             "set STT_SERVICE_AUTH_TOKEN so the LAN-reachable /stt requires a bearer token."
         )
 
-    model = _load_model()
-    app = build_app(model, token=token, max_concurrency=max_concurrency)
+    backend = _load_backend()
+    app = build_app(backend=backend, token=token, max_concurrency=max_concurrency)
     logger.info(f"STT service listening on http://{args.host}:{args.port}  (Ctrl-C to stop)")
     web.run_app(app, host=args.host, port=args.port, print=None)
 

@@ -12,7 +12,12 @@ import wave
 import numpy as np
 from aiohttp.test_utils import TestClient, TestServer
 
-from stt_service.server import build_app, wav_to_float32
+from stt_service.server import (
+    WhisperCppBackend,
+    build_app,
+    float32_to_wav,
+    wav_to_float32,
+)
 
 
 class _FakeSeg:
@@ -92,4 +97,64 @@ def test_room_id_echoed():
         async with TestClient(TestServer(app)) as client:
             r = await client.post("/stt", data=_wav_bytes(), headers={"X-Room-Id": "kitchen"})
             assert (await r.json())["room_id"] == "kitchen"
+    _run(go())
+
+
+def test_float32_wav_roundtrip():
+    audio, sr = wav_to_float32(_wav_bytes(seconds=0.05, rate=16000))
+    audio2, sr2 = wav_to_float32(float32_to_wav(audio, sr))
+    assert sr2 == 16000 and len(audio2) == len(audio)
+
+
+class _FakeBackend:
+    """A ready backend (the build_app `backend=` seam) — async transcribe, records the audio it saw."""
+
+    def __init__(self, text="gpu text"):
+        self._text = text
+        self.calls = 0
+
+    async def transcribe(self, audio, sample_rate, language):
+        self.calls += 1
+        assert isinstance(audio, np.ndarray) and sample_rate == 16000
+        return self._text
+
+    async def close(self):
+        pass
+
+
+def test_build_app_accepts_a_backend_directly():
+    async def go():
+        be = _FakeBackend("from gpu")
+        app = build_app(backend=be, token="")
+        async with TestClient(TestServer(app)) as client:
+            r = await client.post("/stt", data=_wav_bytes())
+            assert r.status == 200
+            assert (await r.json())["text"] == "from gpu"
+            assert be.calls == 1
+    _run(go())
+
+
+def test_whispercpp_backend_proxies_to_inference():
+    """WhisperCppBackend POSTs a WAV to whisper-server /inference and returns the JSON text."""
+    seen = {}
+
+    class _FakeResp:
+        def raise_for_status(self): pass
+        async def json(self): return {"text": "  hello from whisper.cpp\n"}
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+
+    class _FakeSession:
+        closed = False
+        def post(self, url, data=None, timeout=None):
+            seen["url"] = url
+            seen["data"] = data
+            return _FakeResp()
+
+    async def go():
+        be = WhisperCppBackend("http://127.0.0.1:8079", session=_FakeSession())
+        audio, sr = wav_to_float32(_wav_bytes(seconds=0.05))
+        text = await be.transcribe(audio, sr, "en")
+        assert text == "hello from whisper.cpp"          # stripped
+        assert seen["url"].endswith("/inference")
     _run(go())
