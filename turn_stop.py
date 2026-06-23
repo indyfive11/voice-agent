@@ -27,11 +27,17 @@ Env `TURN_HONOR_INCOMPLETE=0` reverts to the stock behavior (A/B / kill-switch).
 
 from __future__ import annotations
 
+import asyncio
 import time
 
 from loguru import logger
 
-from pipecat.frames.frames import Frame, VADUserStoppedSpeakingFrame
+from pipecat.frames.frames import (
+    Frame,
+    TranscriptionFrame,
+    VADUserStartedSpeakingFrame,
+    VADUserStoppedSpeakingFrame,
+)
 from pipecat.turns.types import ProcessFrameResult
 from pipecat.turns.user_stop.turn_analyzer_user_turn_stop_strategy import (
     TurnAnalyzerUserTurnStopStrategy,
@@ -59,18 +65,48 @@ class SmartTurnHonoringStopStrategy(TurnAnalyzerUserTurnStopStrategy):
         ``stop_secs``: honor-incomplete did its job (don't lower ``stop_secs`` on account of these).
     """
 
-    def __init__(self, *, turn_analyzer, stop_secs: float = 4.0, **kwargs):
+    def __init__(
+        self,
+        *,
+        turn_analyzer,
+        stop_secs: float = 4.0,
+        continuation_grace_secs: float = 0.0,
+        continuation_max_words: int = 3,
+        **kwargs,
+    ):
         super().__init__(turn_analyzer=turn_analyzer, **kwargs)
         self._stop_secs = stop_secs
         self._suppressed_logged = False
         self._hold_started: float | None = None  # monotonic ts of the first INCOMPLETE suppression this turn
         self._last_vad_stop: float | None = None  # monotonic ts of the most recent VAD stop this turn
+        # Continuation grace (#62 drive fix): SmartTurn can mis-judge a SHORT garbled fragment as COMPLETE
+        # and close the turn on it — the EMEET/remote-STT path split "…up <pause> tell me the joke" into two
+        # VAD segments; the turn closed on "up", which arya then auto-ran as volume_up, and the real request
+        # was dropped. When SmartTurn fires COMPLETE on a turn with <= continuation_max_words, hold the stop
+        # for continuation_grace_secs; a fresh VAD onset (the user resuming) cancels the stop so the rest of
+        # the utterance lands in the SAME turn. Only short turns pay the grace; full sentences forward
+        # immediately. 0.0 = OFF = byte-identical to today (the safe-universal default per the portability SOP).
+        self._continuation_grace_secs = continuation_grace_secs
+        self._continuation_max_words = continuation_max_words
+        self._text = ""  # accumulated transcript this turn (for the short-turn continuation heuristic)
+        self._pending_stop_task: asyncio.Task | None = None
 
     async def reset(self):
         await super().reset()
         self._suppressed_logged = False
         self._hold_started = None
         self._last_vad_stop = None
+        self._text = ""
+        await self._cancel_pending_stop()
+
+    async def cleanup(self):
+        await super().cleanup()
+        await self._cancel_pending_stop()
+
+    async def _cancel_pending_stop(self):
+        if self._pending_stop_task:
+            await self.task_manager.cancel_task(self._pending_stop_task)
+            self._pending_stop_task = None
 
     async def process_frame(self, frame: Frame) -> ProcessFrameResult:
         # Timestamp the latest VAD-stop BEFORE delegating: the base handler can synchronously trigger the
@@ -79,6 +115,15 @@ class SmartTurnHonoringStopStrategy(TurnAnalyzerUserTurnStopStrategy):
         # line reports the real end-to-end dead air (the latency a person feels).
         if isinstance(frame, VADUserStoppedSpeakingFrame):
             self._last_vad_stop = time.monotonic()
+        elif isinstance(frame, TranscriptionFrame):
+            if frame.text:  # accumulate the turn's text for the short-turn continuation heuristic
+                self._text = f"{self._text} {frame.text}".strip() if self._text else frame.text
+        elif isinstance(frame, VADUserStartedSpeakingFrame):
+            # The user resumed during the continuation grace → cancel the pending stop and keep the turn
+            # open so the continuation joins this turn (instead of becoming a dropped next-turn fragment).
+            if self._pending_stop_task is not None:
+                await self._cancel_pending_stop()
+                _tlog("TURN  | continuation — user resumed within grace, holding turn open")
         return await super().process_frame(frame)
 
     async def trigger_user_turn_stopped(self):
@@ -93,6 +138,37 @@ class SmartTurnHonoringStopStrategy(TurnAnalyzerUserTurnStopStrategy):
                 self._suppressed_logged = True
                 _tlog("TURN  | holding — SmartTurn INCOMPLETE (waiting for end-of-turn, not cutting mid-pause)")
             return
+        # Continuation grace: a COMPLETE verdict on a SHORT turn is the fragment-mis-close signature. Defer
+        # the stop briefly so a resume can fold in; a longer turn (a real sentence) forwards immediately.
+        if self._pending_stop_task is not None:
+            return  # grace already running for this turn — don't double-schedule
+        words = len(self._text.split())
+        if self._continuation_grace_secs > 0 and 1 <= words <= self._continuation_max_words:
+            _tlog(
+                f"TURN  | short turn ({words}w \"{self._text}\") — {self._continuation_grace_secs:.2f}s "
+                "continuation grace before forwarding (fragment guard)"
+            )
+            self._pending_stop_task = self.task_manager.create_task(
+                self._grace_then_stop(), f"{self}::_grace_then_stop"
+            )
+            await asyncio.sleep(0)  # ensure it's scheduled
+            return
+        await self._do_stop()
+
+    async def _grace_then_stop(self):
+        try:
+            await asyncio.sleep(self._continuation_grace_secs)
+        except asyncio.CancelledError:
+            return
+        finally:
+            self._pending_stop_task = None
+        # If SmartTurn re-opened the turn during the grace (user resumed without a fresh onset frame we
+        # caught), don't force the stop — let the turn continue and re-evaluate on the next COMPLETE.
+        if getattr(self._turn_analyzer, "speech_triggered", False):
+            return
+        await self._do_stop()
+
+    async def _do_stop(self):
         self._log_finalization()
         await super().trigger_user_turn_stopped()
 

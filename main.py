@@ -245,11 +245,20 @@ async def run() -> None:
     # which otherwise ends a turn the model judged unfinished and cuts the user off on a natural pause. See
     # turn_stop.SmartTurnHonoringStopStrategy. Default on; TURN_HONOR_INCOMPLETE=0 reverts to stock pipecat.
     honor_incomplete = os.environ.get("TURN_HONOR_INCOMPLETE", "1") not in ("0", "false", "False")
+    # Continuation grace (#62 drive fix): SmartTurn can mis-judge a SHORT garbled fragment as COMPLETE and
+    # close the turn on it (the EMEET/remote-STT path split "…up <pause> tell me the joke" into two VAD
+    # segments → the turn closed on "up", which arya auto-ran as volume_up, and the real request was dropped).
+    # When SmartTurn fires COMPLETE on a turn with <= max_words, hold the stop this long for a possible resume
+    # (a fresh VAD onset cancels it → the rest of the utterance lands in the SAME turn). Only short turns pay
+    # the grace. 0.0 = OFF = today's behavior (safe-universal default; enabled per-device, e.g. the Pi .env).
+    continuation_grace_secs = float(os.environ.get("TURN_CONTINUATION_GRACE_SECS", "0.0"))
+    continuation_max_words = int(os.environ.get("TURN_CONTINUATION_MAX_WORDS", "3"))
     logger.info(
         f"Turn detection: VAD stop_secs={vad_stop_secs}s confidence={vad_confidence} "
         f"min_volume={vad_min_volume} → SmartTurn v3 "
         f"(stop_secs={smart_turn_stop_secs}s max-silence fallback, max_turn={max_turn_secs}s cap, "
-        f"honor-incomplete={honor_incomplete})"
+        f"honor-incomplete={honor_incomplete}, "
+        f"continuation-grace={continuation_grace_secs}s (<= {continuation_max_words}w))"
     )
     turn_analyzer = LocalSmartTurnAnalyzerV3(
         params=SmartTurnParams(
@@ -310,7 +319,12 @@ async def run() -> None:
                     # real COMPLETE verdict or the stop_secs(4s) silence. TURN_HONOR_INCOMPLETE=0 reverts.
                     # It's also passed stop_secs so its per-turn finalization-latency log (#60) can tell a
                     # stop_secs-fallback turn (the latency tax) apart from a prompt COMPLETE.
-                    (SmartTurnHonoringStopStrategy(turn_analyzer=turn_analyzer, stop_secs=smart_turn_stop_secs)
+                    (SmartTurnHonoringStopStrategy(
+                        turn_analyzer=turn_analyzer,
+                        stop_secs=smart_turn_stop_secs,
+                        continuation_grace_secs=continuation_grace_secs,
+                        continuation_max_words=continuation_max_words,
+                     )
                      if honor_incomplete
                      else TurnAnalyzerUserTurnStopStrategy(turn_analyzer=turn_analyzer)),
                     # Safety cap so a long continuous ramble can't hang the turn (SmartTurn won't
