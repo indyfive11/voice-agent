@@ -18,9 +18,19 @@ failure or a missing stream is a logged no-op, never an error that could break a
 
 Env (all default to the historical no-op — DISABLED — per the no-hardcodes SOP, so EM / any other install
 is byte-identical until the knob is set; enabled per-device, e.g. the Pi ``.env``):
-  ``MEDIA_DUCK_LOCAL``        ``1`` to enable (default off).
-  ``MEDIA_DUCK_LOCAL_PCT``    duck-to percentage (default 18, mirrors the brain's ``_DUCK_VOLUME``).
-  ``MEDIA_DUCK_LOCAL_MATCH``  case-insensitive substring matched vs application.name/node.name (default ``mopidy``).
+  ``MEDIA_DUCK_LOCAL``         ``1`` to enable (default off).
+  ``MEDIA_DUCK_LOCAL_PCT``     duck-to percentage (default 18, mirrors the brain's ``_DUCK_VOLUME``).
+  ``MEDIA_DUCK_LOCAL_MATCH``   case-insensitive substring matched vs application.name/node.name (default ``mopidy``).
+  ``MEDIA_DUCK_LOCAL_RESTORE`` baseline % to restore to when the read prior is a stranded duck artifact (default 100).
+
+Two stranding bugs this guards against (2026-06-23 drive: "stuck on mute after switching songs"):
+  * **Value stranding.** ``pactl set-sink-input-volume`` is persisted per-app by PipeWire's
+    ``module-stream-restore``; on a song switch Mopidy rebuilds the stream and stream-restore REPLAYS the
+    last (ducked, 18%) level. If the belt then reads 18 as the "prior", it restores to 18 → music stuck
+    quiet. Guard: never save a prior <= duck_pct — fall back to the baseline so the belt re-asserts a real
+    level and self-heals (its restore-to-100 is then what stream-restore remembers).
+  * **Index change.** A song switch can spawn a NEW sink-input index, so restore must RE-FIND the current
+    stream by name, not target the cached duck-time index (which is dead).
 """
 
 from __future__ import annotations
@@ -45,12 +55,18 @@ class LocalSinkDucker:
     """Duck/restore the LOCAL media sink-input's PipeWire node volume (Pi-side belt for the duck window)."""
 
     def __init__(self, *, enabled: bool | None = None, duck_pct: int | None = None,
-                 match: str | None = None, runner=None):
+                 match: str | None = None, restore_level: int | None = None, runner=None):
         self._enabled = _env_on("MEDIA_DUCK_LOCAL") if enabled is None else enabled
         self._duck_pct = int(os.environ.get("MEDIA_DUCK_LOCAL_PCT", "18")) if duck_pct is None else duck_pct
         self._match = (match or os.environ.get("MEDIA_DUCK_LOCAL_MATCH", "mopidy")).lower()
+        self._restore_level = (
+            int(os.environ.get("MEDIA_DUCK_LOCAL_RESTORE", "100")) if restore_level is None else restore_level
+        )
         self._runner = runner or self._run_pactl
-        self._priors: dict[str, int] = {}  # sink-input index -> prior volume % (set while ducked)
+        # A single GUARDED pre-duck level (> duck_pct), NOT a per-index map: a song switch can change the
+        # sink-input index, so restore re-finds the CURRENT stream by name and lifts it to this level. None
+        # ⟺ not currently ducked (also the idempotency guard — don't re-read/re-save while already ducked).
+        self._prior_level: int | None = None
 
     @property
     def enabled(self) -> bool:
@@ -66,27 +82,42 @@ class LocalSinkDucker:
             _tlog(f"DUCK  | local belt {'on' if on else 'off'} FAILED: {type(e).__name__}: {e}")
 
     async def _duck_on(self) -> None:
-        if self._priors:  # already ducked — don't clobber the saved priors (idempotent)
+        if self._prior_level is not None:  # already ducked — keep the saved prior (idempotent)
             return
-        rc, out = await self._runner("list", "sink-inputs")
-        if rc != 0 or not out:
-            return
-        found = self._parse_media_sink_inputs(out)
+        found = await self._find()
         if not found:
             _tlog("DUCK  | local belt: no media sink-input found (nothing to duck locally)")
             return
-        for idx, vol in found:
-            self._priors[idx] = vol if vol is not None else 100
+        read = next((v for _, v in found if v is not None), None)
+        # Stranded-prior guard: a read at/below the duck level is a leftover duck (module-stream-restore
+        # replays it across a song switch), not a real level — restoring to it would strand the music quiet.
+        prior = read if (read is not None and read > self._duck_pct) else self._restore_level
+        self._prior_level = prior
+        for idx, _ in found:
             await self._runner("set-sink-input-volume", idx, f"{self._duck_pct}%")
-        _tlog(f"DUCK  | local belt ON — sink-input(s) {sorted(self._priors)} → {self._duck_pct}%")
+        _tlog(
+            f"DUCK  | local belt ON — sink-input(s) {[i for i, _ in found]} {read}→{self._duck_pct}% "
+            f"(restore→{prior}%)"
+        )
 
     async def _restore(self) -> None:
-        if not self._priors:
+        if self._prior_level is None:
             return
-        priors, self._priors = self._priors, {}
-        for idx, vol in priors.items():
-            await self._runner("set-sink-input-volume", idx, f"{vol}%")
-        _tlog(f"DUCK  | local belt OFF — restored {priors}")
+        prior, self._prior_level = self._prior_level, None
+        # RE-FIND by name (not the cached duck-time index): a song switch may have spawned a new sink-input,
+        # and the old index is dead. Lift whatever Mopidy stream is live now back to the guarded prior level.
+        found = await self._find()
+        if not found:
+            return
+        for idx, _ in found:
+            await self._runner("set-sink-input-volume", idx, f"{prior}%")
+        _tlog(f"DUCK  | local belt OFF — sink-input(s) {[i for i, _ in found]} → {prior}%")
+
+    async def _find(self) -> list[tuple[str, int | None]]:
+        rc, out = await self._runner("list", "sink-inputs")
+        if rc != 0 or not out:
+            return []
+        return self._parse_media_sink_inputs(out)
 
     def _parse_media_sink_inputs(self, out: str) -> list[tuple[str, int | None]]:
         """Return [(sink-input index, current volume %)] for streams whose application/node name matches.
