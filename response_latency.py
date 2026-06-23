@@ -29,14 +29,32 @@ One clean `RESPONSE | <total>s · stt+brain <a>s · token→audio <b>s` line per
 
 from __future__ import annotations
 
+import os
+import re
+
 from loguru import logger
 
 from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
+    TranscriptionFrame,
     TTSStartedFrame,
     UserStoppedSpeakingFrame,
 )
 from pipecat.observers.base_observer import BaseObserver, FramePushed
+
+# #62 command-turn tag (join aid for the per-room-media / turbo drive). A turbo-eligible turn is one whose
+# text "looks like a command" — the brain routes those straight to the fast rung (`route via=turbo`, ~1–2s)
+# and acts on the room's media. To pick those turns out of the Pi log ALONE (and join them to the brain's
+# `route via=`/`gab_call ttft` receipts in voice_debug.jsonl), we tag the RESPONSE line with ` · cmd`.
+# NOTE: the brain's `agent/router.py:_COMMAND_INTENT` is the AUTHORITATIVE classifier; this is a deliberately
+# coarse high-level MIRROR for log-side filtering only — it may drift from the brain's exact regex and must
+# never be treated as the routing decision. Off by default (`RESPONSE_CMD_TAG`), so it's inert until a drive.
+_CMD_RE = re.compile(
+    r"\bturn\s+(?:it|the|that|them)?\s*(?:up|down|on|off)\b"
+    r"|\b(?:volume|louder|quieter|softer|mute|unmute|un-?pause|pause|resume|skip|rewind|stop|play|next|previous)\b"
+    r"|\b(?:music|song|track|playlist|movie|show|video|album|tidal|jellyfin)\b",
+    re.IGNORECASE,
+)
 
 
 class ResponseLatencyObserver(BaseObserver):
@@ -46,6 +64,8 @@ class ResponseLatencyObserver(BaseObserver):
         super().__init__(**kwargs)
         self._t_user_stop_ns: int | None = None
         self._t_synth_start_ns: int | None = None  # first TTSStartedFrame (Kokoro begins synth) since user-stop
+        self._transcript: str | None = None  # latest user transcript this turn (for the #62 command tag)
+        self._cmd_tag = os.environ.get("RESPONSE_CMD_TAG", "0") not in ("0", "false", "False", "")
 
     async def on_push_frame(self, data: FramePushed):
         frame = data.frame
@@ -53,6 +73,14 @@ class ResponseLatencyObserver(BaseObserver):
             # Latest user-stop before a bot reply wins (a turn may have intermediate stops); arm a fresh turn.
             self._t_user_stop_ns = data.timestamp
             self._t_synth_start_ns = None
+            # NB: do NOT clear self._transcript here. REMOTE STT emits the TranscriptionFrame BEFORE
+            # UserStoppedSpeakingFrame (the finalized transcript is what drives end-of-turn detection), so
+            # clearing on stop wiped the turn's text before bot-start and the cmd tag never fired — caught on
+            # the 2026-06-23 Pi drive ("turn it up"/"play me some music" went untagged). It's cleared after
+            # the RESPONSE line is emitted, so each turn still uses only its own (most-recent) transcript.
+        elif isinstance(frame, TranscriptionFrame):
+            # The user's finalized text for this turn — kept only to tag command-shaped turns (#62 drive join).
+            self._transcript = frame.text
         elif isinstance(frame, TTSStartedFrame):
             # First moment Kokoro actually synthesizes spoken text — the true brain→TTS handoff. Only the
             # first counts. Anchoring here (not the first LLMTextFrame) keeps a non-spoken STATUS line + the
@@ -76,4 +104,10 @@ class ResponseLatencyObserver(BaseObserver):
                     synth_to_audio = (data.timestamp - synth_start_ns) / 1e9
                     if to_synth >= 0 and synth_to_audio >= 0:
                         line += f" · stt+brain {to_synth:.2f}s · token→audio {synth_to_audio:.2f}s"
+                # #62: tag command-shaped turns so the drive can pick turbo-eligible turns out of the Pi log
+                # and join them to the brain's `route via=turbo`/`gab_call ttft` receipts. Appended suffix only
+                # — GA's parser keys on the unchanged `stt+brain`/`token→audio` labels, so it's join-safe.
+                if self._cmd_tag and self._transcript and _CMD_RE.search(self._transcript):
+                    line += " · cmd"
+                self._transcript = None
                 logger.bind(transcript=True).info(line)
