@@ -139,6 +139,7 @@ class WakeWordGate(FrameProcessor):
         guard_inflight: bool = True,
         min_dwell_secs: float = 2.0,
         window_mute: bool = True,
+        wake_only_duck: bool = False,
         preduck_grace: float = 3.0,
         preduck_grace_keepalive: float = 1.0,
         hold_max_secs: float = 120.0,
@@ -221,6 +222,14 @@ class WakeWordGate(FrameProcessor):
         # (not just a partial duck) for the window → no music vocal bleeds into the command's STT. The
         # plain speech-duck (brains/media_duck) stays mute:false. Env: WAKE_WINDOW_MUTE (default on).
         self._window_mute = window_mute
+        # Wake-only duck over media (the maintainer, 2026-06-23): make ducking over PLAYING media behave like the
+        # asleep gate — respond to the wake word, NOT to ambient talking. The confirmed-speech duck path
+        # (duck_allowed) otherwise still fires while the command window is held OPEN over media (keepalive
+        # after a media command), so room crosstalk transcribed mid-song dipped the music. When set, the
+        # confirmed path is gated to a FRESH wake over media (same as duck_onset_allowed), so only a real
+        # "Hey Aria" (whose _open_window pre-duck fires) ducks — crosstalk in the keepalive tail does not.
+        # Default False = the prior behavior (follow-up command ducks in the keepalive window).
+        self._wake_only_duck = wake_only_duck
 
         # Pre-duck release grace: the wake pre-duck holds media down so the command lands on ducked audio,
         # but if no speech actually follows the wake (an unused or phantom wake), release it after this many
@@ -419,8 +428,17 @@ class WakeWordGate(FrameProcessor):
         gated+closed (media playing, no wake yet) a speech onset is room conversation, not for Aria — so the
         duck is suppressed and media no longer dips every time someone talks (2026-06-15, the maintainer: gate the duck
         the same as STT, for all playback). The on-wake pre-duck is fired by the gate itself (`_open_window`),
-        so a real "Hey Aria" still ducks immediately; this only suppresses the un-woken ambient-speech duck."""
-        return self._open or not bool(self._gated_committed)
+        so a real "Hey Aria" still ducks immediately; this only suppresses the un-woken ambient-speech duck.
+
+        `wake_only_duck` (the maintainer, 2026-06-23) tightens this over media to match the onset path: duck only on a
+        FRESH wake, never in the keepalive tail a media command left open — so room crosstalk transcribed
+        while the window is held open over a song no longer dips the music. A genuine follow-up then needs a
+        fresh "Hey Aria" to duck (its _open_window pre-duck fires). Off = prior behavior."""
+        if not bool(self._gated_committed):
+            return True
+        if self._wake_only_duck:
+            return self._open and not self._open_via_keepalive
+        return self._open
 
     def duck_onset_allowed(self) -> bool:
         """Stricter gate for the RAW VAD-onset duck (the immediate, pre-transcription dip). Over gated media,

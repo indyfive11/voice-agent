@@ -1154,6 +1154,45 @@ def test_duck_onset_allowed_when_nothing_gated():
     assert g.duck_onset_allowed() is True
 
 
+# --- wake-only duck over media (the maintainer 2026-06-23): crosstalk must not duck the keepalive tail ----------
+def test_wake_only_duck_suppresses_confirmed_speech_in_keepalive_over_media():
+    # The fix: with wake_only_duck on, confirmed-speech crosstalk in the keepalive tail over media must NOT
+    # duck (the "talking mutes the music" case) — matches the onset gate. A fresh wake is then required.
+    client = FakeBrainClient()
+    g = _gate(client, window_secs=10.0, preduck_grace_keepalive=5.0, wake_only_duck=True)
+    g._gated_committed = True
+
+    async def go():
+        g._set_keepalive(5.0)                # window held open by a media command, not a fresh wake
+        assert g._open_via_keepalive is True
+        assert g.duck_allowed() is False     # crosstalk in the keepalive tail no longer ducks
+        assert g.duck_onset_allowed() is False
+
+    asyncio.run(go())
+
+
+def test_wake_only_duck_allows_confirmed_speech_on_fresh_wake_over_media():
+    # A real "Hey Aria" over media still ducks (fresh-wake window; the _open_window pre-duck also fires).
+    client = FakeBrainClient()
+    g = _gate(client, window_secs=10.0, wake_only_duck=True)
+    g._gated_committed = True
+
+    async def go():
+        g._open_window("fresh wake")
+        assert g._open_via_keepalive is False
+        assert g.duck_allowed() is True      # a woken command still ducks
+
+    asyncio.run(go())
+
+
+def test_wake_only_duck_noop_when_nothing_gated():
+    # No media gated (open mic) → duck allowed as before; the flag only tightens behavior OVER media.
+    client = FakeBrainClient()
+    g = _gate(client, window_secs=10.0, wake_only_duck=True)
+    g._gated_committed = False
+    assert g.duck_allowed() is True
+
+
 # --- V2 interrupt/stop word barge-in (WAKE_INTERRUPT) ----------------------------------------------
 def _interrupt_gate(client=None, **kw):
     """A gate with the interrupt path enabled and push_frame spied (no live pipeline). _on_interrupt cuts

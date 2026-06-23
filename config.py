@@ -1067,6 +1067,9 @@ def build_wake_word_gate(llm):
         guard_inflight=guard_inflight,
         min_dwell_secs=min_dwell_secs,
         window_mute=window_mute,
+        # Over PLAYING media, duck only on a fresh wake word — not on ambient talking in the keepalive tail
+        # (the maintainer 2026-06-23: "respond to the wake word, not all talking, which mutes the media"). Default off.
+        wake_only_duck=_env("DUCK_WAKE_ONLY_OVER_MEDIA", "0") not in ("0", "false", "False"),
         preduck_grace=preduck_grace,
         preduck_grace_keepalive=preduck_grace_keepalive,
         hold_max_secs=hold_max_secs,
