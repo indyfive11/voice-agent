@@ -769,6 +769,13 @@ def build_media_duck(llm, gate=None):
         f"sustained={sustained_secs}s, max_hold={max_hold_secs}s, "
         f"convo_hold={min(convo_hold_secs, window_secs):.0f}s, require_wake={gate_duck})"
     )
+    # Pi-side local sink belt: ducks the LOCAL media sink-input's PipeWire node volume alongside the brain's
+    # RPC duck (for a satellite where the brain's mixer-RPC can't reliably attenuate the room's output —
+    # 2026-06-23 Pi drive). Reads its own env (MEDIA_DUCK_LOCAL, default OFF = no-op); harmless to always pass.
+    from local_duck import LocalSinkDucker
+    local_duck = LocalSinkDucker()
+    if local_duck.enabled:
+        logger.info("Media ducking: Pi-side local sink belt ENABLED (MEDIA_DUCK_LOCAL)")
     return MediaDuckController(
         llm.brain_client,
         llm.session_id,
@@ -782,6 +789,7 @@ def build_media_duck(llm, gate=None):
         should_duck=should_duck,
         should_duck_onset=should_duck_onset,
         media_status=build_media_state_provider(llm),  # SHARED with the wake gate (no divergence)
+        local_duck=local_duck,
     )
 
 

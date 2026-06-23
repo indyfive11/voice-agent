@@ -105,11 +105,18 @@ class MediaDuckController(FrameProcessor):
         should_duck_onset: Callable[[], bool] | None = None,
         media_status: Callable[[], "dict|None"] | None = None,
         time_source: Callable[[], float] | None = None,
+        local_duck=None,
         **kwargs,
     ):
         super().__init__(**kwargs)
         self._client = client
         self._session_id = session_id
+        # Pi-side local sink belt (local_duck.LocalSinkDucker): attenuates the LOCAL media sink-input's
+        # PipeWire node volume alongside the brain's RPC duck. On a satellite where the brain's mixer-RPC
+        # can't reliably attenuate the room's output (the Pi Mopidy software mixer — 2026-06-23 drive), this
+        # does the real duck. None (default) or a disabled ducker = no-op (the brain duck is the only path,
+        # exactly as before). The brain skips its now-redundant mixer-RPC for a `duck_local` room (GA side).
+        self._local_duck = local_duck
         self._min_words = max(1, min_words)
         self._restore_grace = restore_grace
         # An aside (DuckReleaseFrame) normally releases the duck immediately — but if the user is in a
@@ -342,6 +349,11 @@ class MediaDuckController(FrameProcessor):
                     logger.debug("DUCK  | on SKIPPED (media_state: nothing playing)")
                     return
                 await self._client.duck(self._session_id, on)
+                # Pi-side belt: attenuate the LOCAL media sink-input too (no-op when unset/disabled). On a
+                # satellite whose brain mixer-RPC can't reliably duck the room's output, this is the real
+                # duck; elsewhere it's a no-op and the brain duck above is the only path. Best-effort itself.
+                if self._local_duck is not None:
+                    await self._local_duck.duck(on)
                 _tlog(f"DUCK  | on ({reason}) sent" if on else "DUCK  | /media/duck on=False sent")
             except Exception as e:  # noqa: BLE001 - media control must never break audio
                 _tlog(f"DUCK  | /media/duck on={on} FAILED: {type(e).__name__}: {e}")
