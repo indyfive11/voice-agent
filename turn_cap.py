@@ -14,6 +14,7 @@ the SmartTurn strategy still ends normal turns; this only catches the runaway ta
 from __future__ import annotations
 
 import asyncio
+import time
 
 from loguru import logger
 
@@ -27,11 +28,26 @@ def _tlog(message: str) -> None:
 
 
 class MaxTurnDurationUserTurnStopStrategy(BaseUserTurnStopStrategy):
-    """Force-complete a user turn that has run past `max_turn_secs` (so a long ramble can't hang)."""
+    """Force-complete a user turn that has run past `max_turn_secs` (so a long ramble can't hang).
 
-    def __init__(self, *, max_turn_secs: float = 15.0, **kwargs):
+    When a long-form/dictation hold is active (SmartTurnHonoringStopStrategy set the shared `long_hold` flag),
+    the normal cap would guillotine a legitimate long command mid-dictation — so while that flag is set the cap
+    extends to `dictation_max_turn_secs` (a far larger absolute ceiling; the held turn's own silence backstop
+    is what normally ends it). Without a `long_hold` reference this is exactly the old behavior.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_turn_secs: float = 15.0,
+        long_hold=None,
+        dictation_max_turn_secs: float = 120.0,
+        **kwargs,
+    ):
         super().__init__(**kwargs)
         self._max_turn_secs = max_turn_secs
+        self._long_hold = long_hold
+        self._dictation_max_turn_secs = dictation_max_turn_secs
         self._text = ""
         self._armed = False
         self._task: asyncio.Task | None = None
@@ -65,15 +81,25 @@ class MaxTurnDurationUserTurnStopStrategy(BaseUserTurnStopStrategy):
         return ProcessFrameResult.CONTINUE  # additive: other stop strategies still evaluate
 
     async def _cap(self):
+        start = time.monotonic()
         try:
-            await asyncio.sleep(self._max_turn_secs)
+            while True:
+                await asyncio.sleep(self._max_turn_secs)
+                # A long-form/dictation hold is legitimately in progress → extend up to the larger absolute
+                # ceiling instead of guillotining the command. The held turn's silence backstop normally ends
+                # it well before this; the ceiling only catches a genuinely stuck-open VAD during dictation.
+                holding = self._long_hold is not None and self._long_hold.active
+                if holding and (time.monotonic() - start) < self._dictation_max_turn_secs:
+                    continue
+                break
         except asyncio.CancelledError:
             return
         finally:
             self._task = None
+        cap = self._dictation_max_turn_secs if (self._long_hold and self._long_hold.active) else self._max_turn_secs
         if self._text.strip():
-            _tlog(f"TURN  | force-complete after {self._max_turn_secs}s cap (runaway turn)")
+            _tlog(f"TURN  | force-complete after {cap:.0f}s cap (runaway turn)")
             await self.trigger_user_turn_stopped()
         else:
             # No transcript yet → don't fire an empty turn at the brain; let it end naturally.
-            _tlog(f"TURN  | {self._max_turn_secs}s cap reached but no transcript — not force-completing")
+            _tlog(f"TURN  | {cap:.0f}s cap reached but no transcript — not force-completing")

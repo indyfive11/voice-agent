@@ -41,6 +41,7 @@ from pipecat.services.settings import LLMSettings
 from brains.brain_client import BrainClient, BrainEvent
 
 import aria_state
+import bot_speech
 
 _YES_WORDS = ("yes", "yeah", "yep", "yup", "confirm", "proceed", "go ahead", "do it", "affirmative", "sure")
 
@@ -520,6 +521,30 @@ class BrainLLMService(LLMService):
         if text:
             self._reply_buf.append(text)
             await self.push_frame(TTSSpeakFrame(text) if immediate else LLMTextFrame(text))
+
+    def is_floor_free(self) -> bool:
+        """The floor authority: True when bot-initiated speech may be voiced WITHOUT stepping on the
+        conversation — not asleep, no reply turn generating, the user isn't speaking, Aria's own TTS isn't
+        playing, no confirm is awaiting its spoken yes/no, and no bare-wake greeting is armed. Read by the
+        DeferredAnnouncer (announce.py) to time out-of-band announcements; conservative by design (a deferred
+        result is never latency-critical, so it waits for a clean gap rather than risk a talk-over).
+
+        NOT yet considered: convo-hold (a held bed expecting a follow-up), tracked upstream in media_duck.
+        Speaking in a convo-hold gap is acceptable and the producer (Brick B) doesn't exist yet, so wiring
+        convo-hold awareness waits until the real channel lands."""
+        if self._sleeping:
+            return False
+        if self._turn_task is not None and not self._turn_task.done():
+            return False
+        if self._user_speaking:
+            return False
+        if bot_speech.bot_speaking():
+            return False
+        if self._pending_confirm is not None:
+            return False
+        if self._bare_wake_task is not None and not self._bare_wake_task.done():
+            return False
+        return True
 
     def _arm_bare_wake_prompt(self) -> None:
         """User said only the wake word: wait `_bare_wake_delay`, then ask "did you need something?" — but

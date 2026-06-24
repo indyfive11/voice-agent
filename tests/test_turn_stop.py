@@ -10,7 +10,7 @@ import time
 
 from loguru import logger
 
-from turn_stop import SmartTurnHonoringStopStrategy
+from turn_stop import LongHoldState, SmartTurnHonoringStopStrategy
 
 
 class _FakeAnalyzer:
@@ -173,3 +173,121 @@ def test_finalization_attributes_short_hold_to_complete_verdict():
         logger.remove(sink)
     line = next(m for m in msgs if "finalized" in m)
     assert "COMPLETE verdict" in line and "stop_secs" not in line
+
+
+# --- Long-form / dictation hold (let a long multi-clause command survive clause-boundary pauses) ---
+
+
+def _make_dictation(
+    *,
+    triggers=("start a builder task",),
+    enders=("done", "that's all"),
+    silence=10.0,           # long by default so only an explicit stop phrase ends the hold in a test
+    heuristic=True,
+    speech_triggered=False,
+):
+    long_hold = LongHoldState()
+    strat = SmartTurnHonoringStopStrategy(
+        turn_analyzer=_FakeAnalyzer(speech_triggered),
+        dictation_triggers=triggers,
+        dictation_enders=enders,
+        dictation_silence_secs=silence,
+        longform_heuristic=heuristic,
+        long_hold=long_hold,
+    )
+    strat._task_manager = _FakeTaskMgr()  # property is read-only; set the backing field
+    fired: list = []
+    strat.add_event_handler("on_user_turn_stopped", lambda *a, **k: fired.append(True))
+    return strat, fired, long_hold
+
+
+def test_trigger_phrase_holds_across_pauses_until_stop_phrase():
+    # The headline case: "start a builder task …" holds the turn through every clause-boundary pause
+    # (each a confident SmartTurn COMPLETE) and only ends when the explicit stop phrase arrives.
+    async def scenario():
+        strat, fired, lh = _make_dictation()
+        strat._text = "start a builder task the project is builder-test"
+        await strat.trigger_user_turn_stopped()          # pause 1
+        assert fired == [] and strat._held and lh.active  # held, cap-extend flag set
+        strat._text += " create a file named hello.txt containing the text hi"
+        await strat.trigger_user_turn_stopped()          # pause 2 — still held
+        assert fired == []
+        strat._text += " that's all"
+        await strat.trigger_user_turn_stopped()          # stop phrase → dispatch the whole thing
+        assert fired == [True]
+        assert not strat._held and not lh.active
+    asyncio.run(scenario())
+
+
+def test_heuristic_holds_unfinished_tail():
+    # Always-on heuristic (no trigger phrase needed): a tail ending on a connective looks unfinished → hold.
+    async def scenario():
+        strat, fired, lh = _make_dictation(triggers=())
+        strat._text = "the task is"      # ends on "is" → unfinished
+        await strat.trigger_user_turn_stopped()
+        assert fired == [] and strat._held and lh.active
+        await strat._cancel_backstop()   # cleanup the pending 10s timer
+    asyncio.run(scenario())
+
+
+def test_heuristic_finished_tail_forwards_immediately():
+    # A complete-sounding command must NOT be held (keeps normal turns snappy) — "it" is an excluded pronoun.
+    async def scenario():
+        strat, fired, lh = _make_dictation(triggers=())
+        strat._text = "what time is it"
+        await strat.trigger_user_turn_stopped()
+        assert fired == [True] and not strat._held and not lh.active
+    asyncio.run(scenario())
+
+
+def test_silence_backstop_ends_a_held_turn():
+    # No stop phrase spoken → trailing silence ends the held turn after dictation_silence_secs.
+    async def scenario():
+        strat, fired, lh = _make_dictation(silence=0.05)
+        strat._text = "start a builder task the project is x"
+        await strat.trigger_user_turn_stopped()
+        assert fired == [] and strat._held
+        await asyncio.sleep(0.12)         # let the backstop elapse with no resume
+        assert fired == [True]
+        assert not strat._held and not lh.active
+    asyncio.run(scenario())
+
+
+def test_resume_cancels_backstop_and_keeps_holding():
+    # A real resume (a fresh VAD onset, which process_frame turns into _cancel_backstop) must not let the
+    # turn end — the held turn ends only after TRUE trailing silence.
+    async def scenario():
+        strat, fired, lh = _make_dictation(silence=0.05)
+        strat._text = "start a builder task the project is x"
+        await strat.trigger_user_turn_stopped()
+        assert strat._backstop_task is not None
+        await strat._cancel_backstop()   # what a fresh VAD onset does in process_frame
+        await asyncio.sleep(0.12)
+        assert fired == [] and strat._held  # never ended — still holding for the continuation
+        await strat._end_hold_and_stop()    # cleanup
+    asyncio.run(scenario())
+
+
+def test_stop_phrase_matched_at_tail_only():
+    # A stop phrase appearing mid-utterance ("…are you done loading") must NOT end the hold; only a trailing
+    # one does. Guards against premature dispatch when the word happens to occur inside the command.
+    async def scenario():
+        strat, fired, lh = _make_dictation(enders=("done",))
+        strat._text = "start a builder task are you done loading"  # "done" mid-sentence
+        await strat.trigger_user_turn_stopped()
+        assert fired == [] and strat._held                          # not ended
+        strat._text += " done"                                      # now trailing
+        await strat.trigger_user_turn_stopped()
+        assert fired == [True] and not strat._held
+    asyncio.run(scenario())
+
+
+def test_dictation_disabled_forwards_immediately():
+    # Empty triggers + heuristic off ⇒ byte-identical to the prior behavior: an unfinished-looking tail
+    # still forwards at once, nothing is held, the shared flag stays clear.
+    async def scenario():
+        strat, fired, lh = _make_dictation(triggers=(), enders=(), heuristic=False)
+        strat._text = "the task is"
+        await strat.trigger_user_turn_stopped()
+        assert fired == [True] and not strat._held and not lh.active
+    asyncio.run(scenario())

@@ -203,6 +203,24 @@ class HttpBrainClient:
             logger.debug(f"Brain: /media/state unavailable (ignored): {type(e).__name__}: {e}")
         return None
 
+    async def builder_poll(self, session_id: str, ack: list[str] | None = None) -> list[dict]:
+        """Best-effort `GET /builder/poll` (builder_spec.md §4.4) → `[{"job_id","text"}]` out-of-band
+        announcements (builder results / timer rings). `ack` = job_ids fully spoken since the last poll,
+        piggybacked as `&ack=a,b` to finalize the brain's liveness-leased delivery (#1 — no separate route;
+        the brain processes acks before assigning, so a just-acked item can't be re-handed same-response).
+        Returns [] when nothing's pending (the common `{"deferred":[]}` case) / older brain (404) / any
+        error; never raises — the loop just retries next tick."""
+        try:
+            params = self._with_room({"session_id": session_id})
+            if ack:
+                params["ack"] = ",".join(ack)
+            r = await self._http.get("/builder/poll", params=params, timeout=httpx.Timeout(5.0))
+            if r.status_code == 200:
+                return r.json().get("deferred", []) or []
+        except Exception as e:  # noqa: BLE001 - never let a poll error escape the loop
+            logger.debug(f"Brain: /builder/poll unavailable (ignored): {type(e).__name__}: {e}")
+        return []
+
     async def aclose(self) -> None:
         """Full teardown: cancel any active turn, close HTTP, stop the spawned process."""
         if self._active_session:

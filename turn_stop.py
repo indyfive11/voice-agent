@@ -28,6 +28,7 @@ Env `TURN_HONOR_INCOMPLETE=0` reverts to the stock behavior (A/B / kill-switch).
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 
 from loguru import logger
@@ -46,6 +47,39 @@ from pipecat.turns.user_stop.turn_analyzer_user_turn_stop_strategy import (
 
 def _tlog(message: str) -> None:
     logger.bind(transcript=True).info(message)
+
+
+# Trailing function words that signal an UNFINISHED utterance (the always-on long-form heuristic, below).
+# If a turn's last word is one of these, the speaker almost certainly isn't done ("the task is", "and then",
+# "create a file named hello.txt containing the"). Deliberately conservative — pronouns/common verb objects
+# ("it", "this", "that" as objects) are EXCLUDED so normal complete commands ("turn it up", "do it", "what
+# is it") stay snappy and forward immediately. A clause that ends on a plain noun ("…containing the text")
+# does NOT look unfinished and won't be held by the heuristic alone — that case is why the explicit trigger
+# phrase + the silence backstop exist as the reliable net.
+_UNFINISHED_TAIL_WORDS = frozenset(
+    "and or but then to of for with is are was were am the a an my your our his her its their "
+    "into onto at in on by as so because if when while named called containing about from than "
+    "create make write add set put give tell show".split()
+)
+
+
+def _norm(text: str) -> str:
+    """Lowercase, collapse whitespace, strip surrounding sentence punctuation — for phrase matching."""
+    return re.sub(r"\s+", " ", text.strip().lower()).strip(" .,!?;:")
+
+
+class LongHoldState:
+    """Shared one-bit flag: True while a long-form/dictation turn is being held open by the stop strategy.
+
+    The max-turn-duration cap (turn_cap.py) runs as a PARALLEL stop strategy and would otherwise guillotine
+    a legitimate long dictation at its normal wall-clock cap. Both strategies hold a reference to one instance
+    of this: the honoring strategy sets `.active` while holding, and the cap reads it to extend its ceiling.
+    """
+
+    __slots__ = ("active",)
+
+    def __init__(self):
+        self.active = False
 
 
 class SmartTurnHonoringStopStrategy(TurnAnalyzerUserTurnStopStrategy):
@@ -72,6 +106,11 @@ class SmartTurnHonoringStopStrategy(TurnAnalyzerUserTurnStopStrategy):
         stop_secs: float = 4.0,
         continuation_grace_secs: float = 0.0,
         continuation_max_words: int = 3,
+        dictation_triggers: tuple[str, ...] = (),
+        dictation_enders: tuple[str, ...] = (),
+        dictation_silence_secs: float = 7.0,
+        longform_heuristic: bool = False,
+        long_hold: LongHoldState | None = None,
         **kwargs,
     ):
         super().__init__(turn_analyzer=turn_analyzer, **kwargs)
@@ -79,6 +118,18 @@ class SmartTurnHonoringStopStrategy(TurnAnalyzerUserTurnStopStrategy):
         self._suppressed_logged = False
         self._hold_started: float | None = None  # monotonic ts of the first INCOMPLETE suppression this turn
         self._last_vad_stop: float | None = None  # monotonic ts of the most recent VAD stop this turn
+        # Long-form / dictation hold (the "let me finish a long command" path). Two ways to ENTER a hold:
+        #   1. Explicit trigger phrase ("start a builder task") anywhere in the turn → unconditional hold.
+        #   2. Always-on heuristic: the turn's tail looks unfinished (_UNFINISHED_TAIL_WORDS) → hold.
+        # While held, SmartTurn COMPLETE verdicts are SUPPRESSED (clause-boundary pauses don't cut the turn);
+        # it ends only on an explicit stop phrase ("done", "that's all"), the silence backstop, or the cap.
+        self._dictation_triggers = tuple(_norm(t) for t in dictation_triggers if _norm(t))
+        self._dictation_enders = tuple(_norm(e) for e in dictation_enders if _norm(e))
+        self._dictation_silence_secs = dictation_silence_secs
+        self._longform_heuristic = longform_heuristic
+        self._long_hold = long_hold if long_hold is not None else LongHoldState()
+        self._held = False                          # True once this turn entered a long-form hold
+        self._backstop_task: asyncio.Task | None = None  # silence timer that ends a held turn
         # Continuation grace (#62 drive fix): SmartTurn can mis-judge a SHORT garbled fragment as COMPLETE
         # and close the turn on it — the EMEET/remote-STT path split "…up <pause> tell me the joke" into two
         # VAD segments; the turn closed on "up", which arya then auto-ran as volume_up, and the real request
@@ -97,16 +148,25 @@ class SmartTurnHonoringStopStrategy(TurnAnalyzerUserTurnStopStrategy):
         self._hold_started = None
         self._last_vad_stop = None
         self._text = ""
+        self._held = False
+        self._long_hold.active = False
         await self._cancel_pending_stop()
+        await self._cancel_backstop()
 
     async def cleanup(self):
         await super().cleanup()
         await self._cancel_pending_stop()
+        await self._cancel_backstop()
 
     async def _cancel_pending_stop(self):
         if self._pending_stop_task:
             await self.task_manager.cancel_task(self._pending_stop_task)
             self._pending_stop_task = None
+
+    async def _cancel_backstop(self):
+        if self._backstop_task:
+            await self.task_manager.cancel_task(self._backstop_task)
+            self._backstop_task = None
 
     async def process_frame(self, frame: Frame) -> ProcessFrameResult:
         # Timestamp the latest VAD-stop BEFORE delegating: the base handler can synchronously trigger the
@@ -124,6 +184,10 @@ class SmartTurnHonoringStopStrategy(TurnAnalyzerUserTurnStopStrategy):
             if self._pending_stop_task is not None:
                 await self._cancel_pending_stop()
                 _tlog("TURN  | continuation — user resumed within grace, holding turn open")
+            # Resumed mid long-form hold → cancel the silence backstop; it re-arms on the next pause's
+            # COMPLETE. (Only real speech cancels it, so a held turn ends only after true trailing silence.)
+            if self._held and self._backstop_task is not None:
+                await self._cancel_backstop()
         return await super().process_frame(frame)
 
     async def trigger_user_turn_stopped(self):
@@ -138,6 +202,26 @@ class SmartTurnHonoringStopStrategy(TurnAnalyzerUserTurnStopStrategy):
                 self._suppressed_logged = True
                 _tlog("TURN  | holding — SmartTurn INCOMPLETE (waiting for end-of-turn, not cutting mid-pause)")
             return
+
+        # Long-form / dictation hold: SmartTurn fired a CONFIDENT COMPLETE, but this turn is (or should be)
+        # held open so a multi-clause command isn't cut on a clause-boundary pause. Two entry paths, one exit.
+        text_l = _norm(self._text)
+        if self._held or self._should_enter_hold(text_l):
+            if self._dictation_enders and self._matches_end(text_l):
+                _tlog("TURN  | long-form END (stop phrase) — dispatching the full command")
+                await self._end_hold_and_stop()
+                return
+            if not self._held:
+                self._held = True
+                self._long_hold.active = True  # let the parallel max-turn cap extend its ceiling
+                reason = "trigger phrase" if self._matches_trigger(text_l) else "heuristic (tail looks unfinished)"
+                _tlog(
+                    f"TURN  | long-form HOLD on — {reason}; pauses won't cut. Ends on a stop phrase or "
+                    f"~{self._dictation_silence_secs:.0f}s silence."
+                )
+            self._arm_backstop()  # (re)arm only if not already counting down
+            return
+
         # Continuation grace: a COMPLETE verdict on a SHORT turn is the fragment-mis-close signature. Defer
         # the stop briefly so a resume can fold in; a longer turn (a real sentence) forwards immediately.
         if self._pending_stop_task is not None:
@@ -166,6 +250,53 @@ class SmartTurnHonoringStopStrategy(TurnAnalyzerUserTurnStopStrategy):
         # caught), don't force the stop — let the turn continue and re-evaluate on the next COMPLETE.
         if getattr(self._turn_analyzer, "speech_triggered", False):
             return
+        await self._do_stop()
+
+    def _should_enter_hold(self, text_l: str) -> bool:
+        """Decide whether a confident COMPLETE should be HELD instead of ending the turn. Two entry paths:
+        an explicit trigger phrase (unconditional), or the always-on heuristic (the tail looks unfinished)."""
+        if not text_l:
+            return False
+        if self._matches_trigger(text_l):
+            return True
+        if self._longform_heuristic and text_l.split()[-1] in _UNFINISHED_TAIL_WORDS:
+            return True
+        return False
+
+    def _matches_trigger(self, text_l: str) -> bool:
+        # Trigger phrases appear anywhere in the turn (usually at the start: "start a builder task …").
+        return any(t in text_l for t in self._dictation_triggers)
+
+    def _matches_end(self, text_l: str) -> bool:
+        # Stop phrases end the turn — matched at the TAIL of the utterance (the natural place to say "…done")
+        # so a phrase appearing mid-sentence ("are you done loading?") doesn't prematurely close a hold.
+        return any(text_l == e or text_l.endswith(" " + e) for e in self._dictation_enders)
+
+    def _arm_backstop(self) -> None:
+        """Start the trailing-silence timer that ends a held turn. Armed only if not already counting down,
+        so SmartTurn's own repeated silence-fallback COMPLETEs during one quiet stretch don't keep pushing
+        it out — a real resume (VADUserStartedSpeaking) cancels it, and the next pause's COMPLETE re-arms."""
+        if self._backstop_task is not None:
+            return
+        self._backstop_task = self.task_manager.create_task(self._backstop(), f"{self}::_backstop")
+
+    async def _backstop(self) -> None:
+        try:
+            await asyncio.sleep(self._dictation_silence_secs)
+        except asyncio.CancelledError:
+            return
+        finally:
+            self._backstop_task = None
+        # If SmartTurn re-opened the turn (the user resumed) during the wait, don't force the end.
+        if getattr(self._turn_analyzer, "speech_triggered", False):
+            return
+        _tlog(f"TURN  | long-form END ({self._dictation_silence_secs:.0f}s silence) — dispatching the full command")
+        await self._end_hold_and_stop()
+
+    async def _end_hold_and_stop(self) -> None:
+        await self._cancel_backstop()
+        self._held = False
+        self._long_hold.active = False
         await self._do_stop()
 
     async def _do_stop(self):

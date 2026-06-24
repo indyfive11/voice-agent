@@ -124,6 +124,14 @@ class BrainClient(Protocol):
         playing (a long reply produces no incoming speech to refresh it otherwise). Best-effort hint."""
         ...
 
+    async def builder_poll(self, session_id: str, ack: list[str] | None = None) -> list[dict]:
+        """Best-effort proactive-announce poll (builder_spec.md §4.4): `GET /builder/poll` → a list of
+        {"job_id": str, "text": str} out-of-band utterances (builder results / timer rings) to speak at a
+        free floor. `ack` carries job_ids fully spoken since the last poll (piggybacked — finalizes the
+        brain's liveness-leased delivery; no separate endpoint). Returns [] when nothing's pending / the
+        brain doesn't expose it (older brain / 404) / on any error; never raises."""
+        ...
+
     async def aclose(self) -> None:
         """Full teardown — release transport + any spawned brain process (shutdown)."""
         ...
@@ -157,6 +165,11 @@ class FakeBrainClient:
         self.media_state_value: dict | None = None
         self.media_state_calls = 0  # how many times media_state() was queried (debounce tests)
         self.media_state_bot_speaking: list[bool] = []  # bot_speaking carried on each media_state() poll
+        # Tests set this to drive builder_poll(); returned ONCE then cleared (mirrors the brain's hand-once
+        # semantics). Acks piggybacked on each poll are recorded for assertions.
+        self.builder_poll_value: list[dict] = []
+        self.builder_poll_calls = 0
+        self.builder_poll_acks: list[list[str]] = []
 
     async def respond(self, session_id: str, text: str, wake: dict | None = None) -> AsyncIterator[BrainEvent]:
         self.respond_calls.append((session_id, text))
@@ -186,6 +199,13 @@ class FakeBrainClient:
         self.media_state_calls += 1
         self.media_state_bot_speaking.append(bot_speaking)
         return self.media_state_value
+
+    async def builder_poll(self, session_id: str, ack: list[str] | None = None) -> list[dict]:
+        self.builder_poll_calls += 1
+        self.builder_poll_acks.append(list(ack or []))
+        out = self.builder_poll_value
+        self.builder_poll_value = []  # handed once, like the real endpoint (not re-sent while delivering)
+        return out
 
     async def aclose(self) -> None:
         self.closed = True

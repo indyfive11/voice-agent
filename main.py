@@ -65,7 +65,7 @@ from pipecat.turns.user_start import MinWordsUserTurnStartStrategy
 from pipecat.turns.user_stop import TurnAnalyzerUserTurnStopStrategy
 
 from turn_cap import MaxTurnDurationUserTurnStopStrategy
-from turn_stop import SmartTurnHonoringStopStrategy
+from turn_stop import LongHoldState, SmartTurnHonoringStopStrategy
 from turn_mute import BotThinkingMuteStrategy
 from response_latency import ResponseLatencyObserver
 from tts_gain import TTSGainProcessor
@@ -253,12 +253,30 @@ async def run() -> None:
     # the grace. 0.0 = OFF = today's behavior (safe-universal default; enabled per-device, e.g. the Pi .env).
     continuation_grace_secs = float(os.environ.get("TURN_CONTINUATION_GRACE_SECS", "0.0"))
     continuation_max_words = int(os.environ.get("TURN_CONTINUATION_MAX_WORDS", "3"))
+    # Long-form / dictation hold (lets a long multi-clause spoken command — e.g. a voice send_to_builder
+    # dispatch — survive clause-boundary pauses that SmartTurn would otherwise read as a confident end-of-turn).
+    # Two entry paths: (1) an explicit TRIGGER phrase anywhere in the turn → unconditional hold; (2) an
+    # always-on HEURISTIC that holds when the turn's tail looks unfinished (ends on a connective). A held turn
+    # ends on an explicit STOP phrase, ~SILENCE_SECS of trailing silence, or the dictation max-turn ceiling.
+    # Triggers default to the builder phrase; heuristic defaults ON (intentional product default — it only
+    # holds on unfinished-looking tails, so normal commands stay snappy). Empty triggers + heuristic=0 + the
+    # 15s cap reproduces the prior behavior exactly. Phrases are comma-separated and matched case-insensitively.
+    def _phrases(env: str, default: str) -> tuple[str, ...]:
+        return tuple(p.strip() for p in os.environ.get(env, default).split(",") if p.strip())
+    dictation_triggers = _phrases("TURN_DICTATION_TRIGGERS", "start a builder task")
+    dictation_enders = _phrases("TURN_DICTATION_ENDERS", "done,command finished,that's all,send it,go ahead")
+    dictation_silence_secs = float(os.environ.get("TURN_DICTATION_SILENCE_SECS", "7.0"))
+    dictation_max_turn_secs = float(os.environ.get("TURN_DICTATION_MAX_SECS", "120"))
+    longform_heuristic = os.environ.get("TURN_LONGFORM_HEURISTIC", "1") not in ("0", "false", "False")
+    long_hold = LongHoldState()  # shared flag so the parallel max-turn cap extends its ceiling during a hold
     logger.info(
         f"Turn detection: VAD stop_secs={vad_stop_secs}s confidence={vad_confidence} "
         f"min_volume={vad_min_volume} → SmartTurn v3 "
         f"(stop_secs={smart_turn_stop_secs}s max-silence fallback, max_turn={max_turn_secs}s cap, "
         f"honor-incomplete={honor_incomplete}, "
-        f"continuation-grace={continuation_grace_secs}s (<= {continuation_max_words}w))"
+        f"continuation-grace={continuation_grace_secs}s (<= {continuation_max_words}w), "
+        f"long-form: triggers={list(dictation_triggers)} heuristic={longform_heuristic} "
+        f"end=[{', '.join(dictation_enders)}]/{dictation_silence_secs:.0f}s-silence/{dictation_max_turn_secs:.0f}s-cap)"
     )
     turn_analyzer = LocalSmartTurnAnalyzerV3(
         params=SmartTurnParams(
@@ -324,12 +342,22 @@ async def run() -> None:
                         stop_secs=smart_turn_stop_secs,
                         continuation_grace_secs=continuation_grace_secs,
                         continuation_max_words=continuation_max_words,
+                        dictation_triggers=dictation_triggers,
+                        dictation_enders=dictation_enders,
+                        dictation_silence_secs=dictation_silence_secs,
+                        longform_heuristic=longform_heuristic,
+                        long_hold=long_hold,
                      )
                      if honor_incomplete
                      else TurnAnalyzerUserTurnStopStrategy(turn_analyzer=turn_analyzer)),
                     # Safety cap so a long continuous ramble can't hang the turn (SmartTurn won't
                     # end it; this force-completes past max_turn_secs when there's transcribed text).
-                    MaxTurnDurationUserTurnStopStrategy(max_turn_secs=max_turn_secs),
+                    # During a long-form hold it extends to dictation_max_turn_secs via the shared flag.
+                    MaxTurnDurationUserTurnStopStrategy(
+                        max_turn_secs=max_turn_secs,
+                        long_hold=long_hold,
+                        dictation_max_turn_secs=dictation_max_turn_secs,
+                    ),
                 ],
             ),
         ),
@@ -384,6 +412,31 @@ async def run() -> None:
         gate_state=(wake_gate.hb_state if wake_gate else None),  # heartbeat shows gate state too
     )
 
+    # Deferred out-of-band announcements (builder results, timers, …): voiced at a free conversational floor.
+    # Only with a brain that owns floor state (BrainLLMService exposes is_floor_free); a raw-LLM service has
+    # no floor authority, so None → not inserted (exact current behavior). Sits right after the LLM service:
+    # injects TTSSpeakFrame downstream toward TTS and observes BotStopped on the upstream return path.
+    announcer = None
+    if hasattr(llm, "is_floor_free"):
+        from announce import DeferredAnnouncer
+        announcer = DeferredAnnouncer(floor_free=llm.is_floor_free)
+
+    # Brick B: the steady, sleep-independent poll loop that pulls finished builder results / timer rings from
+    # the brain's GET /builder/poll and feeds them to the announcer (spoken at a free floor), piggybacking the
+    # spoken-job acks. Needs a brain client that exposes builder_poll (BrainLLMService over HTTP); skipped for
+    # a raw-LLM brain. Started after the pipeline is up (with pin_task) and stopped on teardown.
+    builder_poller = None
+    if announcer is not None and hasattr(llm, "brain_client") and hasattr(llm, "session_id"):
+        from builder_poll_client import BuilderPollClient, DEFAULT_POLL_INTERVAL_SECS
+        _poll_interval = float(os.environ.get("BUILDER_POLL_INTERVAL_SECS", DEFAULT_POLL_INTERVAL_SECS))
+        builder_poller = BuilderPollClient(
+            poll=llm.brain_client.builder_poll,
+            announce=announcer.announce,
+            drain_delivered=announcer.drain_delivered,
+            session_id=llm.session_id,
+            interval=_poll_interval,
+        )
+
     pipeline = Pipeline(
         [
             transport.input(),     # mic (PipeWire → PyAudio)
@@ -394,6 +447,7 @@ async def run() -> None:
             *([media_duck] if media_duck else []),  # duck media on confirmed speech (gabagent brain)
             user_aggregator,       # VAD + SmartTurn v3 + user-side context
             llm,                   # Claude / OpenAI-compatible / local Ollama
+            *([announcer] if announcer else []),  # deferred out-of-band speech at a free floor (builder/timers)
             tts,                   # Kokoro (local)
             tts_gain_proc,         # attenuate Aria's voice (TTS_GAIN) so she's not louder than ducked music
             transport.output(),    # speaker
@@ -461,6 +515,8 @@ async def run() -> None:
     # Guard the TTS output stream against PipeWire module-stream-restore stranding it silent (which would
     # leave the user muted under half-duplex and break the conversation). In-app, dies with the app.
     pin_task = asyncio.create_task(config.pin_output_stream_volume())
+    if builder_poller is not None:
+        await builder_poller.start()  # proactive builder/timer announcements (Brick B); no-op without a brain
     runner = WorkerRunner(handle_sigint=(sys.platform != "win32"))
     try:
         await runner.add_workers(worker)
@@ -468,6 +524,8 @@ async def run() -> None:
     finally:
         aria_state.set_state("off")  # eye: voice mode down → eye closed
         pin_task.cancel()
+        if builder_poller is not None:
+            await builder_poller.stop()
         # Tear down an external brain (stop `gab --voice-serve`); no-op for local brains.
         await config.stop_brain(llm)
 
