@@ -75,7 +75,19 @@ def build_stt():
         # or a Model enum value. small.en is the plan default; device="auto" → CPU on
         # this AMD box (no CUDA), which is faster-than-real-time here.
         model = _env("STT_MODEL", "small.en")
-        logger.info(f"STT: local Whisper (faster-whisper) model={model!r} device=auto")
+        # compute_type controls the CTranslate2 quantization. Default ("default") lets
+        # CTranslate2 pick from the saved weights + device: a fp16-saved model on a CPU box
+        # (no CUDA) has no efficient fp16 path, so it auto-converts to FLOAT32 — slow
+        # (3.5–5.1s/utterance on a contended i7-8565U), which garbles + fragments speech and
+        # makes the addressing gate reject the turn. Set STT_COMPUTE_TYPE=int8 on CPU-only
+        # satellites: 2–4× faster than fp32 and usually MORE accurate than the fp32
+        # auto-conversion. Unset = historical no-op (CTranslate2's own default). Valid values:
+        # default|auto|int8|int8_float32|int8_float16|int16|float16|bfloat16|float32.
+        compute_type = _env("STT_COMPUTE_TYPE", "default") or "default"
+        logger.info(
+            f"STT: local Whisper (faster-whisper) model={model!r} device=auto "
+            f"compute_type={compute_type!r}"
+        )
         # Pin to the pipeline rate so Whisper never adopts the device's native capture rate
         # (the mic is resampled to PIPELINE_AUDIO_RATE before it reaches STT). Whisper assumes
         # its input array is already at this rate — feeding it 48 kHz samples would make it
@@ -83,6 +95,7 @@ def build_stt():
         svc = WhisperSTTService(
             settings=WhisperSTTService.Settings(model=model),
             device="auto",
+            compute_type=compute_type,
             sample_rate=PIPELINE_AUDIO_RATE,
         )
         # pipecat calls model.transcribe with only `language` — inject the env decoding levers
@@ -378,6 +391,78 @@ def _resolve_device_index(name: str | None, *, want_output: bool) -> int | None:
     return None
 
 
+def _resolve_device_index_stable(
+    name: str | None, *, want_output: bool, settle_secs: float, poll: float = 0.4
+) -> int | None:
+    """Resolve a device index by name, but only after the PortAudio enumeration has SETTLED.
+
+    PortAudio snapshots the device list per ``PyAudio()`` instance, and pipecat opens the actual
+    stream in its OWN instance seconds after we resolve. On a cold/transitional PipeWire-ALSA graph
+    the device set (and therefore the indices) shift during the first seconds of startup — so a
+    name→index resolved too early can point at a DIFFERENT device by open time. Observed live: the
+    output ``pulse`` resolved to ``[6]`` but ``[6]`` had become ``surround40`` (a raw 2ch device)
+    ~200ms later, so pipecat's open hit ``-9997 Invalid sample rate`` and EVERY TTS frame was dropped
+    → the agent went silent on every turn while STT/brain stayed healthy.
+
+    Fix: poll fresh enumerations until the SAME index resolves for ``name`` across two consecutive
+    reads (the graph has stopped moving), or ``settle_secs`` elapses. A healthy/static graph settles
+    on the second read (~one extra ``poll``); only a genuinely thrashing graph waits. On timeout we
+    return the best current match (never worse than the old single-shot resolve). ``settle_secs<=0``
+    disables the wait → exact legacy behaviour (single resolve). Returns None when ``name`` is unset
+    or nothing matches (caller falls back to the OS default).
+    """
+    if not name:
+        return None
+    if settle_secs <= 0:
+        return _resolve_device_index(name, want_output=want_output)
+    try:
+        import pyaudio
+    except Exception as e:  # pragma: no cover - diagnostic only
+        logger.warning(f"Cannot resolve audio device by name ({e}); using default.")
+        return None
+
+    import time
+
+    kind = "output" if want_output else "input"
+    chan_key = "maxOutputChannels" if want_output else "maxInputChannels"
+    nlow = name.lower()
+
+    def _match_once() -> tuple[int | None, str | None]:
+        pa = pyaudio.PyAudio()
+        try:
+            for i in range(pa.get_device_count()):
+                d = pa.get_device_info_by_index(i)
+                if (d.get(chan_key) or 0) > 0 and nlow in str(d.get("name", "")).lower():
+                    return i, str(d.get("name", ""))
+        finally:
+            pa.terminate()
+        return None, None
+
+    deadline = time.monotonic() + settle_secs
+    prev_idx: int | None = None
+    have_prev = False
+    while True:
+        idx, mname = _match_once()
+        if have_prev and idx is not None and idx == prev_idx:
+            logger.info(f"Audio: matched {kind} name~={name!r} → [{idx}] {mname} (enumeration settled)")
+            return idx
+        prev_idx, have_prev = idx, True
+        if time.monotonic() >= deadline:
+            if idx is not None:
+                logger.warning(
+                    f"Audio: {kind} name~={name!r} → [{idx}] {mname}, but the device enumeration "
+                    f"was still shifting after {settle_secs:.0f}s — using it (may be the wrong sink "
+                    f"if the audio graph is unstable; check the read-back line below)."
+                )
+            else:
+                logger.warning(
+                    f"Audio: no {kind} device matched name~={name!r} within {settle_secs:.0f}s; "
+                    f"using system default."
+                )
+            return idx
+        time.sleep(poll)
+
+
 def _readback_device(index: int | None, *, want_output: bool) -> None:
     """Log the device actually selected, so a silent/wrong sink is visible in the log.
 
@@ -534,7 +619,14 @@ def build_transport():
         in_idx = _resolve_device_index(_env("AUDIO_INPUT_DEVICE_NAME"), want_output=False)
     out_idx = _env_int("AUDIO_OUTPUT_DEVICE_INDEX")
     if out_idx is None:
-        out_idx = _resolve_device_index(_env("AUDIO_OUTPUT_DEVICE_NAME"), want_output=True)
+        # Resolve the OUTPUT device only after the PortAudio enumeration settles: on a transitional
+        # PipeWire-ALSA graph at startup the name→index can resolve to a device that has become a
+        # different (raw, fixed-rate) sink by the time pipecat opens the stream → -9997 → silent
+        # output on every turn. AUDIO_DEVICE_SETTLE_SECS=0 restores the legacy single-shot resolve.
+        settle = float(_env("AUDIO_DEVICE_SETTLE_SECS", "6") or 6)
+        out_idx = _resolve_device_index_stable(
+            _env("AUDIO_OUTPUT_DEVICE_NAME"), want_output=True, settle_secs=settle
+        )
     logger.info(f"Transport: local audio  input_device_index={in_idx}  output_device_index={out_idx}")
     _readback_device(in_idx, want_output=False)
     _readback_device(out_idx, want_output=True)
