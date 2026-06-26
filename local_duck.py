@@ -20,7 +20,8 @@ Env (all default to the historical no-op — DISABLED — per the no-hardcodes S
 is byte-identical until the knob is set; enabled per-device, e.g. the Pi ``.env``):
   ``MEDIA_DUCK_LOCAL``         ``1`` to enable (default off).
   ``MEDIA_DUCK_LOCAL_PCT``     duck-to percentage (default 18, mirrors the brain's ``_DUCK_VOLUME``).
-  ``MEDIA_DUCK_LOCAL_MATCH``   case-insensitive substring matched vs application.name/node.name (default ``mopidy``).
+  ``MEDIA_DUCK_LOCAL_MATCH``   comma-separated case-insensitive substrings matched vs application.name/node.name
+                               (default ``mopidy``; e.g. ``mopidy,mpv`` to also duck a Jellyfin/mpv video stream).
   ``MEDIA_DUCK_LOCAL_RESTORE`` baseline % to restore to when the read prior is a stranded duck artifact (default 100).
 
 Two stranding bugs this guards against (2026-06-23 drive: "stuck on mute after switching songs"):
@@ -58,7 +59,11 @@ class LocalSinkDucker:
                  match: str | None = None, restore_level: int | None = None, runner=None):
         self._enabled = _env_on("MEDIA_DUCK_LOCAL") if enabled is None else enabled
         self._duck_pct = int(os.environ.get("MEDIA_DUCK_LOCAL_PCT", "18")) if duck_pct is None else duck_pct
-        self._match = (match or os.environ.get("MEDIA_DUCK_LOCAL_MATCH", "mopidy")).lower()
+        # Comma-separated list of app/node-name substrings (so ONE belt ducks the music player AND a video
+        # player, e.g. "mopidy,mpv" for #62 Jellyfin-on-Pi). A single token = the historical behavior; an
+        # empty value matches NOTHING (safe — never duck every stream, incl. our own TTS).
+        _raw = match if match is not None else os.environ.get("MEDIA_DUCK_LOCAL_MATCH", "mopidy")
+        self._matches = [t.strip().lower() for t in _raw.split(",") if t.strip()]
         self._restore_level = (
             int(os.environ.get("MEDIA_DUCK_LOCAL_RESTORE", "100")) if restore_level is None else restore_level
         )
@@ -113,6 +118,28 @@ class LocalSinkDucker:
             await self._runner("set-sink-input-volume", idx, f"{prior}%")
         _tlog(f"DUCK  | local belt OFF — sink-input(s) {[i for i, _ in found]} → {prior}%")
 
+    async def media_playing(self) -> bool:
+        """True iff a MATCHED local media sink-input is actively PLAYING (present AND not corked). A paused/
+        stopped stream still has a sink-input (corked) — so presence alone isn't 'playing'. Used by the wake
+        gate to suppress the local wake-ack only when audible media is already giving duck-dip feedback (the maintainer:
+        never intrude on playing music). Best-effort: any pactl failure / no match → False (treated as 'no
+        audible media' → the ack speaks). Reads live pactl, NOT the brain's media_state (which goes stale)."""
+        rc, out = await self._runner("list", "sink-inputs")
+        if rc != 0 or not out:
+            return False
+        return self._any_match_playing(out)
+
+    def _any_match_playing(self, out: str) -> bool:
+        """Pure parse: any name-matched sink-input block with `Corked: no` (= actively playing)."""
+        for block in out.split("Sink Input #")[1:]:
+            names = re.findall(r'(?:application|node)\.name = "([^"]*)"', block)
+            if not any(tok in n.lower() for n in names for tok in self._matches):
+                continue
+            m = re.search(r"Corked:\s*(yes|no)", block)
+            if m and m.group(1) == "no":
+                return True
+        return False
+
     async def _find(self) -> list[tuple[str, int | None]]:
         rc, out = await self._runner("list", "sink-inputs")
         if rc != 0 or not out:
@@ -127,7 +154,7 @@ class LocalSinkDucker:
         res: list[tuple[str, int | None]] = []
         for block in out.split("Sink Input #")[1:]:
             names = re.findall(r'(?:application|node)\.name = "([^"]*)"', block)
-            if not any(self._match in n.lower() for n in names):
+            if not any(tok in n.lower() for n in names for tok in self._matches):
                 continue
             idx = block.splitlines()[0].strip()
             if not idx.isdigit():

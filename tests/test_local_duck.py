@@ -117,6 +117,63 @@ def test_substring_match_is_case_insensitive():
     assert r.sets() == [("set-sink-input-volume", "20137", "18%")]
 
 
+# --- #62 multi-match: one belt ducks BOTH the music player and the Jellyfin/mpv video stream ---
+
+SAMPLE_WITH_MPV = (
+    "Sink Input #98\n"
+    "\tVolume: mono: 65536 / 100% / 0.00 dB\n"
+    '\t\tapplication.name = "speech-dispatcher-dummy"\n'
+    "Sink Input #20137\n"
+    "\tVolume: front-left: 65536 / 100% / 0.00 dB\n"
+    '\t\tapplication.name = "Mopidy"\n'
+    '\t\tnode.name = "Mopidy"\n'
+    "Sink Input #21000\n"
+    "\tVolume: front-left: 65536 / 90% / 0.00 dB\n"
+    '\t\tapplication.name = "mpv"\n'
+    '\t\tnode.name = "mpv Media Player"\n'
+)
+
+
+def test_multi_match_ducks_both_music_and_video():
+    # #62: "mopidy,mpv" → the belt ducks BOTH the Mopidy music stream AND the mpv (Jellyfin) video stream.
+    r = _FakeRunner(list_output=SAMPLE_WITH_MPV)
+    d = _mk(r, match="mopidy,mpv")
+    asyncio.run(d.duck(True))
+    assert sorted(s[1] for s in r.sets()) == ["20137", "21000"]
+    assert all(s[2] == "18%" for s in r.sets())
+
+
+def test_multi_match_still_skips_unmatched_streams():
+    # Our own TTS (speech-dispatcher #98) must never be ducked, even with a multi-token match.
+    r = _FakeRunner(list_output=SAMPLE_WITH_MPV)
+    d = _mk(r, match="mopidy,mpv")
+    asyncio.run(d.duck(True))
+    assert not any(s[1] == "98" for s in r.sets())
+
+
+def test_multi_match_tolerates_whitespace_and_case():
+    r = _FakeRunner(list_output=SAMPLE_WITH_MPV)
+    d = _mk(r, match=" MoPiDy , MPV ")
+    asyncio.run(d.duck(True))
+    assert sorted(s[1] for s in r.sets()) == ["20137", "21000"]
+
+
+def test_single_token_unchanged_only_music():
+    # Backward-compat: the historical single token still ducks only Mopidy, never the mpv stream.
+    r = _FakeRunner(list_output=SAMPLE_WITH_MPV)
+    d = _mk(r, match="mopidy")
+    asyncio.run(d.duck(True))
+    assert r.sets() == [("set-sink-input-volume", "20137", "18%")]
+
+
+def test_empty_match_ducks_nothing():
+    # SAFETY: an empty match must NOT degrade into matching every stream (incl. our own TTS) — it ducks none.
+    r = _FakeRunner(list_output=SAMPLE_WITH_MPV)
+    d = _mk(r, match="")
+    asyncio.run(d.duck(True))
+    assert r.sets() == []
+
+
 def test_pactl_list_failure_is_safe_noop():
     r = _FakeRunner(list_rc=1)
     d = _mk(r)
@@ -147,3 +204,39 @@ def test_restore_refinds_new_sink_input_index_after_song_switch():
     asyncio.run(d.duck(False))                      # restore must target the NEW index 30000
     assert ("set-sink-input-volume", "30000", "100%") in r.sets()
     assert not any(s[1] == "20137" and s[2] == "100%" for s in r.sets())  # not the dead index
+
+
+# --- media_playing(): actively-playing probe for the wake-ack gate (present AND not corked) ----------
+def _corked_sample(corked: str, app: str = "Mopidy"):
+    return (
+        "Sink Input #98\n"
+        "\tCorked: no\n"
+        '\t\tapplication.name = "speech-dispatcher-dummy"\n'
+        "Sink Input #20137\n"
+        f"\tCorked: {corked}\n"
+        "\tVolume: front-left: 65536 / 100% / 0.00 dB\n"
+        f'\t\tapplication.name = "{app}"\n'
+        f'\t\tnode.name = "{app}"\n'
+    )
+
+
+def test_media_playing_true_when_matched_stream_not_corked():
+    d = _mk(_FakeRunner(list_output=_corked_sample("no")))
+    assert asyncio.run(d.media_playing()) is True
+
+
+def test_media_playing_false_when_matched_stream_corked():
+    # Paused media keeps a sink-input but is corked → NOT playing (the wife's paused-music wake case).
+    d = _mk(_FakeRunner(list_output=_corked_sample("yes")))
+    assert asyncio.run(d.media_playing()) is False
+
+
+def test_media_playing_false_when_only_unmatched_stream_plays():
+    # A playing Chromium stream must not count as "media playing" when match='mopidy'.
+    d = _mk(_FakeRunner(list_output=_corked_sample("no", app="Chromium")))
+    assert asyncio.run(d.media_playing()) is False
+
+
+def test_media_playing_false_on_pactl_failure():
+    d = _mk(_FakeRunner(list_output="", list_rc=1))
+    assert asyncio.run(d.media_playing()) is False

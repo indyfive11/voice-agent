@@ -368,6 +368,14 @@ class MediaDuckController(FrameProcessor):
             st = await st
         return bool(st and st.get("playing"))
 
+    async def media_playing_local(self) -> bool:
+        """Is local media ACTIVELY playing, per the live local sink belt (NOT the brain's media_state, which
+        goes stale-frozen for a sleeping room)? Wired to the wake gate's wake-ack gate so the ack stays quiet
+        only over genuinely-audible media. No local belt configured → False (the ack speaks)."""
+        if self._local_duck is None or not getattr(self._local_duck, "enabled", False):
+            return False
+        return await self._local_duck.media_playing()
+
     # --- restore timer -----------------------------------------------------
     def _arm_restore(self) -> None:
         self._cancel_restore()
