@@ -80,11 +80,16 @@ def build_stt():
         # (the mic is resampled to PIPELINE_AUDIO_RATE before it reaches STT). Whisper assumes
         # its input array is already at this rate — feeding it 48 kHz samples would make it
         # transcribe everything 3× too fast.
-        return WhisperSTTService(
+        svc = WhisperSTTService(
             settings=WhisperSTTService.Settings(model=model),
             device="auto",
             sample_rate=PIPELINE_AUDIO_RATE,
         )
+        # pipecat calls model.transcribe with only `language` — inject the env decoding levers
+        # (beam/temperature/condition_on_previous_text/vad_filter/initial_prompt/…). No-op unless set.
+        from stt_tuning import wrap_whisper_service
+
+        return wrap_whisper_service(svc)
 
     if provider == "deepgram":
         from pipecat.services.deepgram.stt import DeepgramSTTService  # extra: [deepgram]
@@ -972,6 +977,17 @@ def build_wake_word_gate(llm):
     # the text). Default on; WAKE_SIGNAL_FORWARD=0 disables the producer (brain then sees no `wake` → current
     # behavior). Mirrors GA's GABAI_VOICE_WAKE_CONFIDENCE_FILTER kill-switch.
     emit_wake_events = _env("WAKE_SIGNAL_FORWARD", "1") not in ("0", "false", "False")
+    # Local instant wake-ack: a short phrase spoken the moment the command window opens on a fresh wake, so a
+    # non-technical user gets immediate "I'm listening" feedback (2026-06-24 wife live-test: ~12 wakes opened
+    # but captured no speech — she paused waiting for an ack). Empty = OFF (safe no-op default). Suppressed
+    # over actively-playing local media (the duck-dip is the feedback) unless WAKE_ACK_OVER_MEDIA=1.
+    wake_ack_text = _env("WAKE_ACK_TEXT", "")
+    wake_ack_over_media = _env("WAKE_ACK_OVER_MEDIA", "0") not in ("0", "false", "False")
+    # #2 cold-start pre-warm: fire POST /prewarm on the first post-wake voice energy so the brain warms the
+    # arya cloud session during the user's speech+STT, hiding the 18-21s first-turn cold-start. Off by default
+    # (safe no-op — spends an arya call when on; the brain is also independently kill-switched + rate-limited).
+    prewarm_enabled = _env("WAKE_PREWARM", "0") not in ("0", "false", "False")
+    prewarm_guard_secs = float(_env("WAKE_PREWARM_GUARD_SECS", "1.0"))
     speex_ns = False  # openWakeWord-only; set below when that engine is selected
     extra_log = ""
 
@@ -1043,6 +1059,8 @@ def build_wake_word_gate(llm):
            f"/consec{interrupt_consec_frames}/arm{interrupt_arm_delay_secs:.1f}s" if interrupt_enabled else "")
         + (" speex_ns=on" if speex_ns else "")
         + (" wake-signal=on" if emit_wake_events else " wake-signal=off")
+        + (f" wake-ack={wake_ack_text!r}{'(over-media)' if wake_ack_over_media else ''}" if wake_ack_text else " wake-ack=off")
+        + (" prewarm=on" if prewarm_enabled else "")
         + extra_log
         + (f" debug=on floor={debug_floor}" if debug else "")
     )
@@ -1079,6 +1097,10 @@ def build_wake_word_gate(llm):
         interrupt_refractory_secs=interrupt_refractory_secs,
         interrupt_arm_delay_secs=interrupt_arm_delay_secs,
         emit_wake_events=emit_wake_events,
+        wake_ack_text=wake_ack_text,
+        wake_ack_over_media=wake_ack_over_media,
+        prewarm_enabled=prewarm_enabled,
+        prewarm_guard_secs=prewarm_guard_secs,
     )
 
 

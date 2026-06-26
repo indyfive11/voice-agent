@@ -210,3 +210,27 @@ def test_other_frames_forwarded():
     passthrough = TTSSpeakFrame("not ours")
     _send(ann, passthrough)
     assert passthrough in pushed
+
+
+# --- wake-ack earcon (pre-rendered tone, bare OutputAudioRawFrame → no half-duplex mute) -------------
+def test_play_earcon_pushes_bare_output_audio_frame():
+    from pipecat.frames.frames import OutputAudioRawFrame, TTSAudioRawFrame
+    from announce import _EARCON_PCM, _EARCON_RATE
+
+    ann, pushed, _ = _announcer(started=True)
+    asyncio.run(ann.play_earcon())
+    audio = [f for f in pushed if isinstance(f, OutputAudioRawFrame)]
+    assert len(audio) == 1
+    f = audio[0]
+    # MUST be a bare OutputAudioRawFrame, NOT a TTS/Speech audio frame (those would trip the bot-speaking
+    # half-duplex mute and could clip a one-breath command — the whole reason we use an earcon, not a word).
+    assert not isinstance(f, TTSAudioRawFrame)
+    assert f.audio == _EARCON_PCM and f.sample_rate == _EARCON_RATE
+    # No spoken text, no bot-speech bracket.
+    assert _spoken(pushed) == []
+
+
+def test_play_earcon_noop_before_start():
+    ann, pushed, _ = _announcer(started=False)  # pipeline not up yet
+    asyncio.run(ann.play_earcon())
+    assert pushed == []  # never push pre-StartFrame (would be dropped + could wedge)

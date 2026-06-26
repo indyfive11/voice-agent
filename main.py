@@ -379,6 +379,10 @@ async def run() -> None:
     # gate to read the duck's live state. Both must exist (external brain + gate present).
     if wake_gate is not None and media_duck is not None and hasattr(wake_gate, "set_media_ducked"):
         wake_gate.set_media_ducked(lambda: media_duck._ducked)
+    # Wake-ack media gate: let the gate ask the LOCAL sink belt (not the brain's stale-for-sleeping-rooms
+    # media_state) whether media is actively playing, so it suppresses the local "Yes?" only over audible media.
+    if wake_gate is not None and media_duck is not None and hasattr(wake_gate, "set_media_playing_local"):
+        wake_gate.set_media_playing_local(media_duck.media_playing_local)
     # Tell the brain whether an acoustic gate exists: with one, going to sleep forces it active so only
     # "hey aria" can wake her (no STT on ambient TV); without one, sleep falls back to text-phrase wake.
     if hasattr(llm, "set_acoustic_wake_gated"):
@@ -420,6 +424,19 @@ async def run() -> None:
     if hasattr(llm, "is_floor_free"):
         from announce import DeferredAnnouncer
         announcer = DeferredAnnouncer(floor_free=llm.is_floor_free)
+        # Wake-ack rail: the gate fires a local acknowledgement on a fresh wake via the announcer (injected at
+        # the post-LLM position; a frame pushed from the upstream gate would drag through STT/LLM). Same
+        # external-producer pattern as the builder poll client. WAKE_ACK_MODE picks the form:
+        #   earcon (default, the maintainer 2026-06-25) → a pre-rendered ~120ms tone, played as a bare OutputAudioRawFrame
+        #     so it can't trip the half-duplex mute / clip a one-breath command.
+        #   text → speak WAKE_ACK_TEXT (e.g. "Yes?") via TTS — simpler but can clip a one-breath command.
+        # Still gated by the gate's own enable (WAKE_ACK_TEXT non-empty) + media/asleep suppression.
+        if wake_gate is not None and hasattr(wake_gate, "set_ack_speaker"):
+            _ack_mode = os.environ.get("WAKE_ACK_MODE", "earcon").lower()
+            if _ack_mode == "earcon":
+                wake_gate.set_ack_speaker(lambda _text=None: announcer.play_earcon())
+            else:
+                wake_gate.set_ack_speaker(announcer.announce)
 
     # Brick B: the steady, sleep-independent poll loop that pulls finished builder results / timer rings from
     # the brain's GET /builder/poll and feeds them to the announcer (spoken at a free floor), piggybacking the

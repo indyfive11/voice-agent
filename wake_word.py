@@ -27,7 +27,7 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass
-from typing import Callable
+from typing import Awaitable, Callable
 
 import numpy as np
 from loguru import logger
@@ -149,6 +149,10 @@ class WakeWordGate(FrameProcessor):
         interrupt_refractory_secs: float = 1.0,
         interrupt_arm_delay_secs: float = 0.0,
         emit_wake_events: bool = False,
+        wake_ack_text: str = "",
+        wake_ack_over_media: bool = False,
+        prewarm_enabled: bool = False,
+        prewarm_guard_secs: float = 1.0,
         time_source: Callable[[], float] | None = None,
         **kwargs,
     ):
@@ -245,6 +249,36 @@ class WakeWordGate(FrameProcessor):
         # ~6s" annoyance, 2026-06-16). Held through her reply (BotStarted cancels, BotStopped re-arms).
         self._preduck_grace_keepalive = max(0.0, preduck_grace_keepalive)
         self._preduck_task: asyncio.Task | None = None
+        # Local instant wake-ack: speak a short phrase (e.g. "Yes?") the moment the command window opens on a
+        # FRESH wake, so a user gets immediate "I'm listening" feedback and starts talking before the idle
+        # window closes. (2026-06-24 wife live-test: ~12 wakes opened but captured no speech — a non-technical
+        # user said "Aria…", got no audible ack, paused, and the window idle-closed.) Spoken LOCALLY via the
+        # DeferredAnnouncer rail (no brain round-trip), gated on a LOCAL sink-input probe — NOT the brain's
+        # media_state, which goes stale-frozen for a sleeping room (2026-06-25 GA finding). Empty text =
+        # disabled (safe no-op default). Suppressed over actively-PLAYING local media (the duck-dip is the
+        # feedback there; the maintainer never wants Aria intruding on playing music) unless wake_ack_over_media.
+        self._wake_ack_text = (wake_ack_text or "").strip()
+        self._wake_ack_over_media = wake_ack_over_media
+        self._speak_ack: Callable[[str], Awaitable[None]] | None = None
+        self._media_playing_local: Callable[[], Awaitable[bool]] | None = None
+        self._ack_task: asyncio.Task | None = None
+        # #2 cold-start pre-warm: on the FIRST post-wake voice energy (a voiced onset while the command window
+        # is open — NOT bare gate-open, so the ~12 silent wakes in the wife live-test spend nothing), fire a
+        # fire-and-forget POST /prewarm so the brain warms the arya cloud session concurrently with the user
+        # speaking + STT + endpointing, hiding the 18-21s first-turn cold-start (2026-06-25 decompose: arya
+        # warm-window is hours, deep-cold past it). Off by default (safe no-op); the brain is independently
+        # kill-switched + per-room rate-limited (4s). One fire per open; asleep-suppressed (the brain text-gates
+        # the wake → no turn → nothing to warm); client-guarded against rapid re-fire.
+        self._prewarm_enabled = prewarm_enabled
+        self._prewarm_guard = max(0.0, prewarm_guard_secs)
+        self._prewarm_armed = False
+        self._prewarm_last = 0.0
+        self._prewarm_task: asyncio.Task | None = None
+        # Safety ceiling for a confirm/offer hold (`_set_hold`): a held window has NO idle timer (it's frozen
+        # open for the answer), so a user who walks away without answering would pin the mic open forever. The
+        # brain releases precisely on the next turn, but if no turn ever comes this backstops it — force-close
+        # after `_hold_max_secs` (the same hard ceiling the media keepalive uses). Open-mic-must-never-stay-open.
+        self._hold_ceiling_task: asyncio.Task | None = None
         self._bot_speaking = False  # Aria is mid-reply → keep the pre-duck and freeze the idle close
 
         self._buf = bytearray()
@@ -344,6 +378,7 @@ class WakeWordGate(FrameProcessor):
             self._speech_in_flight = True
             if self._open:
                 self._arm_preduck()  # a speech attempt → give it the grace to produce words
+                self._maybe_fire_prewarm()  # first post-wake voice energy → warm the arya cold-start
         elif isinstance(frame, VADUserStoppedSpeakingFrame):
             self._speech_in_flight = False
             if self._open:
@@ -417,9 +452,35 @@ class WakeWordGate(FrameProcessor):
             else:
                 self._cancel_window()  # freeze the idle timer while held
                 _tlog("GATE  | hold — confirm pending, window held open")
+            self._arm_hold_ceiling()  # walk-away safety: a held window must never stay open forever
         else:
+            self._cancel_hold_ceiling()
             _tlog("GATE  | hold released — re-arming idle window")
             self._arm_window()
+
+    def _arm_hold_ceiling(self) -> None:
+        """Force-release a `_set_hold` window after `_hold_max_secs` regardless of an answer — the safe-by-
+        default backstop for the walk-away case (a confirm/offer the user ignores, so no next turn arrives to
+        release it). The brain still releases precisely on the next turn; this only ever fires when none comes."""
+        self._cancel_hold_ceiling()
+        if self._hold_max_secs <= 0:
+            return
+
+        async def _later():
+            try:
+                await asyncio.sleep(self._hold_max_secs)
+                if self._hold:
+                    _tlog(f"GATE  | hold ceiling {self._hold_max_secs:.0f}s — force-releasing held window (no answer)")
+                    self._set_hold(False)
+            except asyncio.CancelledError:
+                pass
+
+        self._hold_ceiling_task = asyncio.create_task(_later())
+
+    def _cancel_hold_ceiling(self) -> None:
+        if self._hold_ceiling_task is not None and not self._hold_ceiling_task.done():
+            self._hold_ceiling_task.cancel()
+        self._hold_ceiling_task = None
 
     def duck_allowed(self) -> bool:
         """Whether the downstream media-duck may fire on a speech onset. Gate the duck behind the wake word
@@ -651,6 +712,7 @@ class WakeWordGate(FrameProcessor):
                 f"GATE  | escape — {len(self._escape_hits)} sustained near-misses in "
                 f"{self._escape_secs:.0f}s, opening despite sub-threshold"
             )
+            self._schedule_wake_ack()
 
     def _track_gated_retry(self, score: float, now: float) -> None:
         """While the wake is being GATED (asleep OR awake-with-media-playing), count separate >=threshold
@@ -687,6 +749,7 @@ class WakeWordGate(FrameProcessor):
                 f"WAKE  | gated-retry — {self._gated_retry_count} near-wakes in "
                 f"{self._gated_retry_secs:.0f}s, opening despite short sustain"
             )
+            self._schedule_wake_ack()
 
     async def _on_wake(self, score: float, gated: bool = True) -> None:
         # Item C: tell the brain (downstream) a FRESH acoustic wake fired, carrying the detector score, so it
@@ -698,6 +761,7 @@ class WakeWordGate(FrameProcessor):
             await self.push_frame(WakeEventFrame(score=score), FrameDirection.DOWNSTREAM)
         if gated:
             self._open_window(f"WAKE  | wake word ({score:.2f}) — opening command window")
+            self._schedule_wake_ack()
         else:
             # Open mic (media idle): the mic already passes audio through, and there's nothing playing to
             # duck — so this is EMIT-ONLY. No window/pre-duck; the WakeEventFrame is the whole point, giving
@@ -729,6 +793,7 @@ class WakeWordGate(FrameProcessor):
         """Open the command window (idempotent): log the reason, pre-duck, arm the idle timer."""
         self._cancel_keepalive()  # a fresh wake/confirm supersedes any media keepalive hold
         self._open_via_keepalive = False  # a fresh wake → the long preduck grace + raw-onset duck apply
+        self._prewarm_armed = True  # arm the cold-start pre-warm; the first voiced onset in this window fires it
         if not self._open:
             self._open = True
             _tlog(log_msg)
@@ -875,6 +940,68 @@ class WakeWordGate(FrameProcessor):
         """Wire the single-writer coordination: a callback returning whether the MediaDuckController currently
         owns an active duck. Called from main.py after both processors are built. See `self._media_ducked`."""
         self._media_ducked = media_ducked
+
+    def set_ack_speaker(self, speak_ack: Callable[[str], Awaitable[None]]) -> None:
+        """Wire the local wake-ack speak rail (`DeferredAnnouncer.announce`). Called from main.py after the
+        announcer is built. Absent → the wake-ack is inert even if `wake_ack_text` is set."""
+        self._speak_ack = speak_ack
+
+    def set_media_playing_local(self, probe: Callable[[], Awaitable[bool]]) -> None:
+        """Wire a LOCAL 'is media actively playing' probe (`media_duck.media_playing_local`) for the wake-ack
+        gate — kept off the brain's media_state, which goes stale for a sleeping room. Absent → treat as not
+        playing (the ack speaks)."""
+        self._media_playing_local = probe
+
+    def _schedule_wake_ack(self) -> None:
+        """On a genuine FRESH wake, speak the local wake-ack so the user knows Aria is listening — unless
+        disabled (empty text / no speak rail), asleep, or actively-playing local media is already giving
+        duck-dip feedback. Fire-and-forget; never blocks the wake path. Only called from the fresh-wake open
+        sites (not confirm-hold / interrupt-floor)."""
+        if not self._wake_ack_text or self._speak_ack is None:
+            return
+        if self._force_gated:
+            return  # asleep — never blurt; the brain may text-gate the wake and stay dozing
+        if self._ack_task is not None and not self._ack_task.done():
+            return  # an ack is already in flight (refractory already dedups rapid re-fires)
+
+        async def _go():
+            try:
+                if not self._wake_ack_over_media and self._media_playing_local is not None:
+                    try:
+                        if await self._media_playing_local():
+                            return  # audible media → its duck-dip is the ack; don't intrude on playing music
+                    except Exception:  # noqa: BLE001 - a probe failure must never swallow the ack
+                        pass
+                await self._speak_ack(self._wake_ack_text)
+            except Exception as e:  # noqa: BLE001 - the ack is best-effort; never break the wake path
+                _tlog(f"WAKE  | wake-ack FAILED: {type(e).__name__}: {e}")
+
+        self._ack_task = asyncio.create_task(_go())
+
+    def _maybe_fire_prewarm(self) -> None:
+        """On the FIRST post-wake voice energy (a voiced onset while the command window is open), fire a
+        fire-and-forget /prewarm so the brain warms the arya cloud session during the dead time the user
+        spends speaking + STT + endpointing — hiding the cold-start. Once per open (armed by `_open_window`),
+        asleep-suppressed (the brain text-gates the wake → no turn → nothing to warm), client-guarded against
+        rapid re-fire (the brain has its own per-room cooldown too). Off unless `prewarm_enabled`."""
+        if not self._prewarm_enabled or self._client is None or not self._prewarm_armed:
+            return
+        if self._force_gated:
+            return  # asleep — the brain won't run a turn, so warming would be wasted spend
+        now = self._now()
+        if self._prewarm_guard > 0 and (now - self._prewarm_last) < self._prewarm_guard:
+            return
+        self._prewarm_armed = False
+        self._prewarm_last = now
+        ts = int(now * 1000)
+
+        async def _go():
+            try:
+                await self._client.prewarm(self._session_id, ts=ts)
+            except Exception as e:  # noqa: BLE001 - best-effort; never break the wake path
+                _tlog(f"WAKE  | prewarm FAILED: {type(e).__name__}: {e}")
+
+        self._prewarm_task = asyncio.create_task(_go())
 
     def _release_or_relinquish_duck(self, log_msg: str | None = None) -> None:
         """End the gate's own pre-duck. If the media-duck owns an active duck, RELINQUISH silently — clear our

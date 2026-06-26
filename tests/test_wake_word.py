@@ -1309,3 +1309,166 @@ def test_interrupt_threshold_defaults_to_wake_threshold():
     asyncio.run(g._feed_interrupt(_CHUNK))
     assert g._interrupt_calls == []
     assert g._open is False
+
+
+# --- local instant wake-ack ("Yes?" on fresh wake; #3 wife-live-test fix) ---------------------------
+def _ack_gate(*, media_playing=False, **kw):
+    """Gate with the wake-ack rails wired: a recording speak callback + a fake local-media probe."""
+    g = _gate(FakeBrainClient(), **kw)
+    spoken: list[str] = []
+
+    async def _speak(text):
+        spoken.append(text)
+
+    async def _probe():
+        return media_playing
+
+    g.set_ack_speaker(_speak)
+    g.set_media_playing_local(_probe)
+    return g, spoken
+
+
+async def _wake_and_drain(g):
+    g._oww.score = 0.9
+    await g._feed(_CHUNK)
+    if g._ack_task is not None:
+        await g._ack_task  # let the fire-and-forget ack body run to completion
+
+
+def test_wake_ack_speaks_on_fresh_wake_when_enabled():
+    g, spoken = _ack_gate(wake_ack_text="Yes?")
+    asyncio.run(_wake_and_drain(g))
+    assert spoken == ["Yes?"]
+
+
+def test_wake_ack_off_by_default_empty_text():
+    g, spoken = _ack_gate()  # no WAKE_ACK_TEXT → inert (safe no-op default)
+    asyncio.run(_wake_and_drain(g))
+    assert spoken == []
+    assert g._ack_task is None
+
+
+def test_wake_ack_suppressed_over_playing_media():
+    g, spoken = _ack_gate(wake_ack_text="Yes?", media_playing=True)
+    asyncio.run(_wake_and_drain(g))
+    assert spoken == []  # audible media → the duck-dip is the feedback; don't talk over it
+
+
+def test_wake_ack_fires_over_media_when_over_media_opt_in():
+    g, spoken = _ack_gate(wake_ack_text="Yes?", media_playing=True, wake_ack_over_media=True)
+    asyncio.run(_wake_and_drain(g))
+    assert spoken == ["Yes?"]
+
+
+def test_wake_ack_suppressed_while_asleep():
+    g, spoken = _ack_gate(wake_ack_text="Yes?")
+    g._force_gated = True  # asleep — never blurt; the brain may text-gate the wake and stay dozing
+
+    async def go():
+        g._schedule_wake_ack()
+        if g._ack_task is not None:
+            await g._ack_task
+
+    asyncio.run(go())
+    assert spoken == []
+    assert g._ack_task is None
+
+
+# --- #2 cold-start pre-warm: fire /prewarm on the FIRST post-wake voice energy --------------------------
+async def _wake_then_voice(g):
+    g._oww.score = 0.9
+    await g._feed(_CHUNK)  # fresh wake → window opens, prewarm armed
+    await g.process_frame(VADUserStartedSpeakingFrame(), FrameDirection.DOWNSTREAM)  # first voiced onset
+    if g._prewarm_task is not None:
+        await g._prewarm_task
+
+
+def test_prewarm_fires_on_first_post_wake_voice_when_enabled():
+    client = FakeBrainClient()
+    g = _gate(client, prewarm_enabled=True)
+    asyncio.run(_wake_then_voice(g))
+    assert len(client.prewarm_calls) == 1
+    assert client.prewarm_calls[0][0] == "sess-test"  # (session, ts)
+
+
+def test_prewarm_off_by_default():
+    client = FakeBrainClient()
+    g = _gate(client)  # prewarm_enabled defaults False → inert (safe no-op)
+    asyncio.run(_wake_then_voice(g))
+    assert client.prewarm_calls == []
+
+
+def test_prewarm_not_fired_on_silent_wake():
+    # A wake with NO voiced onset (the wife's ~12 no-speech wakes) must spend nothing — armed but never fired.
+    client = FakeBrainClient()
+    g = _gate(client, prewarm_enabled=True)
+
+    async def go():
+        g._oww.score = 0.9
+        await g._feed(_CHUNK)  # window opens; no VADUserStartedSpeaking follows
+
+    asyncio.run(go())
+    assert client.prewarm_calls == []
+
+
+def test_prewarm_once_per_open():
+    # Two voiced onsets in the same window → exactly one /prewarm (armed once per open).
+    client = FakeBrainClient()
+    g = _gate(client, prewarm_enabled=True, prewarm_guard_secs=0.0)
+
+    async def go():
+        g._oww.score = 0.9
+        await g._feed(_CHUNK)
+        await g.process_frame(VADUserStartedSpeakingFrame(), FrameDirection.DOWNSTREAM)
+        if g._prewarm_task is not None:
+            await g._prewarm_task
+        await g.process_frame(VADUserStartedSpeakingFrame(), FrameDirection.DOWNSTREAM)  # same window
+        if g._prewarm_task is not None:
+            await g._prewarm_task
+
+    asyncio.run(go())
+    assert len(client.prewarm_calls) == 1
+
+
+def test_prewarm_suppressed_while_asleep():
+    client = FakeBrainClient()
+    g = _gate(client, prewarm_enabled=True)
+    g._force_gated = True   # asleep — the brain text-gates the wake → no turn → warming would be wasted
+    g._prewarm_armed = True
+
+    async def go():
+        g._maybe_fire_prewarm()
+        if g._prewarm_task is not None:
+            await g._prewarm_task
+
+    asyncio.run(go())
+    assert client.prewarm_calls == []
+
+
+# --- _set_hold max-hold ceiling (walk-away safety: a held window must never stay open forever) ---------
+def test_set_hold_force_releases_at_ceiling_when_no_answer():
+    # An offer/confirm hold with no answer (user walked away) must auto-close after hold_max_secs.
+    g = _gate(FakeBrainClient(), hold_max_secs=0.05)
+
+    async def go():
+        g._set_hold(True)
+        assert g._hold is True and g._open is True
+        await asyncio.sleep(0.09)  # ceiling elapses with no release
+
+    asyncio.run(go())
+    assert g._hold is False  # force-released by the ceiling
+
+
+def test_set_hold_release_cancels_ceiling():
+    # An explicit release (brain answered on the next turn) cancels the ceiling — no double-release/late fire.
+    g = _gate(FakeBrainClient(), hold_max_secs=0.05)
+
+    async def go():
+        g._set_hold(True)
+        g._set_hold(False)  # brain releases promptly
+        assert g._hold is False
+        await asyncio.sleep(0.09)  # the (cancelled) ceiling must not fire
+
+    asyncio.run(go())
+    assert g._hold is False
+    assert g._hold_ceiling_task is None or g._hold_ceiling_task.cancelled()

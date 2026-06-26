@@ -183,6 +183,22 @@ class HttpBrainClient:
         except Exception as e:  # noqa: BLE001
             logger.debug(f"Brain: /media/duck failed (ignored): {type(e).__name__}: {e}")
 
+    async def prewarm(self, session_id: str, ts: int | None = None) -> None:
+        """Fire-and-forget `POST /prewarm` on the first post-wake voice energy → the brain fires a throwaway
+        arya completion to warm the cloud session, overlapping the dead time the user spends speaking + STT +
+        endpointing so the real turn doesn't eat the 18-21s cold-start (2026-06-25 decompose: arya warm-window
+        is hours, deep-cold past it). Response IGNORED (zero added latency); the brain is idempotent + per-room
+        rate-limited + kill-switched. `ts` = our first-voice-energy stamp (monotonic ms), echoed into the
+        brain's `prewarm` debug line so we can pair it with the warm-call ttft and the real turn's arya ttft.
+        Best-effort: a brain without `/prewarm` (404) or any error is a harmless no-op."""
+        try:
+            body = self._with_room({"session_id": session_id})
+            if ts is not None:
+                body["ts"] = ts
+            await self._http.post("/prewarm", json=body, timeout=httpx.Timeout(5.0))
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"Brain: /prewarm failed (ignored): {type(e).__name__}: {e}")
+
     async def media_state(self, session_id: str, bot_speaking: bool = False) -> dict | None:
         """Best-effort `GET /media/state` → provider-neutral `{"playing": bool, "state":
         "playing"|"paused"|"idle"}`. None if the brain doesn't expose it (older brain / 404) or on any

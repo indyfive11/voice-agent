@@ -35,10 +35,44 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 
+import numpy as np
 from loguru import logger
 
-from pipecat.frames.frames import BotStoppedSpeakingFrame, Frame, StartFrame, SystemFrame, TTSSpeakFrame
+from pipecat.frames.frames import (
+    BotStoppedSpeakingFrame,
+    Frame,
+    OutputAudioRawFrame,
+    StartFrame,
+    SystemFrame,
+    TTSSpeakFrame,
+)
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+
+# --- wake-ack earcon ---------------------------------------------------------------------------------
+# A short, soft two-tone rising "blip" (~120ms) used as the local wake acknowledgement. It is a PRE-RENDERED
+# tone (NOT a spoken word) so it's instant — no TTS round-trip — and, played as a bare OutputAudioRawFrame
+# (NOT a TTS/Speech frame), it does NOT trip the output transport's bot-speaking half-duplex mute. So it can
+# never clip a one-breath command the way a spoken "Yes?" would (the 2026-06-25 collision finding; the maintainer chose
+# the earcon over the word for exactly this). Built once at import (~6 KB).
+_EARCON_RATE = 24000
+
+
+def _make_earcon(rate: int = _EARCON_RATE) -> bytes:
+    def _tone(freq: float, ms: int) -> np.ndarray:
+        n = int(rate * ms / 1000)
+        t = np.arange(n) / rate
+        wav = np.sin(2.0 * np.pi * freq * t)
+        fade = max(1, int(rate * 0.006))  # 6ms fade in/out so there's no click
+        env = np.ones(n)
+        env[:fade] = np.linspace(0.0, 1.0, fade)
+        env[-fade:] = np.linspace(1.0, 0.0, fade)
+        return wav * env
+
+    sig = np.concatenate([_tone(880.0, 60), _tone(1320.0, 60)])
+    return (sig * 0.22 * 32767.0).astype("<i2").tobytes()  # ~22% amplitude — present but soft
+
+
+_EARCON_PCM = _make_earcon()
 
 # Reserved priority band (higher = more urgent). Only DEFAULT is used today; the others name the future
 # producers so the API is stable before the ordering logic exists.
@@ -80,6 +114,18 @@ class DeferredAnnouncer(FrameProcessor):
         """Producer entry point (the builder poll client / timers call this). Queue an out-of-band utterance
         and speak it at the next free floor. `text` is voiced verbatim — pass the ground-truth string."""
         await self._enqueue(SpeakDeferredFrame(text=text, job_id=job_id, priority=priority))
+
+    async def play_earcon(self) -> None:
+        """Wake-ack producer entry (the wake gate calls this in earcon mode). Push the pre-rendered tone as a
+        bare OutputAudioRawFrame DOWNSTREAM toward TTS/output — NOT via the floor queue (an ack must be
+        immediate) and NOT a TTS/bot-speech frame (so it never triggers the half-duplex mute → can't clip the
+        user's command). No-op before our StartFrame (push would be dropped)."""
+        if not self._started:
+            return
+        await self.push_frame(
+            OutputAudioRawFrame(audio=_EARCON_PCM, sample_rate=_EARCON_RATE, num_channels=1),
+            FrameDirection.DOWNSTREAM,
+        )
 
     async def enqueue_deferred(self, text: str, job_id: str | None = None) -> None:
         """Back-compat alias for the seam name GA's contract referenced; forwards to announce()."""

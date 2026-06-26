@@ -114,6 +114,12 @@ class BrainClient(Protocol):
         plain duck). No-op if the brain controls no media; must never raise."""
         ...
 
+    async def prewarm(self, session_id: str, ts: int | None = None) -> None:
+        """Best-effort fire-and-forget: tell the brain to warm its LLM cloud session (a throwaway
+        completion) on the first post-wake voice energy, so the real turn doesn't pay the cold-start.
+        No-op on a brain without it; must never raise."""
+        ...
+
     async def media_state(self, session_id: str, bot_speaking: bool = False) -> dict | None:
         """Best-effort, provider-neutral playback snapshot: {"playing": bool, "state":
         "playing"|"paused"|"idle"} so the caller can skip ducking when nothing is playing. Brain-
@@ -161,6 +167,7 @@ class FakeBrainClient:
         self.cancel_calls: list[str] = []
         self.duck_calls: list[tuple[str, bool]] = []
         self.duck_mute_calls: list[tuple[str, bool, bool]] = []  # (session, on, mute)
+        self.prewarm_calls: list[tuple[str, int | None]] = []  # (session, ts) on each /prewarm fire
         # Tests set this to drive media_state(); None → capability absent (callers assume "playing").
         self.media_state_value: dict | None = None
         self.media_state_calls = 0  # how many times media_state() was queried (debounce tests)
@@ -187,6 +194,9 @@ class FakeBrainClient:
             if self._delay:
                 await asyncio.sleep(self._delay)
             yield ev
+
+    async def prewarm(self, session_id: str, ts: int | None = None) -> None:
+        self.prewarm_calls.append((session_id, ts))
 
     async def cancel(self, session_id: str) -> None:
         self.cancel_calls.append(session_id)
