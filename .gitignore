@@ -1,5 +1,8 @@
-# Secrets
+# Secrets — .env and ANY backup variant (.env.bak-*, etc.) must never be visible to git
+# (public repo). .env.example is tracked and intentionally NOT matched by these patterns.
 .env
+.env.bak*
+.env.*.bak
 
 # Python / venv
 .venv/
