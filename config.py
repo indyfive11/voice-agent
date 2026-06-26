@@ -160,6 +160,29 @@ def build_tts():
         tts_kwargs = {"settings": KokoroTTSService.Settings(voice=voice)}
         if out_rate:
             tts_kwargs["sample_rate"] = out_rate  # → base TTSService _init_sample_rate (via **kwargs)
+
+        # Sub-sentence streaming (felt-latency cliff fix, GA↔VAC collab 2026-06-26): pipecat hands
+        # run_tts ONE sentence, and stock Kokoro synthesizes a long sentence WHOLE before any audio
+        # (create_stream is fake-streaming) → a ~6s first-audio on a long run-on. The subclass splits
+        # that sentence at clause boundaries and flushes each, so first-audio lands on the first
+        # clause. SAFE DEFAULT = OFF (0) = the historical no-op (stock KokoroTTSService, byte-identical).
+        # TTS_SUBSENTENCE_SPLIT = N chars → only sentences LONGER than N are sub-split (short/normal
+        # sentences pass through whole, natural prosody — Kokoro renders each chunk with sentence-final
+        # intonation, so we don't chunk the common case). A good daily-driver value is ~140.
+        subsentence = _env_int("TTS_SUBSENTENCE_SPLIT") or 0
+        if subsentence > 0:
+            from tts_stream_kokoro import StreamingKokoroTTSService
+
+            max_chars = _env_int("TTS_SUBSENTENCE_MAX_CHARS") or 160
+            logger.info(
+                f"TTS: local Kokoro (onnx) voice={voice} +sub-sentence-stream"
+                f" (split>{subsentence}c, cap={max_chars}c)"
+                + (f" emit_rate={out_rate}Hz (pinned)" if out_rate else "")
+            )
+            return StreamingKokoroTTSService(
+                split_threshold=subsentence, max_chars=max_chars, **tts_kwargs
+            )
+
         logger.info(
             f"TTS: local Kokoro (onnx) voice={voice}"
             + (f" emit_rate={out_rate}Hz (pinned)" if out_rate else "")

@@ -76,24 +76,18 @@ def _f32_to_pcm16(samples: "np.ndarray") -> bytes:
     return (np.clip(samples, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
 
 
-_SENT_RE = re.compile(r"[^.!?]*[.!?]+|\S[^.!?]*$")
+from tts_chunk import split_for_synth  # noqa: E402 - shared chunker (one impl, no drift); pure-stdlib, no TMPDIR concern
 
 
 def _split_sentences(text: str, *, min_len: int = 24) -> list[str]:
-    """Split a reply into sentence chunks for incremental synth. Tiny fragments are merged forward so we
-    don't synth choppy 1-2 word clips (each synth has fixed overhead). The point is a short FIRST chunk
-    (fast first-audio) without over-fragmenting the rest."""
-    parts = [p.strip() for p in _SENT_RE.findall(text) if p.strip()]
-    merged: list[str] = []
-    for p in parts:
-        if merged and len(merged[-1]) < min_len:
-            merged[-1] = f"{merged[-1]} {p}".strip()
-        else:
-            merged.append(p)
-    if not merged:
-        t = text.strip()
-        return [t] if t else []
-    return merged
+    """Split a reply into chunks for incremental synth — delegates to the shared chunker so there is
+    ONE implementation across the in-pipeline subclass and this service (no drift).
+
+    Defaults reproduce the historical behavior byte-for-byte: ``clause=False`` (sentence terminals
+    ``.!?`` only), no max-char cap, no length gate. To give THIS host (the Pi) the sub-sentence
+    cliff fix too, pass ``clause=True`` + ``split_threshold``/``max_chars`` (deferred until a Pi
+    live-verify — see the GA↔VAC streaming_TTS collab, 2026-06-26)."""
+    return split_for_synth(text, min_len=min_len, clause=False, max_chars=0, split_threshold=0)
 
 
 def synth_pcm(kokoro, text: str, voice: str) -> tuple[bytes, int]:
