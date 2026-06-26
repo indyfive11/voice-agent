@@ -83,9 +83,12 @@ def float32_to_wav(audio: np.ndarray, sample_rate: int) -> bytes:
     return buf.getvalue()
 
 
-def _transcribe(model, audio: np.ndarray, language: str | None) -> str:
-    """Blocking transcribe (run via asyncio.to_thread). Mirrors whisper/stt.py text assembly."""
-    segments, _ = model.transcribe(audio, language=language)
+def _transcribe(model, audio: np.ndarray, language: str | None, decoding: dict | None = None) -> str:
+    """Blocking transcribe (run via asyncio.to_thread). Mirrors whisper/stt.py text assembly.
+
+    `decoding` carries the env accuracy levers (beam/temperature/condition_on_previous_text/…); empty = today.
+    """
+    segments, _ = model.transcribe(audio, language=language, **(decoding or {}))
     return "".join(seg.text for seg in segments).strip()
 
 
@@ -99,11 +102,12 @@ def _transcribe(model, audio: np.ndarray, language: str | None) -> str:
 class FasterWhisperBackend:
     """CPU faster-whisper. Runs the blocking transcribe in a thread so the event loop stays free."""
 
-    def __init__(self, model):
+    def __init__(self, model, decoding: dict | None = None):
         self._model = model
+        self._decoding = decoding or {}
 
     async def transcribe(self, audio: np.ndarray, sample_rate: int, language: str | None) -> str:
-        return await asyncio.to_thread(_transcribe, self._model, audio, language)
+        return await asyncio.to_thread(_transcribe, self._model, audio, language, self._decoding)
 
     async def close(self) -> None:
         pass
@@ -117,10 +121,13 @@ class WhisperCppBackend:
     service remains the LAN-facing, bearer-guarded, room-keyed layer.
     """
 
-    def __init__(self, url: str, *, session: aiohttp.ClientSession | None = None, timeout: float = 30.0):
+    def __init__(self, url: str, *, session: aiohttp.ClientSession | None = None, timeout: float = 30.0,
+                 form_fields: dict | None = None):
         self._url = url.rstrip("/") + "/inference"
         self._session = session
         self._timeout = aiohttp.ClientTimeout(total=timeout)
+        # whisper-server accepts a subset of levers as form fields (temperature, prompt); empty = today.
+        self._form_fields = form_fields or {}
 
     async def _ensure_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -135,6 +142,8 @@ class WhisperCppBackend:
         form.add_field("response_format", "json")
         if language:
             form.add_field("language", language)
+        for key, value in self._form_fields.items():
+            form.add_field(key, value)
         async with session.post(self._url, data=form, timeout=self._timeout) as r:
             r.raise_for_status()
             data = await r.json()
@@ -147,12 +156,18 @@ class WhisperCppBackend:
 
 def _load_backend():
     """Select the transcribe backend from STT_SERVICE_BACKEND (faster | whispercpp). Default faster."""
+    import stt_tuning
+
     backend = (os.environ.get("STT_SERVICE_BACKEND") or "faster").lower()
     if backend in ("whispercpp", "whisper.cpp", "whisper-cpp", "gpu"):
         url = os.environ.get("WHISPER_CPP_URL") or "http://127.0.0.1:8079"
-        logger.info(f"STT service: backend=whispercpp (GPU) proxying to whisper-server {url}")
-        return WhisperCppBackend(url)
-    return FasterWhisperBackend(_load_model())
+        fields = stt_tuning.whispercpp_form_fields()
+        logger.info(f"STT service: backend=whispercpp (GPU) proxying to whisper-server {url} "
+                    f"(levers: {stt_tuning.describe(fields)})")
+        return WhisperCppBackend(url, form_fields=fields)
+    decoding = stt_tuning.decoding_kwargs()
+    logger.info(f"STT service: backend=faster-whisper (levers: {stt_tuning.describe(decoding)})")
+    return FasterWhisperBackend(_load_model(), decoding=decoding)
 
 
 class SttApp:
