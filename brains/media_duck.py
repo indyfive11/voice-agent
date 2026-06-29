@@ -339,14 +339,20 @@ class MediaDuckController(FrameProcessor):
 
         async def _go():
             try:
-                if on and not await self._media_playing():
+                # Arm if EITHER the brain's media_state reports media OR a matched LOCAL sink is live.
+                # The belt ducks a physically-local sink, so a matched local sink playing is ground-truth
+                # on its own — independent of the brain's media_state, which judges a CAST session by its
+                # RemoteEndPoint and can flag a movie playing on THIS laptop's screen as 'remote' (→ not
+                # 'playing') when the room has no room_media profile. Self-detecting via the belt avoids
+                # gating a local-sink duck on the brain's session-locality call (the 2026-06-26 movie gap).
+                if on and not (await self._media_playing() or await self.media_playing_local()):
                     # Nothing actually playing — don't bother the brain; undo the optimistic flag.
                     # DEBUG-only: in open-mic conversation (no media) every VAD onset hits this path, so
                     # logging it to the transcript drowns USER/BOT in "on SKIPPED" noise (~40% of the
                     # transcript in the 2026-06-17 open-mic drive). The skip is a no-op; keep it in
                     # session.log for media debugging, off the transcript.
                     self._ducked = False
-                    logger.debug("DUCK  | on SKIPPED (media_state: nothing playing)")
+                    logger.debug("DUCK  | on SKIPPED (nothing playing: brain media_state idle + no local sink)")
                     return
                 await self._client.duck(self._session_id, on)
                 # Pi-side belt: attenuate the LOCAL media sink-input too (no-op when unset/disabled). On a

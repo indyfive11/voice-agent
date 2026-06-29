@@ -165,6 +165,76 @@ def test_duck_gated_behind_wake_word():
     asyncio.run(go())
 
 
+def test_belt_arms_on_local_sink_when_brain_media_state_blind():
+    # 2026-06-26 movie gap: a cast movie playing on THIS laptop is judged 'remote' by the brain (the
+    # mpv-shim session's RemoteEndPoint is the laptop's ZT IP) → media_state.playing stays False. The belt
+    # ducks the physically-LOCAL mpv sink, so it must arm on its OWN local-sink ground-truth, NOT the
+    # brain's session-locality call. _fire now ORs media_playing_local() into the gate.
+    client = FakeBrainClient()
+
+    class _Belt:
+        enabled = True
+
+        def __init__(self):
+            self.calls = []
+
+        async def media_playing(self):
+            return True  # a matched local sink (mpv) is actively playing
+
+        async def duck(self, on):
+            self.calls.append(on)
+
+    belt = _Belt()
+    g = MediaDuckController(
+        client, session_id="sess-test", confirm_grace=0.02, restore_grace=0.2,
+        media_status=(lambda: {"playing": False}),  # brain is BLIND (remote-judged cast movie)
+        local_duck=belt,
+    )
+
+    async def go():
+        g._handle(VADUserStartedSpeakingFrame())
+        await _drain()
+        assert client.duck_calls == [("sess-test", True)], "belt did not arm the duck on local-sink ground-truth"
+        assert belt.calls == [True], "local belt sink was not ducked"
+        assert g._ducked is True
+
+    asyncio.run(go())
+
+
+def test_belt_skips_when_neither_brain_nor_local_sees_media():
+    # The OR must not become a false-fire: brain media_state idle AND no matched local sink → still skip
+    # (no duck), so open-mic conversation with nothing playing is unaffected.
+    client = FakeBrainClient()
+
+    class _Belt:
+        enabled = True
+
+        def __init__(self):
+            self.calls = []
+
+        async def media_playing(self):
+            return False  # no matched local sink playing
+
+        async def duck(self, on):
+            self.calls.append(on)
+
+    belt = _Belt()
+    g = MediaDuckController(
+        client, session_id="sess-test", confirm_grace=0.02, restore_grace=0.2,
+        media_status=(lambda: {"playing": False}),
+        local_duck=belt,
+    )
+
+    async def go():
+        g._handle(VADUserStartedSpeakingFrame())
+        await _drain()
+        assert client.duck_calls == [], "ducked with no media anywhere (false-fire)"
+        assert belt.calls == []
+        assert g._ducked is False
+
+    asyncio.run(go())
+
+
 def test_onset_gate_suppresses_raw_onset_but_confirmed_speech_still_ducks():
     # F1 (2026-06-16): in the keepalive/idle tail over playing media, the raw VAD onset is suppressed (the
     # media's own onsets must not dip the bed) — modelled by should_duck_onset=False — while a REAL follow-up
