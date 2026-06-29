@@ -30,6 +30,15 @@ auto-recovery instead of a permanent 48%-CPU silent spin. `None` = stay log-only
 `INPUT_STALL_EXIT_ON_FAIL=1` — for bare/interactive runs or transient units with no supervisor to restart us,
 where exiting would just leave Aria dead).
 
+**No-first-frame blind spot (`first_frame_secs`, added 2026-06-28):** the arming above keys on the *first*
+`InputAudioRawFrame` — both the `_armed` flag AND the watch task were only created when one arrived. So a
+capture that **never delivers a first frame** (device opened/claimed but isochronous transfer dead — the EM
+reSpeaker XVF3800, 2026-06-28: ALSA showed `Capture: Running` yet zero frames reached the pipeline) left the
+watch loop unstarted: no heartbeat, no stall, no escalation — **deaf for ~3.5 days across four restarts**.
+Fix: start the watch loop on `StartFrame` and, until armed, treat "StartFrame seen but no first frame within
+`first_frame_secs`" as a stall — same restart-kick → escalate path, so a never-started source self-heals
+instead of sitting silently inert.
+
 Sits FIRST in the pipeline (right after `transport.input()`, before the resampler) so it times the rawest
 mic frames and is blind to downstream wake-gate swallowing (it measures capture health, not gating).
 """
@@ -61,6 +70,7 @@ class InputStallDetector(FrameProcessor):
         stall_secs: float = 5.0,
         silent_secs: float = 8.0,
         silence_eps: int = 4,
+        first_frame_secs: float = 15.0,  # StartFrame seen but no audio frame within this → stall
         restart=None,  # async callable(start_frame) -> bool; None = log-only
         max_restarts: int = 3,
         on_unrecoverable=None,  # callable() run once when restarts are exhausted; None = stay log-only
@@ -72,6 +82,7 @@ class InputStallDetector(FrameProcessor):
         self._stall_secs = stall_secs
         self._silent_secs = silent_secs
         self._silence_eps = silence_eps
+        self._first_frame_secs = first_frame_secs
         self._restart = restart
         self._max_restarts = max_restarts
         self._on_unrecoverable = on_unrecoverable
@@ -80,6 +91,7 @@ class InputStallDetector(FrameProcessor):
 
         self._last = 0.0           # monotonic of the last frame of ANY kind
         self._last_nonsilent = 0.0  # monotonic of the last frame with real audio
+        self._started_at = 0.0      # monotonic of StartFrame (arms the no-first-frame deadline)
         self._armed = False         # seen ≥1 frame (don't warn before capture starts)
         self._stalled = False       # currently in a stall episode
         self._restarts = 0          # restart attempts this episode
@@ -96,6 +108,12 @@ class InputStallDetector(FrameProcessor):
         await super().process_frame(frame, direction)
         if isinstance(frame, StartFrame):
             self._start_frame = frame
+            # Start the watch loop NOW (not on first audio frame) so a capture that never delivers a
+            # first frame is still detectable — the no-first-frame blind spot, see module docstring.
+            self._started_at = time.monotonic()
+            self._hb_at = self._started_at
+            if self._task is None:
+                self._task = self.task_manager.create_task(self._watch(), f"{self}::watch")
         elif isinstance(frame, InputAudioRawFrame):
             now = time.monotonic()
             self._last = now
@@ -108,7 +126,8 @@ class InputStallDetector(FrameProcessor):
                 self._armed = True
                 self._last_nonsilent = now  # arm both clocks on first frame
                 self._hb_at = now
-                self._task = self.task_manager.create_task(self._watch(), f"{self}::watch")
+                if self._task is None:  # StartFrame usually started it; fall back if it didn't
+                    self._task = self.task_manager.create_task(self._watch(), f"{self}::watch")
         await self.push_frame(frame, direction)
 
     def _is_silent(self, audio: bytes) -> bool:
@@ -127,9 +146,14 @@ class InputStallDetector(FrameProcessor):
 
     async def _tick(self) -> None:
         """One watch step (extracted so it's unit-testable without driving the sleep loop)."""
-        if not self._armed:
-            return
         now = time.monotonic()
+        if not self._armed:
+            # Before the first frame: only the no-first-frame deadline applies (and only once
+            # StartFrame has armed `_started_at` — a tick with no StartFrame stays a no-op, so
+            # bare construction never warns). A claimed-but-dead capture is caught here.
+            if self._started_at and now - self._started_at > self._first_frame_secs:
+                await self._on_stall("no first mic frame", now - self._started_at)
+            return
         no_frames = now - self._last
         silent = now - self._last_nonsilent
         if no_frames > self._stall_secs:

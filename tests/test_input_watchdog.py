@@ -94,6 +94,67 @@ def test_not_armed_no_warning_before_first_frame():
     assert lines == []
 
 
+def test_no_first_frame_stall_triggers_restart():
+    # The 2026-06-28 EM blind spot: StartFrame arrives, capture is claimed, but NO audio frame ever
+    # comes (device opened/dead). Before this fix the watch loop never started → deaf forever.
+    calls = []
+
+    async def restart(_):
+        calls.append(1)
+        return True
+
+    d = InputStallDetector(stall_secs=5.0, first_frame_secs=15.0, restart=restart)
+    # StartFrame seen (arms the deadline) but never armed by an audio frame.
+    d._started_at = time.monotonic() - 20  # 20s since StartFrame, no first frame
+    assert d._armed is False
+    lines, remove = _capture_transcript()
+    try:
+        asyncio.run(d._tick())
+    finally:
+        remove()
+
+    assert any("INPUT STALL | no first mic frame" in ln for ln in lines)
+    assert len(calls) == 1
+
+
+def test_no_first_frame_within_grace_does_not_warn():
+    # Within the first_frame grace window, a not-yet-armed detector must stay quiet (normal startup).
+    d = InputStallDetector(stall_secs=5.0, first_frame_secs=15.0, restart=None)
+    d._started_at = time.monotonic() - 3  # only 3s since StartFrame
+    lines, remove = _capture_transcript()
+    try:
+        asyncio.run(d._tick())
+    finally:
+        remove()
+    assert lines == []
+
+
+def test_no_first_frame_escalates_after_restarts_exhausted():
+    # A claimed-but-dead capture that never sends a first frame must escalate (exit→systemd re-init),
+    # not latch inert — the actual EM failure mode (deaf 3.5 days across 4 restarts).
+    restarts, escalations = [], []
+
+    async def restart(_):
+        restarts.append(1)
+        return True
+
+    d = InputStallDetector(stall_secs=5.0, first_frame_secs=15.0, restart=restart, max_restarts=2,
+                           on_unrecoverable=lambda: escalations.append(1))
+    d._started_at = time.monotonic() - 20  # past the deadline, never arms
+    lines, remove = _capture_transcript()
+    try:
+        async def go():
+            for _ in range(6):
+                await d._tick()
+        asyncio.run(go())
+    finally:
+        remove()
+
+    assert len(restarts) == 2
+    assert len(escalations) == 1
+    assert any("escalating" in ln for ln in lines)
+
+
 def test_gives_up_after_max_restarts():
     calls = []
 

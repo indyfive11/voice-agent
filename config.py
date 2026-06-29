@@ -801,17 +801,19 @@ def build_input_watchdog(restart=None, on_unrecoverable=None, gate_state=None):
     if stall_secs <= 0:
         return None
     silent_secs = float(_env("INPUT_SILENT_SECS", "8.0"))
+    first_frame_secs = float(_env("INPUT_FIRST_FRAME_SECS", "15.0"))
     heartbeat_secs = float(_env("INPUT_HEARTBEAT_SECS", "10.0"))
     exit_on_fail = _env("INPUT_STALL_EXIT_ON_FAIL", "0") not in ("0", "false", "False")
     escalate = on_unrecoverable if exit_on_fail else None
     from input_watchdog import InputStallDetector
 
     logger.info(f"Input watchdog: ON (stall={stall_secs}s, silent={silent_secs}s, "
-                f"heartbeat={heartbeat_secs}s, recover={'yes' if restart else 'log-only'}, "
+                f"first_frame={first_frame_secs}s, heartbeat={heartbeat_secs}s, "
+                f"recover={'yes' if restart else 'log-only'}, "
                 f"escalate={'exit-for-restart' if escalate else 'log-only'})")
     return InputStallDetector(
-        stall_secs=stall_secs, silent_secs=silent_secs, restart=restart,
-        on_unrecoverable=escalate, heartbeat_secs=heartbeat_secs, gate_state=gate_state,
+        stall_secs=stall_secs, silent_secs=silent_secs, first_frame_secs=first_frame_secs,
+        restart=restart, on_unrecoverable=escalate, heartbeat_secs=heartbeat_secs, gate_state=gate_state,
     )
 
 
