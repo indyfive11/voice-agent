@@ -41,15 +41,25 @@ class BuilderPollClient:
         drain_delivered: Callable[[], list[str]],
         session_id: str,
         interval: float = DEFAULT_POLL_INTERVAL_SECS,
+        display: Callable[..., Awaitable[None]] | None = None,
+        drain_displayed: Callable[[], list[str]] | None = None,
     ):
-        self._poll = poll                      # async (session_id, ack) -> [{job_id, text}]
+        self._poll = poll                      # async (session_id, ack) -> [{job_id, text[, display]}]
         self._announce = announce              # async (text, *, job_id) -> None  (DeferredAnnouncer.announce)
         self._drain_delivered = drain_delivered  # () -> [job_id]  (DeferredAnnouncer.drain_delivered)
+        # Image display (roadmap ③). Optional — absent → display items are ignored (no-op, spoken path
+        # unchanged), so a build without the sink wired behaves exactly as before.
+        self._display = display                # async (descriptor, *, job_id) -> None  (ImageDisplaySink.show)
+        self._drain_displayed = drain_displayed  # () -> [job_id]  (ImageDisplaySink.drain_displayed)
         self._session_id = session_id
         self._interval = max(0.1, interval)
         self._task: asyncio.Task | None = None
-        # Cheap dedup guard: job_ids we've already handed to the announcer but not yet ack'd. The brain
-        # doesn't re-send a delivering item, so this only guards a same-item double-announce defensively.
+        # Display renders run as detached tasks so a long on-screen window (e.g. 30s, + a paused movie on the
+        # Pi) NEVER blocks the steady poll loop — acks and other announcements keep flowing. Tracked so a task
+        # ref isn't GC'd mid-flight and so stop() can cancel them.
+        self._display_tasks: set[asyncio.Task] = set()
+        # Cheap dedup guard: job_ids we've already handed off (announce OR display) but not yet ack'd. The
+        # brain doesn't re-send a delivering item, so this only guards a same-item double-handoff defensively.
         self._inflight: set[str] = set()
 
     async def start(self) -> None:
@@ -69,6 +79,10 @@ class BuilderPollClient:
         except asyncio.CancelledError:
             pass
         self._task = None
+        # Cancel any in-flight display renders (a window still up at teardown).
+        for t in list(self._display_tasks):
+            t.cancel()
+        self._display_tasks.clear()
 
     async def _loop(self) -> None:
         while True:
@@ -82,6 +96,8 @@ class BuilderPollClient:
 
     async def _tick(self) -> None:
         ack = self._drain_delivered()          # job_ids fully spoken since the last tick (piggybacked)
+        if self._drain_displayed is not None:
+            ack = ack + self._drain_displayed()  # + job_ids of images fully shown (same ack channel)
         for jid in ack:
             self._inflight.discard(jid)        # acked → no longer in flight on our side
         items = await self._poll(self._session_id, ack)
@@ -89,11 +105,30 @@ class BuilderPollClient:
             return
         for item in items:
             job_id = item.get("job_id")
+            display = item.get("display")
             text = item.get("text")
+            # A display-only item (image) carries `display` and empty text — render it, don't speak. An item
+            # with neither is dropped (defensive; the brain always sends one or the other).
+            if display and self._display is not None:
+                if self._claim(job_id):
+                    # Detach: rendering may hold the screen for the whole display window (+ a paused movie on
+                    # the Pi); awaiting it here would freeze the poll loop. The sink records the job_id on
+                    # completion, drained as the ack on a later tick.
+                    t = asyncio.create_task(self._display(display, job_id=job_id))
+                    self._display_tasks.add(t)
+                    t.add_done_callback(self._display_tasks.discard)
+                continue
             if not text:
-                continue                       # nothing to say — defensive (real items always carry text)
-            if job_id is not None:
-                if job_id in self._inflight:
-                    continue                   # already handed to the announcer; don't double-speak
-                self._inflight.add(job_id)
-            await self._announce(text, job_id=job_id)
+                continue                       # nothing to say / can't display — skip
+            if self._claim(job_id):
+                await self._announce(text, job_id=job_id)
+
+    def _claim(self, job_id) -> bool:
+        """Record a job_id as in-flight; return False if it was already claimed (don't double-handle).
+        A None job_id is always handled (no dedup key)."""
+        if job_id is None:
+            return True
+        if job_id in self._inflight:
+            return False
+        self._inflight.add(job_id)
+        return True

@@ -915,6 +915,39 @@ def build_media_duck(llm, gate=None):
     )
 
 
+# --------------------------------------------------------------------------- image display (roadmap ③)
+def make_image_display_sink():
+    """Build the ImageDisplaySink that renders brain `display` descriptors on this room's screen.
+
+    Media controller: a JellyfinRoomController when JELLYFIN_URL/TOKEN/DEVICE are all set (the Pi living-room
+    TV — pause→show→resume); otherwise a NullRoomController (desktop rooms, no media collision). Everything
+    defaults to the historical no-op — an unconfigured install with no display just skips rendering — so this
+    is byte-identical to before until configured per-device.
+
+    Fail-soft: image display is an OPTIONAL feature, so a missing/unimportable `image_display` module must
+    never take down the voice agent. Returns None on ImportError (the caller then wires no display sink and
+    the poll loop simply never renders). This immunizes the whole class of deploy skew — e.g. the module
+    being untracked while its tracked importers ship to a satellite (the Pi crash of 2026-07-04)."""
+    try:
+        from image_display import ImageDisplaySink, JellyfinRoomController, NullRoomController
+    except ImportError as e:
+        logger.warning(
+            f"Image display: module unavailable ({e}) — display disabled, voice loop unaffected"
+        )
+        return None
+
+    controller = JellyfinRoomController()
+    if controller.enabled:
+        logger.info(f"Image display: Jellyfin room pause/resume ENABLED (device={_env('JELLYFIN_DEVICE')})")
+    else:
+        controller = NullRoomController()
+    sink = ImageDisplaySink(controller=controller)
+    logger.info(
+        f"Image display: sink ready (enabled={sink._enabled}, {sink._display_secs}s window)"  # noqa: SLF001
+    )
+    return sink
+
+
 # --------------------------------------------------------------------------- wake word
 def _wake_model_paths(names: str) -> list[str]:
     """Resolve comma-separated WAKE_WORD entries to ONNX paths.

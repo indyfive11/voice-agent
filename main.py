@@ -446,12 +446,18 @@ async def run() -> None:
     if announcer is not None and hasattr(llm, "brain_client") and hasattr(llm, "session_id"):
         from builder_poll_client import BuilderPollClient, DEFAULT_POLL_INTERVAL_SECS
         _poll_interval = float(os.environ.get("BUILDER_POLL_INTERVAL_SECS", DEFAULT_POLL_INTERVAL_SECS))
+        # Image display (roadmap ③): the same poll loop carries `display` items (empty text + an image
+        # descriptor). The sink renders them on this room's screen; a room with no display auto-skips.
+        from config import make_image_display_sink
+        _image_sink = make_image_display_sink()  # None if the optional image_display module is absent
         builder_poller = BuilderPollClient(
             poll=llm.brain_client.builder_poll,
             announce=announcer.announce,
             drain_delivered=announcer.drain_delivered,
             session_id=llm.session_id,
             interval=_poll_interval,
+            display=_image_sink.show if _image_sink else None,
+            drain_displayed=_image_sink.drain_displayed if _image_sink else None,
         )
 
     pipeline = Pipeline(

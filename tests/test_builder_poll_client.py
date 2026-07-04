@@ -18,6 +18,8 @@ class _Harness:
         self.poll_acks: list[list[str]] = []       # acks the client piggybacked on each poll
         self.delivered: list[str] = []             # what drain_delivered() will hand back next tick
         self.announced: list[tuple[str, str | None]] = []  # (text, job_id) handed to the announcer
+        self.displayed_items: list[tuple[dict, str | None]] = []  # (descriptor, job_id) to the display sink
+        self.to_display_ack: list[str] = []        # what drain_displayed() hands back next tick
 
     async def poll(self, session_id, ack):
         self.poll_acks.append(list(ack))
@@ -31,7 +33,17 @@ class _Harness:
         self.delivered = []
         return out
 
-    def client(self, **kw):
+    async def display(self, descriptor, *, job_id=None):
+        self.displayed_items.append((descriptor, job_id))
+
+    def drain_displayed(self):
+        out = self.to_display_ack
+        self.to_display_ack = []
+        return out
+
+    def client(self, *, with_display=False, **kw):
+        if with_display:
+            kw.update(display=self.display, drain_displayed=self.drain_displayed)
         return BuilderPollClient(
             poll=self.poll, announce=self.announce, drain_delivered=self.drain_delivered,
             session_id="sess-1", **kw,
@@ -101,6 +113,94 @@ def test_item_without_job_id_still_announced():
     h.poll_returns = [[{"job_id": None, "text": "anon ring"}]]
     asyncio.run(h.client()._tick())
     assert h.announced == [("anon ring", None)]
+
+
+# ---- roadmap ③: display (image) item routing ------------------------------
+
+def test_display_item_routed_to_sink_not_spoken():
+    h = _Harness()
+    desc = {"path": "/x.png", "url": "https://cdn/x.png"}
+    h.poll_returns = [[{"job_id": "img-1", "text": "", "display": desc}]]
+    asyncio.run(h.client(with_display=True)._tick())
+    assert h.displayed_items == [(desc, "img-1")]
+    assert h.announced == []           # display-only → nothing spoken
+
+
+def test_display_and_spoken_items_both_handled_same_tick():
+    h = _Harness()
+    desc = {"url": "https://cdn/x.png"}
+    h.poll_returns = [[
+        {"job_id": "img-1", "text": "", "display": desc},
+        {"job_id": "j2", "text": "build done"},
+    ]]
+    asyncio.run(h.client(with_display=True)._tick())
+    assert h.displayed_items == [(desc, "img-1")]
+    assert h.announced == [("build done", "j2")]
+
+
+def test_display_jobid_piggybacked_as_ack_next_tick():
+    h = _Harness()
+    c = h.client(with_display=True)
+    asyncio.run(c._tick())
+    assert h.poll_acks[-1] == []
+    # the sink reports img-1 shown → next tick carries it as the ack (same channel as spoken rings)
+    h.to_display_ack = ["img-1"]
+    asyncio.run(c._tick())
+    assert h.poll_acks[-1] == ["img-1"]
+
+
+def test_display_dedup_before_ack():
+    h = _Harness()
+    c = h.client(with_display=True)
+    desc = {"url": "https://cdn/x.png"}
+    h.poll_returns = [[{"job_id": "img-1", "text": "", "display": desc}]]
+    asyncio.run(c._tick())
+    h.poll_returns = [[{"job_id": "img-1", "text": "", "display": desc}]]  # re-sent before ack
+    asyncio.run(c._tick())
+    assert h.displayed_items == [(desc, "img-1")]   # rendered once
+
+
+def test_display_item_ignored_when_no_sink_wired():
+    h = _Harness()
+    # display present but the client has no sink → not spoken, not displayed (graceful no-op)
+    h.poll_returns = [[{"job_id": "img-1", "text": "", "display": {"url": "u"}}]]
+    asyncio.run(h.client(with_display=False)._tick())
+    assert h.announced == []
+    assert h.displayed_items == []
+
+
+def test_item_with_neither_text_nor_display_skipped():
+    h = _Harness()
+    h.poll_returns = [[{"job_id": "j1", "text": ""}, {"job_id": "j2", "text": "ok"}]]
+    asyncio.run(h.client(with_display=True)._tick())
+    assert h.displayed_items == []
+    assert h.announced == [("ok", "j2")]
+
+
+def test_display_does_not_block_the_tick():
+    """A slow render (long on-screen window) must not freeze the poll loop — the tick returns while the
+    display runs detached; the item is recorded once the render finishes."""
+    h = _Harness()
+    rendered: list[str] = []
+
+    async def slow_display(descriptor, *, job_id=None):
+        await asyncio.sleep(0.2)                 # simulate a long on-screen window
+        rendered.append(job_id)
+
+    async def _run():
+        c = h.client(with_display=True)
+        c._display = slow_display
+        h.poll_returns = [[{"job_id": "img-1", "text": "", "display": {"url": "u"}}]]
+        # the tick itself must return promptly, NOT wait ~0.2s for the render
+        t0 = asyncio.get_event_loop().time()
+        await c._tick()
+        assert asyncio.get_event_loop().time() - t0 < 0.1
+        assert rendered == []                    # render still in flight
+        await asyncio.sleep(0.3)                 # let the detached render finish
+        assert rendered == ["img-1"]
+        await c.stop()
+
+    asyncio.run(_run())
 
 
 def test_loop_survives_poll_errors():
