@@ -34,3 +34,18 @@ machine with zero code edits. Every such value MUST be:
 **Principle: the running app reads config (dumb) · the setup step detects-and-writes (smart) · the user edits (in
 control).** Genuinely-universal constants (e.g. the 16 kHz `PIPELINE_AUDIO_RATE` ↔ Whisper/Silero training) may stay
 hardcoded — just comment WHY. Mirrored in `gabagent/CLAUDE.md` (cross-repo SOP).
+
+## New-module deploy-safety (hard SOP, cross-repo)
+
+A change that adds a **new module** which already-tracked/deployed code imports MUST do **one** of:
+1. **Guard the import at the call site** so an absent module degrades to the documented no-op (fail-soft), OR
+2. **Ship the new module in the same commit** (deploy-manifest) as its importer.
+
+**Never an importer without its import target.** Rationale: satellite deploys sync **git-tracked files only**
+(`git ls-files` — a blind `*.py` rsync would clobber a satellite's ARM `.venv`), so a new *untracked* module + a
+*tracked* importer = a **guaranteed satellite crash** (the Pi went hard-down 2026-07-04 when an untracked
+`image_display.py` shipped its tracked importers `main.py`/`config.py` to the Pi via the launch rsync →
+`ModuleNotFoundError` on every start). Corollary: under a push-freeze, (1) is the freeze-safe path since (2) is
+blocked. The fail-soft guard is the durable primary — it immunizes the *whole class*, not just one file; wrap
+import **and** construction so an optional feature can never take down the core loop. Mirrored in
+`gabagent/CLAUDE.md` (cross-repo SOP).
