@@ -936,12 +936,24 @@ def make_image_display_sink():
         )
         return None
 
-    controller = JellyfinRoomController()
-    if controller.enabled:
-        logger.info(f"Image display: Jellyfin room pause/resume ENABLED (device={_env('JELLYFIN_DEVICE')})")
-    else:
-        controller = NullRoomController()
-    sink = ImageDisplaySink(controller=controller)
+    # Construction backstop: the import succeeded but a room that can't *build* a sink (an unexpected env /
+    # controller error) must still degrade to no-op, never crash the voice loop. Broad on purpose — an optional
+    # display feature failing to construct is fail-soft; a genuine Null-path logic bug still surfaces on EM,
+    # which runs this path in dev. Pairs with the narrow ImportError guard above (deploy skew) and .show()'s
+    # own runtime guard (render failures).
+    try:
+        controller = JellyfinRoomController()
+        if controller.enabled:
+            logger.info(f"Image display: Jellyfin room pause/resume ENABLED (device={_env('JELLYFIN_DEVICE')})")
+        else:
+            controller = NullRoomController()
+        sink = ImageDisplaySink(controller=controller)
+    except Exception as e:  # noqa: BLE001 - optional feature: construction failure → disabled, not a crash
+        logger.warning(
+            f"Image display: sink construction failed ({type(e).__name__}: {e}) — display disabled, "
+            "voice loop unaffected"
+        )
+        return None
     logger.info(
         f"Image display: sink ready (enabled={sink._enabled}, {sink._display_secs}s window)"  # noqa: SLF001
     )

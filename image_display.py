@@ -155,9 +155,18 @@ class ImageDisplaySink:
     ):
         self._runner = runner or self._run_mpv
         self._controller = controller or NullRoomController()
-        self._display_secs = (
-            int(os.environ.get("IMAGE_DISPLAY_SECS", "30")) if display_secs is None else display_secs
-        )
+        if display_secs is not None:
+            self._display_secs = display_secs
+        else:
+            # Defensive parse: a fat-fingered override (e.g. "30s") must NOT ValueError at construction and
+            # take down the voice loop — fall back to the default and keep the feature up. Disabling image
+            # display entirely over a typo'd *duration* would be worse than just using 30s.
+            raw = os.environ.get("IMAGE_DISPLAY_SECS", "30")
+            try:
+                self._display_secs = int(raw)
+            except ValueError:
+                _tlog(f"IMAGE | bad IMAGE_DISPLAY_SECS={raw!r} (not an int) — using default 30s")
+                self._display_secs = 30
         # Default ENABLED — but a box with no display auto-skips (see _has_display). The env override is an
         # explicit off-switch; unset behaves as "show if this room has a screen".
         if enabled is None:

@@ -224,3 +224,26 @@ def test_make_sink_returns_none_when_module_absent():
     # treats a None entry as "known-absent"), simulating the module never reaching the box.
     with patch.dict(sys.modules, {"image_display": None}):
         assert config.make_image_display_sink() is None
+
+
+def test_bad_display_secs_falls_back_to_default_not_crash(monkeypatch):
+    """A fat-fingered IMAGE_DISPLAY_SECS must NOT ValueError at construction (which would take down the
+    voice loop) — fall back to the 30s default and keep the feature enabled."""
+    monkeypatch.setenv("IMAGE_DISPLAY_SECS", "30s")     # non-numeric override
+    sink = ImageDisplaySink()                            # must not raise
+    assert sink._display_secs == 30
+    assert sink._enabled is True                         # feature stays up, not disabled over a typo
+
+
+def test_make_sink_returns_none_when_construction_raises(monkeypatch):
+    """Construction backstop: an unexpected error building the sink (not just a missing module) degrades to
+    None (display disabled) rather than crashing the voice loop."""
+    import config
+
+    class _Boom:
+        def __init__(self, *a, **k):
+            raise RuntimeError("controller kaboom")
+
+    # Force construction to blow up inside make_image_display_sink's post-import block.
+    monkeypatch.setattr("image_display.JellyfinRoomController", _Boom)
+    assert config.make_image_display_sink() is None
