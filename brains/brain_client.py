@@ -49,6 +49,14 @@ class BrainEvent:
                       level for `set` (1.0 = full, 0.0 = silent), absent for up/down (voice side owns the
                       step). Arrival-keyed; kill-switched brain-side. A dropped event is a no-op (the gain
                       just doesn't change). See tts_gain.VoiceVolumeFrame.
+      - "transport_intent": this turn issued a user media PAUSE or STOP. Emitted before `done`, only on the
+                      turn where it applies. Lets the wake-media pauser (which auto-paused a video for the
+                      command window) know NOT to auto-resume — the user/brain now owns the transport state.
+                      Arrival-keyed (the handler keys on the event TYPE, so a serializer that drops the
+                      literal `true` can't disarm it); `transport_intent` bool carried for logging. The brain
+                      LATCHES it over the wake window; a dropped event degrades safely to "resume unless the
+                      session is gone". Provider-neutral (no jellyfin/tidal name crosses). See
+                      wake_media_pause.WakeMediaPauser.
       - "done"      : end of this turn
     """
 
@@ -80,6 +88,10 @@ class BrainEvent:
     # absolute level for `set` (1.0 full, 0.0 silent), absent for up/down (voice side owns the step).
     op: str | None = None
     value: float | None = None
+    # "transport_intent" event only: this turn issued a user media PAUSE/STOP. Always True on the wire (the
+    # brain emits the event only when it applies); the handler keys on the event TYPE, not this value, so a
+    # serializer that drops a literal True can't disarm it. Carried for logging.
+    transport_intent: bool | None = None
 
 
 @runtime_checkable

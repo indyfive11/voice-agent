@@ -388,6 +388,17 @@ async def run() -> None:
     if hasattr(llm, "set_acoustic_wake_gated"):
         llm.set_acoustic_wake_gated(wake_gate is not None)
 
+    # Shared room media controller (ONE instance for both the wake-media pauser here and the image-display
+    # sink below — they pause/resume the SAME Jellyfin session, so a shared marker avoids a double-pause race).
+    # None on a room with no Jellyfin config (desktop) or a missing module (deploy-skew fail-soft).
+    room_controller = config.make_room_controller()
+    # Wake-media pause: on a fresh wake over a playing VIDEO, pause it for the command window so the command
+    # lands on a clean mic (a movie's dialogue floods the satellite's un-AEC'd mic). Music is left to the duck
+    # belt. No-op unless a Jellyfin room is configured. Wired into the gate's window open/close lifecycle.
+    wake_media_pauser = config.build_wake_media_pauser(llm, controller=room_controller)
+    if wake_gate is not None and wake_media_pauser is not None and hasattr(wake_gate, "set_wake_media_pauser"):
+        wake_gate.set_wake_media_pauser(wake_media_pauser)
+
     # Input-stall watchdog: best-effort recovery for a frozen/silent mic capture. The restart "kicks"
     # the PortAudio stream in place (stop→start) — the least-invasive revive that doesn't tear down the
     # base-input task machinery. Goes FIRST so it times the rawest mic frames.
@@ -449,7 +460,8 @@ async def run() -> None:
         # Image display (roadmap ③): the same poll loop carries `display` items (empty text + an image
         # descriptor). The sink renders them on this room's screen; a room with no display auto-skips.
         from config import make_image_display_sink
-        _image_sink = make_image_display_sink()  # None if the optional image_display module is absent
+        # Share the SAME room controller the wake-media pauser uses (no double-pause race on the session).
+        _image_sink = make_image_display_sink(controller=room_controller)  # None if the module is absent
         builder_poller = BuilderPollClient(
             poll=llm.brain_client.builder_poll,
             announce=announcer.announce,

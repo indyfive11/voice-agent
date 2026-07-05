@@ -53,6 +53,9 @@ class NullRoomController:
     async def resume(self) -> None:
         return None
 
+    def forget(self) -> None:
+        return None
+
 
 class JellyfinRoomController:
     """Pause/resume the room's Jellyfin playback via the Session API (roadmap ③, Pi living-room TV).
@@ -99,6 +102,11 @@ class JellyfinRoomController:
         sess, self._paused_session = self._paused_session, None
         if sess:
             await self._post(f"/Sessions/{sess}/Playing/Unpause")
+
+    def forget(self) -> None:
+        """Drop the pause marker WITHOUT unpausing — the caller decided NOT to resume (e.g. the user's own
+        command paused/stopped the media, so honoring their transport state means leaving it paused)."""
+        self._paused_session = None
 
     async def _find_playing_session(self) -> str | None:
         """Session id for our device that is actively playing (NowPlayingItem present, not paused)."""

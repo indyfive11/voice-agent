@@ -107,6 +107,45 @@ def test_voice_volume_event_pushes_frame_downstream():
     assert frames[0].op == "down" and frames[0].value is None
 
 
+def test_transport_intent_event_latches_flag():
+    # A "pause the movie" turn emits transport_intent → the service latches last_transport_intent so the
+    # WakeMediaPauser suppresses its auto-resume at window close.
+    client = FakeBrainClient(respond_events=[
+        BrainEvent("token", text="Paused."),
+        BrainEvent("transport_intent", transport_intent=True),
+        BrainEvent("done"),
+    ])
+    svc, _ = _service_with_recorder(client)
+    assert svc.last_transport_intent is False          # clean before the turn
+    asyncio.run(svc._process_context(_ctx("pause the movie")))
+    assert svc.last_transport_intent is True            # latched by the event
+
+
+def test_transport_intent_latch_is_window_scoped_not_per_turn():
+    # The latch must NOT reset per turn — a benign follow-up in the same wake window keeps it latched (GA's
+    # `resume ⟺ … NOT saw(transport_intent)` is window-scoped). Only reset_transport_intent clears it.
+    client = FakeBrainClient(respond_events=[
+        BrainEvent("transport_intent", transport_intent=True),
+        BrainEvent("done"),
+    ])
+    svc, _ = _service_with_recorder(client)
+    asyncio.run(svc._process_context(_ctx("pause the movie")))
+    assert svc.last_transport_intent is True
+    # A second, benign turn in the same window must not un-latch it.
+    svc._client = FakeBrainClient(respond_events=[BrainEvent("token", text="3pm."), BrainEvent("done")])
+    asyncio.run(svc._process_context(_ctx("what time is it")))
+    assert svc.last_transport_intent is True            # still latched
+    svc.reset_transport_intent()                        # only an explicit reset clears it
+    assert svc.last_transport_intent is False
+
+
+def test_no_transport_intent_event_leaves_flag_false():
+    client = FakeBrainClient(respond_events=[BrainEvent("token", text="3pm."), BrainEvent("done")])
+    svc, _ = _service_with_recorder(client)
+    asyncio.run(svc._process_context(_ctx("what time is it")))
+    assert svc.last_transport_intent is False
+
+
 def test_status_filler_logged_but_not_spoken():
     # the user disliked the spoken filler ("Trying tidal…"). Status events are now LOG-ONLY: no TTSSpeakFrame
     # and no LLMTextFrame for the status; only the token speaks.

@@ -915,21 +915,47 @@ def build_media_duck(llm, gate=None):
     )
 
 
+# --------------------------------------------------------------------------- room media controller (③ + wake-pause)
+def make_room_controller():
+    """Build the ONE JellyfinRoomController shared by the image-display sink (③) and the wake-media pauser.
+
+    A single shared instance is deliberate: both pause/resume the SAME room video session, and two separate
+    controllers would race the pause/resume marker on it (GA's no-double-pause constraint). Returns a
+    JellyfinRoomController when JELLYFIN_URL/TOKEN/DEVICE are all set (the Pi living-room TV); otherwise a
+    NullRoomController (desktop rooms — always a no-op). Fail-soft: a missing/unimportable `image_display`
+    module returns None (both consumers then wire no controller), immunizing the deploy-skew class (an
+    untracked module reaching a satellite via its tracked importers — the Pi crash of 2026-07-04)."""
+    try:
+        from image_display import JellyfinRoomController, NullRoomController
+    except ImportError as e:
+        logger.warning(f"Room media: controller module unavailable ({e}) — pause/resume disabled")
+        return None
+    try:
+        controller = JellyfinRoomController()
+        if controller.enabled:
+            logger.info(f"Room media: Jellyfin pause/resume ENABLED (device={_env('JELLYFIN_DEVICE')})")
+            return controller
+        return NullRoomController()
+    except Exception as e:  # noqa: BLE001 - optional feature: construction failure → no-op controller, not a crash
+        logger.warning(f"Room media: controller construction failed ({type(e).__name__}: {e}) — disabled")
+        return None
+
+
 # --------------------------------------------------------------------------- image display (roadmap ③)
-def make_image_display_sink():
+def make_image_display_sink(controller=None):
     """Build the ImageDisplaySink that renders brain `display` descriptors on this room's screen.
 
-    Media controller: a JellyfinRoomController when JELLYFIN_URL/TOKEN/DEVICE are all set (the Pi living-room
-    TV — pause→show→resume); otherwise a NullRoomController (desktop rooms, no media collision). Everything
-    defaults to the historical no-op — an unconfigured install with no display just skips rendering — so this
-    is byte-identical to before until configured per-device.
+    `controller` — the SHARED room media controller from `make_room_controller()` (so the image sink and the
+    wake-media pauser drive the same Jellyfin session without racing). When None (tests, or the module absent)
+    the sink makes its own NullRoomController. Everything defaults to the historical no-op — an unconfigured
+    install with no display just skips rendering — so this is byte-identical to before until configured.
 
     Fail-soft: image display is an OPTIONAL feature, so a missing/unimportable `image_display` module must
     never take down the voice agent. Returns None on ImportError (the caller then wires no display sink and
     the poll loop simply never renders). This immunizes the whole class of deploy skew — e.g. the module
     being untracked while its tracked importers ship to a satellite (the Pi crash of 2026-07-04)."""
     try:
-        from image_display import ImageDisplaySink, JellyfinRoomController, NullRoomController
+        from image_display import ImageDisplaySink, NullRoomController
     except ImportError as e:
         logger.warning(
             f"Image display: module unavailable ({e}) — display disabled, voice loop unaffected"
@@ -942,12 +968,7 @@ def make_image_display_sink():
     # which runs this path in dev. Pairs with the narrow ImportError guard above (deploy skew) and .show()'s
     # own runtime guard (render failures).
     try:
-        controller = JellyfinRoomController()
-        if controller.enabled:
-            logger.info(f"Image display: Jellyfin room pause/resume ENABLED (device={_env('JELLYFIN_DEVICE')})")
-        else:
-            controller = NullRoomController()
-        sink = ImageDisplaySink(controller=controller)
+        sink = ImageDisplaySink(controller=controller or NullRoomController())
     except Exception as e:  # noqa: BLE001 - optional feature: construction failure → disabled, not a crash
         logger.warning(
             f"Image display: sink construction failed ({type(e).__name__}: {e}) — display disabled, "
@@ -958,6 +979,49 @@ def make_image_display_sink():
         f"Image display: sink ready (enabled={sink._enabled}, {sink._display_secs}s window)"  # noqa: SLF001
     )
     return sink
+
+
+# --------------------------------------------------------------------------- wake-media pause (Pi movie clean-mic)
+def build_wake_media_pauser(llm, controller=None):
+    """Build the WakeMediaPauser that pauses a playing VIDEO for the wake command window (so a command over a
+    movie lands on a clean mic — the movie's dialogue otherwise floods the satellite's un-AEC'd mic). Music is
+    untouched (the media-duck belt at 18% already handles non-dialogue audio). Wired into the wake gate.
+
+    `controller` — the SHARED room media controller (`make_room_controller()`). None / a Null / a not-`enabled`
+    controller ⇒ return None (pure no-op; any install without a Jellyfin room is byte-identical to before).
+
+    Fail-soft: `wake_media_pause` is an OPTIONAL module — a missing/unimportable one returns None (deploy-skew
+    guard, same class as the ③ image_display module)."""
+    if controller is None or not getattr(controller, "enabled", False):
+        return None
+    try:
+        from wake_media_pause import WakeMediaPauser
+    except ImportError as e:
+        logger.warning(f"Wake-media pause: module unavailable ({e}) — video pause-on-wake disabled")
+        return None
+    # Resume-suppression signal: the brain flags (and latches over the window) a turn that issued a media-
+    # transport action ("pause it" / "stop it") so we don't auto-resume over the user's own intent. Wired
+    # optional — a brain without `last_transport_intent` leaves this None and resume degrades safely (a
+    # stopped movie's session is gone, so its resume is a harmless no-op; only an explicit "pause" while
+    # auto-paused is imperfect until the flag exists). `reset_transport_intent` clears the brain latch at each
+    # fresh window so a prior window's flag can't leak in.
+    if hasattr(llm, "last_transport_intent"):
+        transport_intent = lambda: bool(llm.last_transport_intent)  # noqa: E731
+        reset_transport_intent = getattr(llm, "reset_transport_intent", None)
+    else:
+        transport_intent = None
+        reset_transport_intent = None
+    try:
+        pauser = WakeMediaPauser(
+            controller=controller,
+            transport_intent=transport_intent,
+            reset_transport_intent=reset_transport_intent,
+        )
+    except Exception as e:  # noqa: BLE001 - optional feature: construction failure → disabled, not a crash
+        logger.warning(f"Wake-media pause: construction failed ({type(e).__name__}: {e}) — disabled")
+        return None
+    logger.info("Wake-media pause: video pause-on-wake ENABLED (clean mic over movies)")
+    return pauser
 
 
 # --------------------------------------------------------------------------- wake word

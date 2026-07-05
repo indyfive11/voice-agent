@@ -236,14 +236,36 @@ def test_bad_display_secs_falls_back_to_default_not_crash(monkeypatch):
 
 
 def test_make_sink_returns_none_when_construction_raises(monkeypatch):
-    """Construction backstop: an unexpected error building the sink (not just a missing module) degrades to
+    """Construction backstop: an unexpected error building the SINK (not just a missing module) degrades to
     None (display disabled) rather than crashing the voice loop."""
+    import config
+
+    class _Boom:
+        def __init__(self, *a, **k):
+            raise RuntimeError("sink kaboom")
+
+    # Force the ImageDisplaySink construction to blow up inside make_image_display_sink's post-import block.
+    monkeypatch.setattr("image_display.ImageDisplaySink", _Boom)
+    assert config.make_image_display_sink() is None
+
+
+def test_make_room_controller_returns_none_when_construction_raises(monkeypatch):
+    """The controller backstop moved to make_room_controller (shared by ③ + the wake-media pauser): an
+    unexpected error building JellyfinRoomController degrades to None, never a crash."""
     import config
 
     class _Boom:
         def __init__(self, *a, **k):
             raise RuntimeError("controller kaboom")
 
-    # Force construction to blow up inside make_image_display_sink's post-import block.
     monkeypatch.setattr("image_display.JellyfinRoomController", _Boom)
-    assert config.make_image_display_sink() is None
+    assert config.make_room_controller() is None
+
+
+def test_make_room_controller_null_when_unconfigured(monkeypatch):
+    """No Jellyfin env → a NullRoomController (desktop no-op), not None and not a crash."""
+    import config
+    from image_display import NullRoomController
+    for k in ("JELLYFIN_URL", "JELLYFIN_TOKEN", "JELLYFIN_DEVICE"):
+        monkeypatch.delenv(k, raising=False)
+    assert isinstance(config.make_room_controller(), NullRoomController)

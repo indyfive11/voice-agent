@@ -350,6 +350,11 @@ class BrainLLMService(LLMService):
         self._this_turn_led_with_wake = False  # reset per turn in _process_context
         self._this_turn_wake_conf: float | None = None
         self._this_turn_residual_words = 0  # command words after the stripped wake (aside-safety hint)
+        # Media transport latch (movie-deafness fix): True once a turn in the current wake-media-pause window
+        # issued a user PAUSE/STOP of media (brain `transport_intent` event). WINDOW-scoped, NOT per-turn — it
+        # is NOT reset in _process_context; the WakeMediaPauser clears it at each fresh window's start (via
+        # reset_transport_intent) and reads it at window-close to decide whether to auto-resume the video.
+        self._last_transport_intent = False
         # Log the correlation key so the transcript can be lined up with the brain's own logs.
         _tlog(f"BRAIN | gabagent session_id={self._session_id}")
 
@@ -666,6 +671,19 @@ class BrainLLMService(LLMService):
         from brains.media_duck import ConvoReleaseFrame
 
         await self.push_frame(ConvoReleaseFrame(), FrameDirection.UPSTREAM)
+
+    @property
+    def last_transport_intent(self) -> bool:
+        """True iff a turn in the current wake-media-pause window issued a user media PAUSE/STOP. Read by the
+        WakeMediaPauser at window-close to suppress the auto-resume (the user/brain owns the transport now).
+        Latched over the window (set by the brain `transport_intent` event); cleared by reset_transport_intent
+        at each fresh window's start."""
+        return self._last_transport_intent
+
+    def reset_transport_intent(self) -> None:
+        """Clear the transport latch. Called by the WakeMediaPauser when a fresh wake window opens, so a flag
+        from a prior window (e.g. a "pause the music" turn that paused no *video*) can't leak into this one."""
+        self._last_transport_intent = False
 
     async def _set_voice_volume(self, op: str | None, value: float | None) -> None:
         """Adjust Aria's OWN voice (TTS) level — push DOWNSTREAM to the TTS-gain processor (which lives in the
@@ -993,6 +1011,14 @@ class BrainLLMService(LLMService):
                     # if no gain processor is downstream (frame just flows on).
                     _tlog(f"VOICE | own-volume hint op={ev.op!r} value={ev.value!r}")
                     await self._set_voice_volume(ev.op, ev.value)
+                elif ev.type == "transport_intent":
+                    # This turn issued a user media PAUSE/STOP → latch it so the wake-media pauser (which
+                    # auto-paused a video for this command window) won't auto-resume over the user's intent.
+                    # Arrival-keyed (like `addressed`/`convo_hold`): the mere arrival latches it, robust to a
+                    # serializer dropping the literal True. WINDOW-scoped: the pauser clears the latch at each
+                    # fresh window. NOT a stream boundary — keep consuming (`done` still follows).
+                    self._last_transport_intent = True
+                    _tlog(f"TRANSPORT| user pause/stop (transport_intent={ev.transport_intent!r}) → suppress auto-resume")
                 elif ev.type == "done":
                     return
         except asyncio.CancelledError:

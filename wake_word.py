@@ -262,6 +262,12 @@ class WakeWordGate(FrameProcessor):
         self._speak_ack: Callable[[str], Awaitable[None]] | None = None
         self._media_playing_local: Callable[[], Awaitable[bool]] | None = None
         self._ack_task: asyncio.Task | None = None
+        # Wake-media pauser: on a FRESH wake over a playing video, pause it for the command window (clean mic
+        # over a movie whose dialogue would otherwise flood the un-AEC'd satellite mic), resume on window
+        # close. Injected (main.py); None ⇒ no video-pause (byte-identical to before). Engaged on the fresh-wake
+        # open, released once the command window fully idle-closes or she goes to sleep. Fire-and-forget: the
+        # pauser is best-effort and never blocks the wake path (its own methods swallow failures).
+        self._wake_media_pauser = None
         # #2 cold-start pre-warm: on the FIRST post-wake voice energy (a voiced onset while the command window
         # is open — NOT bare gate-open, so the ~12 silent wakes in the wife live-test spend nothing), fire a
         # fire-and-forget POST /prewarm so the brain warms the arya cloud session concurrently with the user
@@ -419,6 +425,8 @@ class WakeWordGate(FrameProcessor):
         # never runs on ambient TV and only "hey aria" can wake her (see _gated_now / _force_gated).
         if isinstance(frame, WakeSleepFrame):
             self._force_gated = frame.asleep
+            if frame.asleep:
+                self._release_wake_media()  # going to sleep ends the exchange → resume any video we paused
             rest = "sleeping" if frame.asleep else "idle"
             # Record what "rest" means now so a goodbye TTS spoken on the way to sleep settles the eye
             # on `sleeping`, not `idle` (tts_gain's BotStopped→rest write reads this); then set it live.
@@ -808,6 +816,10 @@ class WakeWordGate(FrameProcessor):
                 self._fire_duck(True)  # pre-duck so the command lands on already-ducked media
                 if not self._hold:
                     self._arm_preduck()  # release the pre-duck if no speech follows (not while held for a confirm)
+                # Pause a playing VIDEO for this window: a movie's dialogue floods the un-AEC'd mic and no
+                # amount of ducking clears it (the maintainer's manual pause was the only fix). Held for the whole
+                # command window; resumed at idle-close/sleep. Music is untouched (the belt handles it).
+                self._engage_wake_media()
         self._escape_peak = 0.0
         self._escape_run = 0
         self._escape_hits.clear()  # fresh start once we're open
@@ -835,6 +847,7 @@ class WakeWordGate(FrameProcessor):
                     self._cancel_preduck()
                     _tlog("WAKE  | window closed (idle) — muting until next wake word")
                     self._release_or_relinquish_duck()
+                    self._release_wake_media()  # resume a video we paused for this window (unless transport)
                     # eye: a wake with no command → back to the resting state (`idle` awake, `off`
                     # asleep). Only downgrade `listening`; never step on `speaking`/`thinking` (those own
                     # their own return to rest). Honors resting_state() so an asleep false-wake settles `off`.
@@ -951,6 +964,26 @@ class WakeWordGate(FrameProcessor):
         gate — kept off the brain's media_state, which goes stale for a sleeping room. Absent → treat as not
         playing (the ack speaks)."""
         self._media_playing_local = probe
+
+    def set_wake_media_pauser(self, pauser) -> None:
+        """Wire the WakeMediaPauser (pause a playing video for the command window). Called from main.py; None
+        keeps the video-pause inert. See `self._wake_media_pauser`."""
+        self._wake_media_pauser = pauser
+
+    def _engage_wake_media(self) -> None:
+        """Fire-and-forget: pause a playing video for this fresh-wake command window. Never blocks the wake
+        path; the pauser swallows its own failures. Skipped while asleep (a wake-candidate the brain may
+        text-reject — don't pause a movie for a doze) — same gate as the pre-duck skip."""
+        if self._wake_media_pauser is None or self._force_gated:
+            return
+        asyncio.create_task(self._wake_media_pauser.engage())
+
+    def _release_wake_media(self) -> None:
+        """Fire-and-forget: resume the video we paused (unless the turn owned the transport). Idempotent — the
+        pauser no-ops when it holds no pause."""
+        if self._wake_media_pauser is None:
+            return
+        asyncio.create_task(self._wake_media_pauser.release())
 
     def _schedule_wake_ack(self) -> None:
         """On a genuine FRESH wake, speak the local wake-ack so the user knows Aria is listening — unless
