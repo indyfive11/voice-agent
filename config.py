@@ -383,13 +383,56 @@ def list_audio_devices() -> None:
         pa.terminate()
 
 
+def _collect_name_matches(pa, name: str, *, want_output: bool) -> list[tuple[int, str, int]]:
+    """All (index, name, channels) devices whose name case-insensitively substring-matches `name`."""
+    nlow = name.lower()
+    chan_key = "maxOutputChannels" if want_output else "maxInputChannels"
+    out: list[tuple[int, str, int]] = []
+    for i in range(pa.get_device_count()):
+        d = pa.get_device_info_by_index(i)
+        chans = d.get(chan_key) or 0
+        if chans > 0 and nlow in str(d.get("name", "")).lower():
+            out.append((i, str(d.get("name", "")), int(chans)))
+    return out
+
+
+def _rank_name_matches(matches: list[tuple[int, str, int]]) -> list[tuple[int, str, int]]:
+    """Rank name-matched devices best-first so "the match" is the ROUTABLE node, not merely the first.
+
+    A bare substring pin (e.g. ``reSpeaker``) can hit BOTH the PipeWire/pulse-backed node
+    ("… Analog Stereo", in×4) AND a raw ALSA alias of the SAME card ("… : USB Audio (hw:4,0)", in×2).
+    Grabbing the raw ``hw:`` device directly CONTENDS with PipeWire — which already holds the card open
+    — so the direct grab starves and capture stalls (EM 2026-07-05: first-match roulette across a replug
+    landed the raw node → the in×2 grab went dead within seconds → 43 watchdog restarts). A settle-wait
+    alone does NOT fix this: it only makes *first-match* stable, not correct — a stable enumeration that
+    sorts the raw node first would deterministically lock onto the stalling device. So we RANK:
+      1. prefer a PipeWire/pulse-routed node over a raw ``hw:``/``plughw:`` grab — the real discriminator
+         is card ownership (does PipeWire already hold it), not channel count,
+      2. then most channels (a proxy that also favors the full array node),
+      3. then lowest index (stable, deterministic tiebreak).
+    This is a RANKING that always returns the best AVAILABLE match — on a bare-ALSA box whose ONLY match
+    is a ``hw:`` node, that node still wins (never filtered to empty → never a surprise fall-through to
+    the OS default; a single-match install behaves exactly as before). Returns [] when there are none.
+    """
+    def _key(m: tuple[int, str, int]) -> tuple[int, int, int]:
+        idx, nm, chans = m
+        nlow = nm.lower()
+        # "hw:" covers "(hw:N,M)" and "plughw:" — both are direct-ALSA grabs that bypass PipeWire.
+        routable = 0 if "hw:" in nlow else 1
+        return (routable, chans, -idx)  # higher is better; -idx → lower index wins the final tie
+
+    return sorted(matches, key=_key, reverse=True)
+
+
 def _resolve_device_index(name: str | None, *, want_output: bool) -> int | None:
     """Resolve a PyAudio device index by case-insensitive substring match on its name.
 
     Returns None if `name` is unset or nothing matches (caller falls back to the OS default).
     Pinning by name survives index reshuffles; pin to avoid the silent-sink failure where the OS
     default changes mid-session (e.g. a monitor/HDMI move) and the already-open stream keeps writing
-    to the now-silent original device.
+    to the now-silent original device. When a name matches MULTIPLE devices (e.g. a card's pulse node
+    AND its raw `hw:` alias), pick the best-ranked (see `_rank_name_matches`), not the first — and log
+    every match so a wrong pick is visible.
     """
     if not name:
         return None
@@ -401,17 +444,20 @@ def _resolve_device_index(name: str | None, *, want_output: bool) -> int | None:
     kind = "output" if want_output else "input"
     pa = pyaudio.PyAudio()
     try:
-        nlow = name.lower()
-        for i in range(pa.get_device_count()):
-            d = pa.get_device_info_by_index(i)
-            chans = d.get("maxOutputChannels" if want_output else "maxInputChannels") or 0
-            if chans > 0 and nlow in str(d.get("name", "")).lower():
-                logger.info(f"Audio: matched {kind} name~={name!r} → [{i}] {d['name']}")
-                return i
-        logger.warning(f"Audio: no {kind} device matched name~={name!r}; using system default.")
+        matches = _rank_name_matches(_collect_name_matches(pa, name, want_output=want_output))
+        if not matches:
+            logger.warning(f"Audio: no {kind} device matched name~={name!r}; using system default.")
+            return None
+        best_i, best_n, _ = matches[0]
+        if len(matches) > 1:
+            others = ", ".join(f"[{i}] {n!r} (ch={c})" for i, n, c in matches)
+            logger.info(f"Audio: {kind} name~={name!r} matched {len(matches)} devices ({others}) "
+                        f"→ picked [{best_i}] {best_n}")
+        else:
+            logger.info(f"Audio: matched {kind} name~={name!r} → [{best_i}] {best_n}")
+        return best_i
     finally:
         pa.terminate()
-    return None
 
 
 def _resolve_device_index_stable(
@@ -447,16 +493,15 @@ def _resolve_device_index_stable(
     import time
 
     kind = "output" if want_output else "input"
-    chan_key = "maxOutputChannels" if want_output else "maxInputChannels"
-    nlow = name.lower()
 
     def _match_once() -> tuple[int | None, str | None]:
         pa = pyaudio.PyAudio()
         try:
-            for i in range(pa.get_device_count()):
-                d = pa.get_device_info_by_index(i)
-                if (d.get(chan_key) or 0) > 0 and nlow in str(d.get("name", "")).lower():
-                    return i, str(d.get("name", ""))
+            # Rank each fresh enumeration (prefer the pulse node over a raw hw: alias) and settle on the
+            # best-ranked index, so settle-wait converges to the CORRECT device, not merely a stable one.
+            matches = _rank_name_matches(_collect_name_matches(pa, name, want_output=want_output))
+            if matches:
+                return matches[0][0], matches[0][1]
         finally:
             pa.terminate()
         return None, None
@@ -639,7 +684,15 @@ def build_transport():
 
     in_idx = _env_int("AUDIO_INPUT_DEVICE_INDEX")
     if in_idx is None:
-        in_idx = _resolve_device_index(_env("AUDIO_INPUT_DEVICE_NAME"), want_output=False)
+        # Resolve INPUT only after the enumeration settles too — a replug (or cold PipeWire-ALSA graph)
+        # is a transitional-enumeration event: the name→index can resolve to a half-registered/raw alias
+        # by open time. The OUTPUT path already settle-waits (the -9997 silent-sink bug); the INPUT path
+        # did not, so the reSpeaker was the unprotected one and grabbed the stalling raw hw: node on a
+        # replug (EM 2026-07-05). Same knob shape; AUDIO_INPUT_DEVICE_SETTLE_SECS=0 restores single-shot.
+        in_settle = float(_env("AUDIO_INPUT_DEVICE_SETTLE_SECS", "6") or 6)
+        in_idx = _resolve_device_index_stable(
+            _env("AUDIO_INPUT_DEVICE_NAME"), want_output=False, settle_secs=in_settle
+        )
     out_idx = _env_int("AUDIO_OUTPUT_DEVICE_INDEX")
     if out_idx is None:
         # Resolve the OUTPUT device only after the PortAudio enumeration settles: on a transitional
@@ -802,17 +855,24 @@ def build_input_watchdog(restart=None, on_unrecoverable=None, gate_state=None):
         return None
     silent_secs = float(_env("INPUT_SILENT_SECS", "8.0"))
     first_frame_secs = float(_env("INPUT_FIRST_FRAME_SECS", "15.0"))
+    # Extra first-frame patience for the post-start/replug warmup window only (added to first_frame_secs).
+    # Settle-wait guarantees a stable enumeration but not a live frame path — a just-replugged PipeWire
+    # link can take another beat to wire, and restarting mid-wire-up re-enters the thrash. Default 0 =
+    # historical behavior (flat first_frame_secs); does NOT affect steady-state no-frames/silent clocks.
+    first_frame_warmup_secs = float(_env("INPUT_FIRST_FRAME_WARMUP_SECS", "0.0"))
     heartbeat_secs = float(_env("INPUT_HEARTBEAT_SECS", "10.0"))
     exit_on_fail = _env("INPUT_STALL_EXIT_ON_FAIL", "0") not in ("0", "false", "False")
     escalate = on_unrecoverable if exit_on_fail else None
     from input_watchdog import InputStallDetector
 
+    warmup_note = f"+{first_frame_warmup_secs}s warmup" if first_frame_warmup_secs else "no warmup"
     logger.info(f"Input watchdog: ON (stall={stall_secs}s, silent={silent_secs}s, "
-                f"first_frame={first_frame_secs}s, heartbeat={heartbeat_secs}s, "
+                f"first_frame={first_frame_secs}s ({warmup_note}), heartbeat={heartbeat_secs}s, "
                 f"recover={'yes' if restart else 'log-only'}, "
                 f"escalate={'exit-for-restart' if escalate else 'log-only'})")
     return InputStallDetector(
         stall_secs=stall_secs, silent_secs=silent_secs, first_frame_secs=first_frame_secs,
+        first_frame_warmup_secs=first_frame_warmup_secs,
         restart=restart, on_unrecoverable=escalate, heartbeat_secs=heartbeat_secs, gate_state=gate_state,
     )
 

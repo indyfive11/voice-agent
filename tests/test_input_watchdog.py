@@ -129,6 +129,68 @@ def test_no_first_frame_within_grace_does_not_warn():
     assert lines == []
 
 
+def test_first_frame_warmup_extends_the_no_first_frame_deadline():
+    # Post-replug: settle-wait gives a stable enumeration but the PipeWire link can take another beat to
+    # wire. The warmup grace must hold off the no-first-frame stall past the base deadline so we don't
+    # restart mid-wire-up and re-enter the thrash.
+    calls = []
+
+    async def restart(_):
+        calls.append(1)
+        return True
+
+    d = InputStallDetector(stall_secs=5.0, first_frame_secs=15.0, first_frame_warmup_secs=15.0,
+                           restart=restart)
+    d._started_at = time.monotonic() - 20  # past the base 15s but within the 30s warmup window
+    lines, remove = _capture_transcript()
+    try:
+        asyncio.run(d._tick())
+    finally:
+        remove()
+    assert lines == []            # still warming up → no stall
+    assert calls == []            # and no restart kicked
+
+
+def test_first_frame_warmup_still_fires_after_extended_deadline():
+    # The grace is BOUNDED — a genuinely dead capture past first_frame_secs+warmup must still stall.
+    calls = []
+
+    async def restart(_):
+        calls.append(1)
+        return True
+
+    d = InputStallDetector(stall_secs=5.0, first_frame_secs=15.0, first_frame_warmup_secs=15.0,
+                           restart=restart)
+    d._started_at = time.monotonic() - 35  # past the full 30s warmup deadline
+    lines, remove = _capture_transcript()
+    try:
+        asyncio.run(d._tick())
+    finally:
+        remove()
+    assert any("INPUT STALL | no first mic frame" in ln for ln in lines)
+    assert len(calls) == 1
+
+
+def test_first_frame_warmup_defaults_to_zero_unchanged_behavior():
+    # Default (warmup=0): the deadline is exactly first_frame_secs — no behavior change for installs
+    # that don't set the knob (safe universal default = historical no-op).
+    calls = []
+
+    async def restart(_):
+        calls.append(1)
+        return True
+
+    d = InputStallDetector(stall_secs=5.0, first_frame_secs=15.0, restart=restart)  # warmup defaults 0
+    d._started_at = time.monotonic() - 20  # past 15s, no warmup extension
+    lines, remove = _capture_transcript()
+    try:
+        asyncio.run(d._tick())
+    finally:
+        remove()
+    assert any("INPUT STALL | no first mic frame" in ln for ln in lines)
+    assert len(calls) == 1
+
+
 def test_no_first_frame_escalates_after_restarts_exhausted():
     # A claimed-but-dead capture that never sends a first frame must escalate (exit→systemd re-init),
     # not latch inert — the actual EM failure mode (deaf 3.5 days across 4 restarts).

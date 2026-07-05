@@ -71,6 +71,7 @@ class InputStallDetector(FrameProcessor):
         silent_secs: float = 8.0,
         silence_eps: int = 4,
         first_frame_secs: float = 15.0,  # StartFrame seen but no audio frame within this → stall
+        first_frame_warmup_secs: float = 0.0,  # EXTRA first-frame patience (added to first_frame_secs)
         restart=None,  # async callable(start_frame) -> bool; None = log-only
         max_restarts: int = 3,
         on_unrecoverable=None,  # callable() run once when restarts are exhausted; None = stay log-only
@@ -83,6 +84,7 @@ class InputStallDetector(FrameProcessor):
         self._silent_secs = silent_secs
         self._silence_eps = silence_eps
         self._first_frame_secs = first_frame_secs
+        self._first_frame_warmup_secs = first_frame_warmup_secs
         self._restart = restart
         self._max_restarts = max_restarts
         self._on_unrecoverable = on_unrecoverable
@@ -151,7 +153,13 @@ class InputStallDetector(FrameProcessor):
             # Before the first frame: only the no-first-frame deadline applies (and only once
             # StartFrame has armed `_started_at` — a tick with no StartFrame stays a no-op, so
             # bare construction never warns). A claimed-but-dead capture is caught here.
-            if self._started_at and now - self._started_at > self._first_frame_secs:
+            # This deadline is ALREADY scoped to the post-start warmup window (it only runs before the
+            # first frame arms the detector), so `first_frame_warmup_secs` grants EXTRA patience for a
+            # slow PipeWire link to wire up after a replug/restart — settle-wait guarantees a stable
+            # *enumeration* but not a live *frame path*, and restarting mid-wire-up re-enters the thrash
+            # loop. It never dulls steady-state detection (no-frames/silent use the tighter clocks below).
+            first_frame_deadline = self._first_frame_secs + self._first_frame_warmup_secs
+            if self._started_at and now - self._started_at > first_frame_deadline:
                 await self._on_stall("no first mic frame", now - self._started_at)
             return
         no_frames = now - self._last
