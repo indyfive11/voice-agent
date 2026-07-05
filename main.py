@@ -404,6 +404,15 @@ async def run() -> None:
     # base-input task machinery. Goes FIRST so it times the rawest mic frames.
     async def _restart_capture(_start_frame):
         inp = transport.input()
+        # Part 3 (task #78): if the pinned name now resolves to a DIFFERENT device index (a replug
+        # reshuffled enumeration), reopen capture on the new index instead of futilely kicking the stale
+        # one. Returns "reopened" (done), "failed" (reopen tried but open() failed → return False so the
+        # watchdog escalates to os._exit — today's ladder), or None (no reopen warranted → in-place kick).
+        outcome = config.maybe_reopen_input_device(inp)
+        if outcome == "reopened":
+            return True
+        if outcome == "failed":
+            return False
         stream = getattr(inp, "_in_stream", None)
         if stream is None:
             return False

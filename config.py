@@ -599,6 +599,86 @@ def _supported_input_rate(index: int | None, prefer: int = PIPELINE_AUDIO_RATE) 
         pa.terminate()
 
 
+def maybe_reopen_input_device(inp) -> str | None:
+    """On a capture STALL, re-resolve the pinned input NAME and reopen the stream if the device INDEX
+    changed (a replug reshuffled PortAudio enumeration onto a different node). This is the self-heal for
+    the class fixed at startup by the ranked matcher + settle-wait (parts 1+2, `8a270c7`): part 3 makes
+    the in-process watchdog kick recover a device SHIFT instead of futilely kicking the stale index until
+    `os._exit`. Returns:
+      - "reopened": stream reopened on a new index (success — caller returns True),
+      - "failed":   a reopen was attempted but open() failed → stream left CLOSED; caller MUST return
+                    False so the watchdog escalates (`max_restarts`→`os._exit`→systemd re-init). This is
+                    EXACTLY today's ladder — a failed reopen is strictly safer-or-equal, never deaf-latched,
+      - None:       no reopen warranted → caller does today's in-place stop/start kick. None when the
+                    kill-switch is off, the device is index-pinned (respect the explicit pin), no name is
+                    pinned, the name no longer matches, or the index is UNCHANGED (a same-device stall is
+                    the echo-cancel-died case the kick already targets).
+
+    Design + guardrails ratified with GA 2026-07-05 (task #78). Kill-switch `INPUT_STALL_RERESOLVE`
+    (default ON) → set 0 for pure-kick fallback. Single-shot RANKED resolve (never the sync settle-poll —
+    a `time.sleep` loop here would block the event loop and starve the very frame delivery we're
+    restoring; the ranked matcher already dodges the raw `hw:` node so settle's startup-flux value doesn't
+    apply mid-run). Channels are NOT re-probed — `build_transport` never sets `audio_in_channels`, so
+    input always opens at the base default (1), a fixed param; only the RATE is per-index. Not covered
+    (own follow-up): a wrong-but-LIVE device that delivers valid frames never trips the stall detector —
+    the observed EM/Pi bad node (`hw:4,0`) manifests as a STALL, so this stall-triggered reopen covers it.
+    """
+    if _env("INPUT_STALL_RERESOLVE", "1") in ("0", "false", "False", ""):
+        return None
+    if _env_int("AUDIO_INPUT_DEVICE_INDEX") is not None:
+        return None  # an explicit index pin wins — never re-resolve by name over the user's choice
+    name = _env("AUDIO_INPUT_DEVICE_NAME")
+    if not name:
+        return None
+    params = getattr(inp, "_params", None)
+    if params is None:  # not a pipecat LocalAudioInputTransport we recognize → leave to the kick
+        return None
+    new_idx = _resolve_device_index(name, want_output=False)  # ranked single-shot (non-blocking)
+    cur_idx = getattr(params, "input_device_index", None)
+    if new_idx is None or new_idx == cur_idx:
+        return None  # unchanged (or no match) → in-place kick handles a same-device freeze
+    logger.warning(
+        f"INPUT | mic stalled and pinned name~={name!r} now resolves to a DIFFERENT device "
+        f"[{cur_idx}]→[{new_idx}] (likely a replug) — reopening capture on the new index."
+    )
+    try:
+        old = getattr(inp, "_in_stream", None)
+        if old is not None:  # E1: guard the close so a retry after a nulled stream genuinely re-attempts
+            old.stop_stream()
+            old.close()
+        rate = _supported_input_rate(new_idx)
+        num_frames = int(rate / 100) * 2  # 20ms — mirrors pipecat LocalAudioInputTransport.start()
+        new = inp._py_audio.open(
+            format=inp._py_audio.get_format_from_width(2),
+            channels=params.audio_in_channels,
+            rate=rate,
+            frames_per_buffer=num_frames,
+            stream_callback=inp._audio_in_callback,
+            input=True,
+            input_device_index=new_idx,
+        )
+        # Mutate shared state only AFTER a successful open and BEFORE start_stream(): the old callback
+        # thread is stopped (stop_stream blocks until it quiesces) and the new stream is not yet started,
+        # and there is no `await` between here and start_stream(), so no coroutine/callback reads these
+        # mid-swap. `_sample_rate` retags every InputAudioRawFrame → the downstream InputResampler keys on
+        # it, so a rate change is safe once this is updated (avoids the mis-tagged-rate chipmunk).
+        inp._sample_rate = rate
+        params.audio_in_sample_rate = rate
+        params.input_device_index = new_idx
+        inp._in_stream = new
+        new.start_stream()
+        logger.bind(transcript=True).info(
+            f"INPUT RESUMED | reopened capture on [{new_idx}] at {rate}Hz after a device change"
+        )
+        return "reopened"
+    except Exception as e:  # noqa: BLE001 - recovery must never crash the watch loop
+        # Leave the stream CLOSED and do NOT advance the pinned index → caller returns False → the
+        # watchdog escalates to os._exit for a clean systemd re-init. Never a deaf latch without escalation.
+        inp._in_stream = None
+        logger.warning(f"INPUT | reopen on [{new_idx}] FAILED ({type(e).__name__}: {e}) — escalating")
+        return "failed"
+
+
 async def wait_for_input_device(name: str | None, *, timeout: float, poll: float = 1.0) -> bool:
     """Block startup until an input device whose name contains `name` is enumerable, or `timeout` elapses.
 
