@@ -873,7 +873,8 @@ class BrainLLMService(LLMService):
                 pending = self._pending_confirm
                 self._pending_confirm = None
                 await self._hold_wake(False)  # confirm answered → release the wake-gate hold
-                if self._is_cancel(user_text):
+                decision = self._confirm_decision(user_text)
+                if decision == "cancel":
                     # Explicit "wrong one / back out" — distinct from "no" (= new window). The brain reads
                     # this through the existing confirm passphrase field and aborts without playing.
                     _tlog(f"USER  | {user_text!r}  (confirm decision: cancelled)")
@@ -881,7 +882,7 @@ class BrainLLMService(LLMService):
                         self._session_id, pending["id"], approved=False, passphrase="cancel"
                     )
                 else:
-                    approved = self._parse_yes_no(user_text)
+                    approved = decision == "yes"
                     _tlog(f"USER  | {user_text!r}  (confirm decision: approved={approved})")
                     stream = self._client.confirm(self._session_id, pending["id"], approved)
             else:
@@ -1088,15 +1089,36 @@ class BrainLLMService(LLMService):
         return ""
 
     @staticmethod
-    def _parse_yes_no(text: str) -> bool:
-        t = (text or "").strip().lower()
-        return any(w in t for w in _YES_WORDS)
+    def _confirm_decision(text: str) -> str:
+        """Resolve a spoken confirm answer to 'yes' | 'cancel' | 'no', robust to the confirm
+        PROMPT being echoed back into STT ahead of the real answer.
 
-    @staticmethod
-    def _is_cancel(text: str) -> bool:
-        """True only for explicit back-out phrases. A plain 'no' is NOT cancel (it = new window)."""
+        The tail we (or the brain) speak — "Say yes to proceed, or no to cancel." — contains
+        ALL THREE signal words, so on un-AEC'd room audio STT can capture "…or no to cancel. Yes."
+        for a plain "Yes". A first-substring-match then fired 'cancel' (the echoed word) over the
+        user's trailing 'yes', silently voiding the confirm (the maintainer, 2026-07-06). Because the echo
+        always PRECEDES the user's answer (she speaks the prompt, then he answers), the user's true
+        decision is the RIGHTMOST decision token — so the last-positioned signal wins.
+
+        Only yes-vs-cancel is resolved positionally; a plain 'no' stays the default (approved=False,
+        no passphrase = "new window", NOT a back-out). We deliberately do NOT position-match a bare
+        "no": it's a substring of too many words ("now", "know") and would misfire on e.g.
+        "yes, go ahead now". Consequence: an echoed tail followed by a bare "no" resolves to
+        'cancel' rather than 'no' — benign, since both are non-executing (unlike a flipped 'yes')."""
         t = (text or "").strip().lower()
-        return any(p in t for p in _CANCEL_PHRASES)
+        if not t:
+            return "no"  # nothing intelligible → decline; never execute a mutation on silence
+
+        def _rightmost_end(needles) -> int:
+            # end index of the last-ending matching phrase (end, not start, so a later-ENDING
+            # multi-word phrase like "go ahead" ranks after an earlier bare token)
+            return max((i + len(n) for n in needles if (i := t.rfind(n)) >= 0), default=-1)
+
+        yes_end = _rightmost_end(_YES_WORDS)
+        cancel_end = _rightmost_end(_CANCEL_PHRASES)
+        if yes_end < 0 and cancel_end < 0:
+            return "no"
+        return "yes" if yes_end > cancel_end else "cancel"
 
     async def _keyboard_confirm(self, summary: str, reason: str | None = None) -> bool:
         """Out-of-band physical confirm for Tier-3 actions (KDE kdialog, terminal fallback).

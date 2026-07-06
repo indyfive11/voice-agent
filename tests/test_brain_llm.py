@@ -297,18 +297,36 @@ def test_confirm_plain_no_is_not_cancel():
     assert client.confirm_calls == [("sess-test", "c4", False, None)]
 
 
-def test_is_cancel_phrase_matching():
-    f = BrainLLMService._is_cancel
-    assert f("cancel")
-    assert f("never mind")
-    assert f("forget it")
-    assert f("that's the wrong movie")
-    assert f("neither")
-    assert f("don't play it")
-    # plain yes/no decisions are not cancel
-    assert not f("no")
-    assert not f("yes")
-    assert not f("no, open a new window")
+def test_confirm_decision_phrase_matching():
+    d = BrainLLMService._confirm_decision
+    # explicit back-out phrases → cancel
+    assert d("cancel") == "cancel"
+    assert d("never mind") == "cancel"
+    assert d("forget it") == "cancel"
+    assert d("that's the wrong movie") == "cancel"
+    assert d("neither") == "cancel"
+    assert d("don't play it") == "cancel"
+    # yes-words → yes
+    assert d("yes") == "yes"
+    assert d("go ahead") == "yes"
+    assert d("do it") == "yes"
+    # plain decline / no signal → "no" (new window, NOT a cancel back-out)
+    assert d("no") == "no"
+    assert d("no, open a new window") == "no"
+    assert d("") == "no"
+
+
+def test_confirm_decision_ignores_echoed_prompt_tail():
+    # Regression (the maintainer, 2026-07-06): STT captured Aria's own confirm tail ("…or no to cancel")
+    # echoed ahead of the user's "Yes"; the old first-substring match fired 'cancel' and silently
+    # voided a tier-2 add. The user's real answer comes LAST, so the rightmost signal must win.
+    d = BrainLLMService._confirm_decision
+    assert d("or no to cancel. Yes.") == "yes"
+    assert d("Say yes to proceed, or no to cancel. Yeah do it.") == "yes"
+    # echo with no real answer → cancel (fail-closed: never execute the mutation on a bare echo)
+    assert d("Say yes to proceed, or no to cancel.") == "cancel"
+    # a genuine trailing cancel still wins over an echoed "yes"
+    assert d("Say yes to proceed, or no to cancel. Actually cancel it.") == "cancel"
 
 
 def test_error_event_spoken_once_fallback_status_suppressed():
