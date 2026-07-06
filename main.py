@@ -402,12 +402,20 @@ async def run() -> None:
     # Input-stall watchdog: best-effort recovery for a frozen/silent mic capture. The restart "kicks"
     # the PortAudio stream in place (stop→start) — the least-invasive revive that doesn't tear down the
     # base-input task machinery. Goes FIRST so it times the rawest mic frames.
-    async def _restart_capture(_start_frame):
+    # A wedged USB capture (dead isochronous transfer while the device stays claimed — the reSpeaker's
+    # ~20-min firmware stall) makes PortAudio's SYNCHRONOUS open()/stop_stream() block FOREVER in the C
+    # layer. Run recovery in a worker thread under a hard timeout: on the event-loop thread these blocking
+    # calls would freeze the watch loop itself → no more ticks, no escalation → permanent deafness (task
+    # #83, GA-confirmed 2026-07-06). Timeout → return False → the watchdog counts a failed attempt and
+    # escalates to a clean systemd restart. Bounded, never wedged.
+    input_reopen_timeout = float(os.environ.get("INPUT_REOPEN_TIMEOUT_SECS", "6.0"))
+
+    def _recover_capture_blocking():
         inp = transport.input()
-        # Part 3 (task #78): if the pinned name now resolves to a DIFFERENT device index (a replug
-        # reshuffled enumeration), reopen capture on the new index instead of futilely kicking the stale
-        # one. Returns "reopened" (done), "failed" (reopen tried but open() failed → return False so the
-        # watchdog escalates to os._exit — today's ladder), or None (no reopen warranted → in-place kick).
+        # Part 3 (task #78) + task #83: if the pinned name resolves to a DIFFERENT index (replug) OR the
+        # stream is gone on the SAME index (the ~20-min firmware watchdog), reopen a fresh stream. Returns
+        # "reopened" (done), "failed" (open() failed → escalate ladder), or None (no reopen warranted →
+        # in-place kick of a still-live but frozen stream).
         outcome = config.maybe_reopen_input_device(inp)
         if outcome == "reopened":
             return True
@@ -419,6 +427,23 @@ async def run() -> None:
         stream.stop_stream()
         stream.start_stream()
         return True
+
+    async def _restart_capture(_start_frame):
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(_recover_capture_blocking), timeout=input_reopen_timeout
+            )
+        except asyncio.TimeoutError:
+            logger.bind(transcript=True).warning(
+                f"INPUT STALL | reopen exceeded {input_reopen_timeout:.0f}s (device wedged in the C layer) "
+                "— abandoning this attempt so the watchdog can escalate to a clean restart"
+            )
+            return False
+        except Exception as e:  # noqa: BLE001 - recovery must never crash the watch loop
+            logger.bind(transcript=True).warning(
+                f"INPUT STALL | reopen errored ({type(e).__name__}: {e}) — treating as a failed attempt"
+            )
+            return False
 
     # Last resort when the in-process capture kicks can't revive the mic (e.g. the reSpeaker came up
     # all-silent and never recovers): exit hard so systemd (Restart=on-failure) does a clean full device

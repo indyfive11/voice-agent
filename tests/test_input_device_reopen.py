@@ -121,12 +121,32 @@ def test_reopen_open_kwargs_mirror_pipecat_start_args(monkeypatch):
 
 # --- no-reopen cases → None (caller does the in-place kick) ----------------------------------------
 
-def test_same_index_returns_none(monkeypatch):
+def test_same_index_live_stream_returns_none(monkeypatch):
+    # Same index AND the stream is still live (a freeze, e.g. echo-cancel died) → the lighter in-place
+    # stop/start kick handles it; no reopen.
     _base_env(monkeypatch)
     monkeypatch.setattr(config, "_resolve_device_index", lambda *a, **k: 11)   # unchanged
-    inp = _FakeInput(cur_idx=11)
+    inp = _FakeInput(cur_idx=11)                       # default _in_stream is live (started=True)
     assert config.maybe_reopen_input_device(inp) is None
     assert inp._py_audio.open_calls == []             # never touched the stream
+
+
+def test_same_index_reopens_when_stream_is_dead(monkeypatch):
+    # task #83: the reSpeaker's ~20-min firmware watchdog kills the capture stream IN PLACE (index
+    # UNCHANGED). pipecat nulls _in_stream, so the in-place kick has "no stream to kick" and we'd escalate
+    # to a full process bounce every 20 min. Reopen a FRESH stream on the SAME index instead.
+    _base_env(monkeypatch)
+    monkeypatch.setattr(config, "_resolve_device_index", lambda *a, **k: 11)   # unchanged index
+    monkeypatch.setattr(config, "_supported_input_rate", lambda idx, **k: 48000)
+    inp = _FakeInput(cur_idx=11)
+    inp._in_stream = None                              # firmware watchdog killed the stream in place
+    outcome = config.maybe_reopen_input_device(inp)
+    assert outcome == "reopened"
+    assert len(inp._py_audio.open_calls) == 1
+    assert inp._py_audio.open_calls[0]["input_device_index"] == 11   # same index, fresh stream
+    assert inp._in_stream is not None and inp._in_stream.started
+    assert inp._params.input_device_index == 11        # pin unchanged (same index), rate retagged
+    assert inp._sample_rate == 48000
 
 
 def test_no_name_match_returns_none(monkeypatch):

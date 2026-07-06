@@ -635,12 +635,26 @@ def maybe_reopen_input_device(inp) -> str | None:
         return None
     new_idx = _resolve_device_index(name, want_output=False)  # ranked single-shot (non-blocking)
     cur_idx = getattr(params, "input_device_index", None)
-    if new_idx is None or new_idx == cur_idx:
-        return None  # unchanged (or no match) → in-place kick handles a same-device freeze
-    logger.warning(
-        f"INPUT | mic stalled and pinned name~={name!r} now resolves to a DIFFERENT device "
-        f"[{cur_idx}]→[{new_idx}] (likely a replug) — reopening capture on the new index."
-    )
+    if new_idx is None:
+        return None  # name no longer matches anything → leave to the in-place kick / escalation ladder
+    stream_dead = getattr(inp, "_in_stream", None) is None
+    if new_idx == cur_idx and not stream_dead:
+        return None  # same device, stream still LIVE → the lighter in-place stop/start kick handles a freeze
+    if new_idx == cur_idx:
+        # Same index but the capture stream is GONE. The reSpeaker's ~20-min firmware UAC watchdog kills
+        # the stream in place (index unchanged), so pipecat nulls `_in_stream` and the in-place kick has
+        # nothing to stop/start ("no stream to kick") → we'd escalate to a full ~44s process bounce every
+        # 20 min. Reopen a FRESH stream on the SAME index instead → in-process recovery, ~2s blip.
+        # (task #83, consensus w/ GA 2026-07-06.)
+        logger.warning(
+            f"INPUT | mic stalled and the capture stream is gone on the same index [{cur_idx}] "
+            f"(pinned name~={name!r}) — reopening a fresh stream in place."
+        )
+    else:
+        logger.warning(
+            f"INPUT | mic stalled and pinned name~={name!r} now resolves to a DIFFERENT device "
+            f"[{cur_idx}]→[{new_idx}] (likely a replug) — reopening capture on the new index."
+        )
     try:
         old = getattr(inp, "_in_stream", None)
         if old is not None:  # E1: guard the close so a retry after a nulled stream genuinely re-attempts
