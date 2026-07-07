@@ -15,11 +15,22 @@ natively — so no provider branching is needed for the prompt.
 from __future__ import annotations
 
 import os
+import threading
 
 from dotenv import load_dotenv
 from loguru import logger
 
 load_dotenv(override=True)
+
+# Serializes the two capture-recovery paths — the reactive stall watchdog (main.py _recover_capture_blocking
+# → maybe_reopen_input_device / in-place kick) and the proactive recycle loop (recycle_input_device). Both
+# run in `to_thread` workers and mutate inp._in_stream / inp._py_audio; without mutual exclusion a heavy
+# recycle's terminate() can race the reactive path's open() (C-layer use-after-free), and two opens can hit
+# one index at once (GA review 2026-07-06, finding B). Acquired NON-BLOCKING at each entry point: if the
+# other path holds it, the current attempt is a no-op (the holder is already recovering) and the watchdog
+# stays the backstop. Full-body scope also closes the timeout-orphan stomp (finding C): a worker abandoned
+# by its caller's wait_for keeps the lock until it truly returns, so nothing mutates underneath it.
+_input_recovery_lock = threading.Lock()
 
 
 # --------------------------------------------------------------------------- env helpers
@@ -893,6 +904,214 @@ async def pin_output_stream_volume(poll_secs: float = 5.0, floor_pct: int = 60, 
         except Exception as e:  # noqa: BLE001 - never let the guard crash the app
             logger.debug(f"Output-volume pin: {type(e).__name__}: {e}")
         await asyncio.sleep(poll_secs)
+
+
+def _open_input_stream(pa, inp, params, idx: int):
+    """Open ONE fresh capture stream on `idx` via PyAudio instance `pa`, using the transport's standard
+    input params (rate re-probed per index, 20ms buffer, the transport's own audio-in callback). Returns
+    (stream, rate). Blocking. Shared by the reactive reopen and the proactive recycle so the open contract
+    stays in one place (mirrors pipecat LocalAudioInputTransport.start())."""
+    rate = _supported_input_rate(idx)
+    num_frames = int(rate / 100) * 2  # 20ms
+    stream = pa.open(
+        format=pa.get_format_from_width(2),
+        channels=params.audio_in_channels,
+        rate=rate,
+        frames_per_buffer=num_frames,
+        stream_callback=inp._audio_in_callback,
+        input=True,
+        input_device_index=idx,
+    )
+    return stream, rate
+
+
+def recycle_input_device(inp, *, heavy: bool = False) -> bool:
+    """Proactively recycle the LIVE capture stream BEFORE the XVF3800's firmware wedge (task #84).
+
+    The reSpeaker XVF3800 wedges its capture at a deterministic 1200s of STREAM age (GA+VAC diagnosis
+    2026-07-06: ten clean, never-USB-reset 20:00 lifetimes back-to-back ⇒ the counter is STREAM-scoped,
+    not device/USB-age). Reopening the stream while it is still HEALTHY resets that clock, so a periodic
+    recycle at ~18:00 prevents the ~66s deaf recovery every ~21min (≈5% deaf duty cycle) WITHOUT ever
+    invoking the reactive stall ladder — and with no root, no USB reset, no udev rule.
+
+    Two teardown depths (INPUT_PROACTIVE_RECYCLE_MODE):
+      - light (default): input-only stop→close→open→start on the SHARED PyAudio client — re-issues USB
+        SET_INTERFACE alt 1→0→1. This is #83's proven reopen path run on a still-live stream. Output
+        untouched. Whether this light alt-flip resets the firmware counter is the ONE bit the live run
+        confirms (all of GA's observed resets came from a HEAVY full-process teardown).
+      - heavy (#2.5a): open input on a FRESH dedicated PyAudio instance and swap it in — a full client
+        disconnect+reacquire (what a process restart does, which we KNOW resets the clock), performed
+        IN-PROCESS, still no root. Scoped to input: pipecat hands ONE PyAudio instance to both input and
+        output (transports/local/audio.py:206), so a global terminate() would blip TTS — we never touch
+        the shared instance while output holds it, and only terminate a PRIOR dedicated-input instance.
+
+    Returns True on a successful recycle, False on a no-op/skip or a failed open (the caller logs; the
+    reactive input watchdog stays the backstop regardless). BLOCKING — PortAudio open/stop are synchronous
+    and a wedged device blocks in the C layer, so ALWAYS call under asyncio.to_thread + a hard timeout,
+    never on the event loop (the #83 lesson).
+    """
+    params = getattr(inp, "_params", None)
+    if params is None:  # not a pipecat LocalAudioInputTransport we recognize
+        return False
+    pinned_idx = _env_int("AUDIO_INPUT_DEVICE_INDEX")
+    if pinned_idx is not None:
+        idx, name = pinned_idx, None  # explicit index pin wins, but is still a valid recycle target
+    else:
+        name = _env("AUDIO_INPUT_DEVICE_NAME")
+        idx = _resolve_device_index(name, want_output=False) if name else None
+    if idx is None:  # name unset / no longer resolves → fall back to the current bound index
+        idx = getattr(params, "input_device_index", None)
+    if idx is None:
+        return False
+
+    # B (GA review 2026-07-06): serialize against the reactive stall watchdog so the two recovery paths
+    # never mutate _in_stream/_py_audio concurrently (a heavy terminate() racing the reactive open() is a
+    # C-layer use-after-free; two opens can hit one index at once). NON-BLOCKING: if the reactive path (or
+    # a prior recycle worker its wait_for abandoned) holds the lock, that path is already recovering — skip
+    # this proactive pass and leave the watchdog as backstop rather than pile a second mutation on top.
+    if not _input_recovery_lock.acquire(blocking=False):
+        logger.debug("INPUT | recovery lock held (another recovery in flight) — skipping proactive recycle this pass")
+        return False
+    try:
+        if not heavy:
+            # LIGHT: reopen on the shared client (input-only). Stop the live stream FIRST — on a healthy
+            # device stop_stream() returns promptly (only a WEDGED stream blocks, and the caller's timeout
+            # bounds that), so there is no dual-callback overlap.
+            try:
+                old = getattr(inp, "_in_stream", None)
+                if old is not None:
+                    old.stop_stream()
+                    old.close()
+                new, rate = _open_input_stream(inp._py_audio, inp, params, idx)
+                inp._sample_rate = rate
+                params.audio_in_sample_rate = rate
+                params.input_device_index = idx
+                inp._in_stream = new
+                new.start_stream()
+                logger.bind(transcript=True).info(
+                    f"INPUT RECYCLED | light in-process recycle on [{idx}] at {rate}Hz (shared client, output untouched)"
+                )
+                return True
+            except Exception as e:  # noqa: BLE001 - recovery must never crash the loop
+                inp._in_stream = None  # leave closed → reactive watchdog sees no frames and recovers
+                logger.warning(f"INPUT | light recycle on [{idx}] FAILED ({type(e).__name__}: {e}) — reactive watchdog will pick up")
+                return False
+
+        # HEAVY (#2.5a): fresh dedicated input client. Stop old first (healthy → prompt), then open on a NEW
+        # PyAudio instance so input gets a genuinely fresh ALSA/PW client (the heavy teardown a restart does),
+        # while the shared instance that also backs OUTPUT is left alive.
+        import pyaudio
+
+        old_stream = getattr(inp, "_in_stream", None)
+        old_pa = inp._py_audio
+        try:
+            if old_stream is not None:
+                old_stream.stop_stream()
+                old_stream.close()
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"INPUT | heavy recycle old-stream close: {type(e).__name__}: {e}")
+        new_pa = None
+        try:
+            new_pa = pyaudio.PyAudio()
+            new, rate = _open_input_stream(new_pa, inp, params, idx)
+        except Exception as e:  # noqa: BLE001
+            # A (GA review 2026-07-06): _open_input_stream can raise AFTER pyaudio.PyAudio() already stood up
+            # a PortAudio/ALSA/PW client. Terminate it here — heavy runs precisely when the device is flaky,
+            # so an unterminated fresh client per failed open would leak fds / host-API handles until exhaustion.
+            if new_pa is not None:
+                try:
+                    new_pa.terminate()
+                except Exception as te:  # noqa: BLE001
+                    logger.debug(f"INPUT | heavy recycle failed-open cleanup terminate: {type(te).__name__}: {te}")
+            inp._in_stream = None
+            logger.warning(f"INPUT | heavy recycle open on [{idx}] FAILED ({type(e).__name__}: {e}) — reactive watchdog will pick up")
+            return False
+        setattr(new_pa, "_va_input_dedicated", True)  # mark so a later heavy recycle can terminate THIS one
+        inp._sample_rate = rate
+        params.audio_in_sample_rate = rate
+        params.input_device_index = idx
+        inp._py_audio = new_pa
+        inp._in_stream = new
+        new.start_stream()
+        # Terminate the previous instance ONLY if it was a prior dedicated-input instance — NEVER the original
+        # shared one (output still uses it). This keeps repeated heavy recycles from leaking PyAudio clients.
+        if getattr(old_pa, "_va_input_dedicated", False):
+            try:
+                old_pa.terminate()
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"INPUT | heavy recycle old-client terminate: {type(e).__name__}: {e}")
+        logger.bind(transcript=True).info(
+            f"INPUT RECYCLED | heavy in-process re-init on [{idx}] at {rate}Hz (fresh dedicated PyAudio client)"
+        )
+        return True
+    finally:
+        _input_recovery_lock.release()
+
+
+async def proactive_input_recycle_loop(inp, *, is_idle=None) -> None:
+    """Periodic proactive capture recycle to dodge the XVF3800 1200s stream-age wedge (task #84).
+
+    OFF by default: INPUT_PROACTIVE_RECYCLE_SECS unset/0 ⇒ returns immediately and the app is byte-identical
+    to today (Hardware-Generalization SOP — the knob's mere existence never changes an unconfigured install).
+    Knobs:
+      INPUT_PROACTIVE_RECYCLE_SECS            interval between recycles (0/unset = OFF; ~1080 = 18min, under 1200s)
+      INPUT_PROACTIVE_RECYCLE_MODE            light (default) | heavy   (#2.5a fallback)
+      INPUT_PROACTIVE_RECYCLE_MAX_DEFER_SECS  wait up to this long past the interval for an idle floor before
+                                              forcing the recycle (default 90 → worst stream-age ~19:30)
+      INPUT_PROACTIVE_RECYCLE_TIMEOUT_SECS    hard cap on the blocking recycle (default 6.0)
+
+    Idle-gated: when `is_idle()` (the brain's floor-free signal) is provided, defer the recycle out of a live
+    turn so the ~1-2s blip lands in silence and never chops a wake/command. The recycle runs in a worker
+    thread under a hard timeout (a wedged device blocks PortAudio in the C layer — the #83 lesson); on
+    timeout we simply skip and leave it to the reactive watchdog. The reactive stall ladder stays the
+    backstop throughout — this loop only tries to make it never fire.
+
+    Experiment note (2026-07-06): because the firmware counter is stream-scoped, if the LIGHT recycle does
+    NOT reset it, a -9987 wedge still fires at ~1200s of the ORIGINAL stream age despite the recycle at the
+    interval — so the log reads cleanly: no wedge past the interval ⇒ light resets the clock (ship #2);
+    a wedge at ~1200s anyway ⇒ flip INPUT_PROACTIVE_RECYCLE_MODE=heavy and re-run.
+    """
+    import asyncio
+
+    interval = float(_env("INPUT_PROACTIVE_RECYCLE_SECS", "0") or 0)
+    if interval <= 0:
+        return
+    mode = (_env("INPUT_PROACTIVE_RECYCLE_MODE", "light") or "light").lower()
+    heavy = mode == "heavy"
+    max_defer = float(_env("INPUT_PROACTIVE_RECYCLE_MAX_DEFER_SECS", "90") or 90)
+    timeout = float(_env("INPUT_PROACTIVE_RECYCLE_TIMEOUT_SECS", "6.0") or 6.0)
+    idle_poll = 2.0
+    logger.bind(transcript=True).info(
+        f"Proactive input recycle: ENABLED interval={interval:.0f}s mode={mode} max_defer={max_defer:.0f}s (task #84)"
+    )
+
+    def _idle() -> bool:
+        if is_idle is None:
+            return True
+        try:
+            return bool(is_idle())
+        except Exception:  # noqa: BLE001 - never let the idle probe block a needed recycle
+            return True
+
+    while True:
+        await asyncio.sleep(interval)
+        deferred = 0.0
+        while not _idle() and deferred < max_defer:
+            await asyncio.sleep(idle_poll)
+            deferred += idle_poll
+        try:
+            ok = await asyncio.wait_for(
+                asyncio.to_thread(recycle_input_device, inp, heavy=heavy), timeout=timeout
+            )
+            if not ok:
+                logger.warning("INPUT | proactive recycle was a no-op/failed — reactive watchdog remains the backstop")
+        except asyncio.TimeoutError:
+            logger.bind(transcript=True).warning(
+                f"INPUT | proactive recycle exceeded {timeout:.0f}s (device wedged mid-recycle?) — "
+                "leaving it to the reactive watchdog"
+            )
+        except Exception as e:  # noqa: BLE001 - the loop must survive any single recycle error
+            logger.warning(f"INPUT | proactive recycle errored ({type(e).__name__}: {e}) — continuing")
 
 
 async def warn_if_output_muted() -> None:

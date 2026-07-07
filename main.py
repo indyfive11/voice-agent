@@ -412,21 +412,32 @@ async def run() -> None:
 
     def _recover_capture_blocking():
         inp = transport.input()
-        # Part 3 (task #78) + task #83: if the pinned name resolves to a DIFFERENT index (replug) OR the
-        # stream is gone on the SAME index (the ~20-min firmware watchdog), reopen a fresh stream. Returns
-        # "reopened" (done), "failed" (open() failed → escalate ladder), or None (no reopen warranted →
-        # in-place kick of a still-live but frozen stream).
-        outcome = config.maybe_reopen_input_device(inp)
-        if outcome == "reopened":
+        # B (GA review 2026-07-06): serialize this reactive recovery against the proactive recycle loop
+        # (config.recycle_input_device) — both mutate inp._in_stream/_py_audio from to_thread workers, and a
+        # heavy recycle's terminate() racing the open()/kick below is a C-layer use-after-free. NON-BLOCKING:
+        # if the proactive path holds the lock it is already recovering, so count this as a spent attempt and
+        # let the watchdog re-tick (a wedged holder is resolved by the existing os._exit escalation).
+        if not config._input_recovery_lock.acquire(blocking=False):
+            logger.debug("INPUT | recovery lock held (proactive recycle in flight) — skipping this reactive attempt")
+            return False
+        try:
+            # Part 3 (task #78) + task #83: if the pinned name resolves to a DIFFERENT index (replug) OR the
+            # stream is gone on the SAME index (the ~20-min firmware watchdog), reopen a fresh stream. Returns
+            # "reopened" (done), "failed" (open() failed → escalate ladder), or None (no reopen warranted →
+            # in-place kick of a still-live but frozen stream).
+            outcome = config.maybe_reopen_input_device(inp)
+            if outcome == "reopened":
+                return True
+            if outcome == "failed":
+                return False
+            stream = getattr(inp, "_in_stream", None)
+            if stream is None:
+                return False
+            stream.stop_stream()
+            stream.start_stream()
             return True
-        if outcome == "failed":
-            return False
-        stream = getattr(inp, "_in_stream", None)
-        if stream is None:
-            return False
-        stream.stop_stream()
-        stream.start_stream()
-        return True
+        finally:
+            config._input_recovery_lock.release()
 
     async def _restart_capture(_start_frame):
         try:
@@ -584,6 +595,15 @@ async def run() -> None:
     # Guard the TTS output stream against PipeWire module-stream-restore stranding it silent (which would
     # leave the user muted under half-duplex and break the conversation). In-app, dies with the app.
     pin_task = asyncio.create_task(config.pin_output_stream_volume())
+    # Proactive capture recycle (task #84): reopen the mic stream at ~18:00 to dodge the XVF3800's
+    # deterministic 1200s stream-age wedge BEFORE it fires (vs #83's reactive ~66s recovery every ~21min).
+    # OFF unless INPUT_PROACTIVE_RECYCLE_SECS is set → byte-identical for every other install. Idle-gated on
+    # the brain's floor-free signal (when present) so the ~1-2s blip lands in silence, never chopping a turn.
+    recycle_task = asyncio.create_task(
+        config.proactive_input_recycle_loop(
+            transport.input(), is_idle=getattr(llm, "is_floor_free", None)
+        )
+    )
     if builder_poller is not None:
         await builder_poller.start()  # proactive builder/timer announcements (Brick B); no-op without a brain
     runner = WorkerRunner(handle_sigint=(sys.platform != "win32"))
@@ -593,6 +613,7 @@ async def run() -> None:
     finally:
         aria_state.set_state("off")  # eye: voice mode down → eye closed
         pin_task.cancel()
+        recycle_task.cancel()
         if builder_poller is not None:
             await builder_poller.stop()
         # Tear down an external brain (stop `gab --voice-serve`); no-op for local brains.
