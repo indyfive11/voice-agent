@@ -466,10 +466,31 @@ async def run() -> None:
         )
         os._exit(1)
 
+    # Hardware rung (task #79/#83): when the in-process kicks can't clear a HARD C-layer open() wedge, a USB
+    # power-cycle of the mic's port forces the device to cold re-enumerate — the only thing that clears it.
+    # Off unless INPUT_USB_RESET_VIDPID names the device (default '' = today's exact behavior). Resolves the
+    # hub+port at cycle time by VID:PID (survives bus renumbering), and runs OUTSIDE _input_recovery_lock so a
+    # hung proactive recycle can't starve it (GA flag 2026-07-07). Needs the udev rule for non-root uhubctl.
+    usb_reset_vidpid = os.environ.get("INPUT_USB_RESET_VIDPID", "").strip()
+    hard_reset = None
+    if usb_reset_vidpid:
+        import usb_reset
+
+        uhubctl_bin = os.environ.get("UHUBCTL_BIN", "uhubctl")
+        usb_off_delay = float(os.environ.get("INPUT_USB_RESET_DELAY", "2.0"))
+
+        async def _usb_power_cycle():
+            return await asyncio.to_thread(
+                usb_reset.cycle, usb_reset_vidpid, uhubctl_bin=uhubctl_bin, off_delay=usb_off_delay
+            )
+
+        hard_reset = _usb_power_cycle
+
     input_watchdog = config.build_input_watchdog(
         restart=_restart_capture,
         on_unrecoverable=_exit_for_clean_restart,
         gate_state=(wake_gate.hb_state if wake_gate else None),  # heartbeat shows gate state too
+        hard_reset=hard_reset,
     )
 
     # Deferred out-of-band announcements (builder results, timers, …): voiced at a free conversational floor.

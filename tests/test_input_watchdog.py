@@ -366,3 +366,150 @@ def test_resume_logs_and_resets():
     assert any("INPUT RESUMED" in ln for ln in lines)
     assert d._stalled is False
     assert d._restarts == 0
+
+
+# --------------------------------------------------------------------------- hardware rung (USB reset)
+def test_hard_reset_fires_after_kicks_then_rekicks_then_escalates():
+    # Ladder: N in-process kicks → USB power-cycle → N more kicks → escalate. The hardware rung sits
+    # between the kicks and the process-exit (task #79/#83): only VBUS-cycling clears a hard open() wedge.
+    kicks, hard, escalations = [], [], []
+
+    async def restart(_):
+        kicks.append(1)
+        return True
+
+    async def hard_reset():
+        hard.append(1)
+        return True
+
+    d = InputStallDetector(stall_secs=5.0, restart=restart, max_restarts=2,
+                           hard_reset=hard_reset, max_hard_resets=1,
+                           on_unrecoverable=lambda: escalations.append(1))
+    d._armed = True
+    now = time.monotonic()
+    d._last = now - 10            # no frames → stays stalled through the whole ladder
+    d._last_nonsilent = now - 10
+
+    lines, remove = _capture_transcript()
+    try:
+        async def go():
+            for _ in range(10):
+                await d._tick()
+        asyncio.run(go())
+    finally:
+        remove()
+
+    assert len(hard) == 1                      # exactly one USB power-cycle (max_hard_resets)
+    assert len(kicks) == 4                      # 2 before the cycle + 2 after (counter reset re-armed them)
+    assert len(escalations) == 1                # only escalates once both rungs are spent
+    assert any("USB power-cycling" in ln for ln in lines)
+    assert any("re-arming in-process recovery" in ln for ln in lines)
+    # order: the cycle happens after the first 2 kicks and before the escalation
+    order = [t for ln in lines for t in (["cycle"] if "USB power-cycling" in ln
+                                         else ["esc"] if "escalating" in ln else [])]
+    assert order == ["cycle", "esc"]
+
+
+def test_no_hard_reset_when_unconfigured_is_unchanged():
+    # hard_reset=None (default / INPUT_USB_RESET_VIDPID unset) → today's exact ladder: kicks then escalate,
+    # never a USB power-cycle line.
+    kicks, escalations = [], []
+
+    async def restart(_):
+        kicks.append(1)
+        return True
+
+    d = InputStallDetector(stall_secs=5.0, restart=restart, max_restarts=2,
+                           hard_reset=None, on_unrecoverable=lambda: escalations.append(1))
+    d._armed = True
+    now = time.monotonic()
+    d._last = now - 10
+    d._last_nonsilent = now - 10
+
+    lines, remove = _capture_transcript()
+    try:
+        async def go():
+            for _ in range(6):
+                await d._tick()
+        asyncio.run(go())
+    finally:
+        remove()
+
+    assert len(kicks) == 2
+    assert len(escalations) == 1
+    assert not any("USB power-cycling" in ln for ln in lines)
+
+
+def test_hard_reset_failure_still_escalates():
+    # If the USB cycle itself fails (uhubctl error / no PPPS hub found), the ladder must still fall through
+    # to the exit rung — never latch waiting on a cure that didn't land.
+    async def restart(_):
+        return True
+
+    async def hard_reset():
+        return False           # cycle failed
+
+    escalations = []
+    d = InputStallDetector(stall_secs=5.0, restart=restart, max_restarts=1,
+                           hard_reset=hard_reset, max_hard_resets=1,
+                           on_unrecoverable=lambda: escalations.append(1))
+    d._armed = True
+    now = time.monotonic()
+    d._last = now - 10
+    d._last_nonsilent = now - 10
+
+    lines, remove = _capture_transcript()
+    try:
+        async def go():
+            for _ in range(8):
+                await d._tick()
+        asyncio.run(go())
+    finally:
+        remove()
+
+    assert len(escalations) == 1
+    assert any("usb power-cycle FAILED" in ln or "FAILED" in ln for ln in lines)
+
+
+def test_hard_reset_exception_is_swallowed_and_ladder_continues():
+    # A raising hard_reset must not crash the watch loop — it's caught, logged, and the ladder proceeds.
+    async def restart(_):
+        return True
+
+    async def hard_reset():
+        raise RuntimeError("uhubctl blew up")
+
+    escalations = []
+    d = InputStallDetector(stall_secs=5.0, restart=restart, max_restarts=1,
+                           hard_reset=hard_reset, max_hard_resets=1,
+                           on_unrecoverable=lambda: escalations.append(1))
+    d._armed = True
+    now = time.monotonic()
+    d._last = now - 10
+    d._last_nonsilent = now - 10
+
+    lines, remove = _capture_transcript()
+    try:
+        async def go():
+            for _ in range(8):
+                await d._tick()
+        asyncio.run(go())
+    finally:
+        remove()
+
+    assert len(escalations) == 1                       # still escalates
+    assert any("usb power-cycle FAILED: RuntimeError" in ln for ln in lines)
+
+
+def test_resume_resets_hard_reset_budget():
+    # A recovered episode must re-arm the hardware budget so a LATER stall can power-cycle again.
+    d = InputStallDetector(stall_secs=5.0, silent_secs=8.0, restart=None, hard_reset=(lambda: _async_true()))
+    d._armed = True
+    d._stalled = True
+    d._restarts = 2
+    d._hard_resets = 1
+    now = time.monotonic()
+    d._last = now
+    d._last_nonsilent = now
+    asyncio.run(d._tick())
+    assert d._hard_resets == 0

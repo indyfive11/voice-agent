@@ -1148,7 +1148,7 @@ def build_input_resampler():
     return InputResampler(target_rate=PIPELINE_AUDIO_RATE)
 
 
-def build_input_watchdog(restart=None, on_unrecoverable=None, gate_state=None):
+def build_input_watchdog(restart=None, on_unrecoverable=None, gate_state=None, hard_reset=None):
     """Input-stall watchdog (goes first, right after transport.input()), or None if disabled.
 
     Detects a mic-capture freeze — both 'no frames' and 'frames but silent' (the 2026-06-03 echo-cancel
@@ -1176,17 +1176,22 @@ def build_input_watchdog(restart=None, on_unrecoverable=None, gate_state=None):
     heartbeat_secs = float(_env("INPUT_HEARTBEAT_SECS", "10.0"))
     exit_on_fail = _env("INPUT_STALL_EXIT_ON_FAIL", "0") not in ("0", "false", "False")
     escalate = on_unrecoverable if exit_on_fail else None
+    # Hardware rung: only wired if main.py built a hard_reset (INPUT_USB_RESET_VIDPID set). max_hard_resets
+    # bounds the USB power-cycles per stall episode before the ladder falls through to the exit rung.
+    max_hard_resets = int(_env("INPUT_MAX_HARD_RESETS", "1"))
     from input_watchdog import InputStallDetector
 
     warmup_note = f"+{first_frame_warmup_secs}s warmup" if first_frame_warmup_secs else "no warmup"
     logger.info(f"Input watchdog: ON (stall={stall_secs}s, silent={silent_secs}s, "
                 f"first_frame={first_frame_secs}s ({warmup_note}), heartbeat={heartbeat_secs}s, "
                 f"recover={'yes' if restart else 'log-only'}, "
+                f"usb_reset={'yes' if hard_reset else 'off'}, "
                 f"escalate={'exit-for-restart' if escalate else 'log-only'})")
     return InputStallDetector(
         stall_secs=stall_secs, silent_secs=silent_secs, first_frame_secs=first_frame_secs,
         first_frame_warmup_secs=first_frame_warmup_secs,
-        restart=restart, on_unrecoverable=escalate, heartbeat_secs=heartbeat_secs, gate_state=gate_state,
+        restart=restart, hard_reset=hard_reset, max_hard_resets=max_hard_resets,
+        on_unrecoverable=escalate, heartbeat_secs=heartbeat_secs, gate_state=gate_state,
     )
 
 

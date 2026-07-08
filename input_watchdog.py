@@ -74,6 +74,8 @@ class InputStallDetector(FrameProcessor):
         first_frame_warmup_secs: float = 0.0,  # EXTRA first-frame patience (added to first_frame_secs)
         restart=None,  # async callable(start_frame) -> bool; None = log-only
         max_restarts: int = 3,
+        hard_reset=None,  # async callable() -> bool; USB power-cycle rung, None = skip (log-only ladder)
+        max_hard_resets: int = 1,  # how many hardware power-cycles before giving up to on_unrecoverable
         on_unrecoverable=None,  # callable() run once when restarts are exhausted; None = stay log-only
         heartbeat_secs: float = 10.0,  # periodic liveness line; 0 = off
         gate_state=None,  # optional callable → {"gated","open","wake_peak"} for the heartbeat
@@ -87,6 +89,8 @@ class InputStallDetector(FrameProcessor):
         self._first_frame_warmup_secs = first_frame_warmup_secs
         self._restart = restart
         self._max_restarts = max_restarts
+        self._hard_reset = hard_reset
+        self._max_hard_resets = max_hard_resets
         self._on_unrecoverable = on_unrecoverable
         self._hb_secs = heartbeat_secs
         self._gate_state = gate_state
@@ -97,6 +101,7 @@ class InputStallDetector(FrameProcessor):
         self._armed = False         # seen ≥1 frame (don't warn before capture starts)
         self._stalled = False       # currently in a stall episode
         self._restarts = 0          # restart attempts this episode
+        self._hard_resets = 0       # hardware power-cycles this episode
         self._start_frame: StartFrame | None = None  # captured for the restart
         self._task: asyncio.Task | None = None
         # Heartbeat counters (deltas since the last beat).
@@ -172,6 +177,7 @@ class InputStallDetector(FrameProcessor):
             # good frames are flowing again
             self._stalled = False
             self._restarts = 0
+            self._hard_resets = 0
             _tlog(f"INPUT RESUMED | mic audio back after {silent:.1f}s")
         self._maybe_heartbeat(now)
 
@@ -200,6 +206,28 @@ class InputStallDetector(FrameProcessor):
         if self._restart is None:
             return
         if self._restarts >= self._max_restarts:
+            # In-process kicks are exhausted this round. Before giving up, try the HARDWARE rung: a
+            # USB power-cycle that forces the device to cold re-enumerate — the only thing that clears a
+            # hard C-layer open() wedge (task #79/#83) that no reopen can. Runs OUTSIDE the in-process
+            # recovery lock, so a hung proactive recycle can't starve it (GA flag 2026-07-07). After a
+            # cycle we reset the kick counter so the reopen path gets a fresh round to re-resolve the
+            # re-enumerated device by name; only if THAT also fails do we escalate to a process exit.
+            if self._hard_reset is not None and self._hard_resets < self._max_hard_resets:
+                self._hard_resets += 1
+                _tlog(
+                    f"INPUT STALL | {self._max_restarts} in-process kicks exhausted — USB power-cycling "
+                    f"the mic port (hardware reset {self._hard_resets}/{self._max_hard_resets})"
+                )
+                try:
+                    ok = await self._hard_reset()
+                    _tlog(
+                        f"INPUT STALL | usb power-cycle {'done' if ok else 'FAILED'} — "
+                        "re-arming in-process recovery for the re-enumerated device"
+                    )
+                except Exception as e:  # noqa: BLE001 - recovery must never crash the watch loop
+                    _tlog(f"INPUT STALL | usb power-cycle FAILED: {type(e).__name__}: {e}")
+                self._restarts = 0  # give the reopen path a fresh round on the cold-restarted device
+                return
             if self._restarts == self._max_restarts:
                 self._restarts += 1  # run the give-up path exactly once
                 _tlog(
