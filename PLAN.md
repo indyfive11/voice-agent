@@ -1,13 +1,20 @@
-# Plan: Voice Agent — as-built architecture (reconciled 2026-06-20)
+# Plan: Voice Agent — as-built architecture (reconciled 2026-06-20; re-verified 2026-07-13)
 
-This is the **current, authoritative** description of the system as built. It supersedes the original
-v1 implementation plan, which is archived for reference at
+This is the **current, authoritative** description of the system **as built** (the *what it is / how
+it's wired*). It supersedes the original v1 implementation plan, which is archived for reference at
 [`docs/PLAN_v1_original.md`](docs/PLAN_v1_original.md) (deprecated — read this file, not that one).
+
+**For the charter, the anti-drift gate, and the forward plan (Now/Next/Deferred/Someday/Shipped),
+see [`ROADMAP.md`](ROADMAP.md) — the single plan-of-record.** This file is the architecture record;
+ROADMAP.md is what we're doing and why. Granular bug/tuning detail lives in the internal tracker.
 
 The v1 Phase 0–5 foundation (Pipecat, local-first STT/Claude/TTS, `uv` venv, swappable providers)
 shipped as planned. The architecture then **diverged in two major ways** that v1 never anticipated;
-both are now load-bearing and are documented here. Open bugs, tuning, and feature roadmap live in
-[`TRACKER.md`](TRACKER.md).
+both are now load-bearing and are documented here.
+
+**Charter, in one line:** voice-agent is a **voice user interface (VUI)** — a thin voice shell that
+owns audio and delegates *all* cognition to a swappable brain over its HTTP/SSE protocol.
+Brain-agnostic by protocol, not vendor (gabagent is the *reference* brain, never a hardcode).
 
 ---
 
@@ -35,8 +42,8 @@ to whatever brain `BRAIN=` selects:
 - `BRAIN=local` — a raw LLM brain (still uses `config.build_llm()`; default `claude-sonnet-4-6`,
   swappable to OpenAI-compatible or local Ollama on the RX 7900 XT).
 - `BRAIN=gabagent` — the full agent: tools + escalating-tier safety + media control + an
-  addressing/aside classifier. Released independently (currently **v0.5.1**, own AUR package, own
-  test suite).
+  addressing/aside classifier. Released independently (own repo, own AUR package, own test suite;
+  version tracked brain-side, not here).
 
 **Why:** the brain grew its own complexity and release cadence; coupling two independently-evolving
 systems in one process was the wrong seam. The split lets the voice shell stay brain-agnostic.
@@ -183,8 +190,10 @@ is idle, asleep, listening, thinking, or speaking.
   2026-06). The 3.12-only cap was solely `speexdsp-ns` (cp312 wheel) — now an optional `[speex]`
   extra. `uv` provisions the interpreter regardless of the 3.14 system python.
 - **Turn detector:** SmartTurn **V3** (v1 was updated V2→V3 before build; shipped on V3).
-- **GPU STT:** v1's "optional later" whisper.cpp+Vulkan offload — **never needed**; CPU Whisper is
-  faster-than-real-time. Correctly deferred indefinitely.
+- **GPU STT:** v1 called whisper.cpp+Vulkan an "optional later" offload and CPU Whisper "not needed
+  for v1." **Reversed as built** — a shared GPU whisper.cpp/Vulkan **large-v3-turbo** server ships and
+  runs live on the reference workstation (`7ae0fd8`, 06-22); it's the STT-accuracy lever, not just a
+  speed one. CPU faster-whisper remains the default/portable fallback.
 - **Provider swaps:** Deepgram / Cartesia / ElevenLabs / Ollama are wired per v1 but **only
   Kokoro + Whisper + Claude/gabagent are exercised live.** The cloud/local-LLM swaps are unproven
   in practice — treat as "wired, not verified."
@@ -229,16 +238,8 @@ now exercise the **brain**, but the test intent is unchanged.
 
 ## Roadmap / open work
 
-Tracked in [`TRACKER.md`](TRACKER.md). Current themes (all in the wake/duck/brain-split architecture
-above, not the v1 foundation, which is done):
-
-- **Voice-side:** wake false-positives over music (next lever: `capture_selfneg.sh` self-negatives);
-  wake recall over a loud movie (held pending brain wrong-sink fix); dedicated stop-word barge-in
-  model; STT mis-expanding the bare wake ("Hey Aria" → "Hey, how are you?") — next priority, needs a
-  better STT engine and/or an out-of-band wake-confidence signal. *(Done this cycle: SmartTurn-honoring
-  endpointing, duck single-writer, runtime voice-volume control, `bot_speaking` watchdog refresh,
-  convo-hold 8s.)*
-- **Brain-side (gabagent):** reconcile-vs-duck-off race stranding the music sink quiet; TIDAL search
-  latency (~15s); resume-from-position-0.
-- **Cross-project:** decouple gabagent-specific naming (GitHub #1); whole-home / multi-room (Home
-  Assistant seam) + timers.
+**The forward plan is [`ROADMAP.md`](ROADMAP.md)** (charter → ship-the-PoC gate →
+Now/Next/Deferred/Someday/Cut/Shipped). Granular bug/tuning detail and device-specific state live in
+the internal tracker. The current north star: **publish the self-provisioning thin-client PoC**
+(installer packaging, auto-detect LAN brain, HW-tiering, protocol de-branding / GitHub #1) — nothing
+new-domain enters until it ships.
