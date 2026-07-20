@@ -154,3 +154,82 @@ def test_http_health_ok_false_on_error(monkeypatch):
 
     monkeypatch.setattr(urllib.request, "urlopen", _boom)
     assert d.http_health_ok("192.168.1.10", 8765, timeout=0.1) is False
+
+
+# --------------------------------------------------------- reresolve_brain_host_async
+# Sync tests drive the coroutine via asyncio.run (no pytest-asyncio dependency).
+import asyncio
+
+
+def _reresolve(**kw):
+    return asyncio.run(d.reresolve_brain_host_async(**kw))
+
+
+def test_reresolve_skips_loopback_written_host():
+    # a local brain is never re-resolved onto another box; probe must not even run
+    def _probe(_h, _p):
+        raise AssertionError("probe must not be called for a loopback host")
+    host, reason = _reresolve(written_host="127.0.0.1", port=8765, probe_fn=_probe)
+    assert (host, reason) == ("127.0.0.1", "loopback-skip")
+
+
+def test_reresolve_keeps_reachable_and_never_browses():
+    def _discover():
+        raise AssertionError("must not browse when the written host is reachable")
+    host, reason = _reresolve(
+        written_host="10.0.0.5", port=8765,
+        probe_fn=lambda h, p: True, discover_fn=_discover,
+    )
+    assert (host, reason) == ("10.0.0.5", "written-reachable")
+
+
+def test_reresolve_adopts_routable_rediscovery_when_unreachable():
+    host, reason = _reresolve(
+        written_host="10.0.0.5", port=8765,
+        probe_fn=lambda h, p: False,
+        discover_fn=lambda: BrainEndpoint("10.0.0.9", 8765, "mdns"),
+    )
+    assert (host, reason) == ("10.0.0.9", "rediscovered")
+
+
+def test_reresolve_keeps_written_on_discovery_miss():
+    host, reason = _reresolve(
+        written_host="10.0.0.5", port=8765,
+        probe_fn=lambda h, p: False,
+        discover_fn=lambda: None,
+    )
+    assert (host, reason) == ("10.0.0.5", "written-kept")
+
+
+def test_reresolve_rejects_loopback_rediscovery():
+    # a discovery that somehow yields loopback must never overwrite a good written host
+    host, reason = _reresolve(
+        written_host="10.0.0.5", port=8765,
+        probe_fn=lambda h, p: False,
+        discover_fn=lambda: BrainEndpoint("127.0.0.1", 8765, "mdns"),
+    )
+    assert (host, reason) == ("10.0.0.5", "written-kept")
+
+
+def test_reresolve_never_raises_returns_error_kept():
+    def _boom(_h, _p):
+        raise RuntimeError("probe blew up")
+    host, reason = _reresolve(written_host="10.0.0.5", port=8765, probe_fn=_boom)
+    assert (host, reason) == ("10.0.0.5", "error-kept")
+
+
+# --------------------------------------------------------------------- _room_matches
+@pytest.mark.parametrize(
+    "advertised,want_room,expected",
+    [
+        (None, None, True),                 # satellite asks nothing → match anything
+        (b"bedroom", None, True),             # satellite asks nothing → match a named brain too
+        (None, b"bedroom", True),             # advert has no room_id → default brain, matches
+        (b"", b"bedroom", True),              # advert empty room_id → single-room default, matches (the PoC path)
+        (b"bedroom", b"bedroom", True),         # exact room match
+        (b"kitchen", b"bedroom", False),      # a genuinely different room's brain → skip
+        (b"", None, True),                  # empty advert + no ask → match
+    ],
+)
+def test_room_matches(advertised, want_room, expected):
+    assert d._room_matches(advertised, want_room) is expected

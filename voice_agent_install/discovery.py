@@ -73,6 +73,23 @@ def is_loopback(host: str) -> bool:
     )
 
 
+def _room_matches(advertised: Optional[bytes], want_room: Optional[bytes]) -> bool:
+    """Room-filter policy for an mDNS advert (contract with the brain advertiser).
+
+    - the satellite asks for no particular room (``want_room is None``) → match anything.
+    - the advert carries an ABSENT or EMPTY ``room_id`` → it's the default/only brain and ALWAYS
+      matches (a single-room brain advertises ``room_id=""`` and must be found even when the satellite
+      asks for its hostname-defaulted room).
+    - only a NON-EMPTY advertised room that DIFFERS from the requested one is a genuinely other room's
+      brain → no match.
+    """
+    if want_room is None:
+        return True
+    if not advertised:  # None or b"" → default/only brain
+        return True
+    return advertised == want_room
+
+
 def decide_host(
     written_host: str,
     reachable: bool,
@@ -150,10 +167,8 @@ def mdns_discover(
             info = zc.get_service_info(type_, name, timeout=info_timeout_ms)
             if info is None:
                 return
-            if want_room is not None:
-                rid = (info.properties or {}).get(b"room_id")
-                if rid is not None and rid != want_room:
-                    return  # a different room's brain — keep browsing
+            if not _room_matches((info.properties or {}).get(b"room_id"), want_room):
+                return  # a different room's brain — keep browsing
             for addr in info.parsed_addresses():
                 if not is_loopback(addr):
                     found["host"] = addr
@@ -235,3 +250,63 @@ def default_providers(
         lambda: mdns_discover(room_id=room_id),
         lambda: manual_prompt(input_fn=input_fn),
     )
+
+
+# --------------------------------------------------------------- in-app boot re-resolve
+async def reresolve_brain_host_async(
+    written_host: str,
+    port: int,
+    *,
+    room_id: Optional[str] = None,
+    health_timeout: float = HEALTH_PROBE_TIMEOUT,
+    browse_timeout: float = MDNS_BROWSE_TIMEOUT,
+    probe_fn: Optional[Callable[[str, int], bool]] = None,
+    discover_fn: Optional[Callable[[], Optional[BrainEndpoint]]] = None,
+) -> tuple[str, str]:
+    """In-app boot re-resolve of the brain host — the async runtime counterpart to the
+    install-time seam. Returns ``(host, reason)`` (same shape as :func:`decide_host`).
+
+    This is the SANCTIONED form of "re-find the brain at boot" (Tier-0 boot-safety): a
+    plain library call inside the app's async startup, NEVER a systemd ``ExecStartPre``/
+    oneshot with a remote dependency. Bounded and non-fatal by construction:
+
+    - a loopback ``written_host`` is a local brain → skip (never re-resolve to another box).
+    - ONE bounded ``GET /health`` on the written host; reachable → keep it, no browse.
+    - only if unreachable, ONE bounded mDNS browse; then :func:`decide_host` decides —
+      adopt a routable rediscovery, else KEEP the written host (a miss/loopback never
+      overwrites a good value). The app's existing in-process connect-retry then covers a
+      transiently-down brain.
+
+    Worst case = one probe + one browse, each run OFF the event loop via ``asyncio.to_thread``
+    so a slow lookup never stalls the loop. ANY internal error → ``(written_host, "error-kept")``
+    so app startup never dies on discovery. The port is left as written (per-room brains use a
+    stable port; :func:`decide_host` policy is host-only) — a moved port is the operator's
+    manual re-provision, not an auto-adopt.
+
+    ``probe_fn``/``discover_fn`` are injection seams for tests (sync stubs); unset ⇒ the real
+    stdlib health probe and mDNS browse.
+    """
+    import asyncio
+
+    if is_loopback(written_host):
+        return written_host, "loopback-skip"
+
+    async def _probe() -> bool:
+        if probe_fn is not None:
+            return probe_fn(written_host, port)
+        return await asyncio.to_thread(http_health_ok, written_host, port, timeout=health_timeout)
+
+    async def _discover() -> Optional[BrainEndpoint]:
+        if discover_fn is not None:
+            return discover_fn()
+        return await asyncio.to_thread(mdns_discover, timeout=browse_timeout, room_id=room_id)
+
+    try:
+        reachable = await _probe()
+        discovered_host: Optional[str] = None
+        if not reachable:
+            endpoint = await _discover()
+            discovered_host = endpoint.host if endpoint is not None else None
+        return decide_host(written_host, reachable, discovered_host)
+    except Exception:
+        return written_host, "error-kept"
