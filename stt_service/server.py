@@ -212,6 +212,24 @@ class SttApp:
         return web.json_response({"text": text, "room_id": room_id})
 
 
+def _bind_is_loopback(host: str) -> bool:
+    """True if ``host`` is a loopback bind (safe to run without a token).
+
+    ``0.0.0.0``/``::`` are the unspecified addresses — they bind EVERY interface, so they are the most
+    exposed bind there is, never loopback. Anything unparseable is treated as non-loopback: a bind we
+    cannot classify must not be granted the no-token exemption.
+    """
+    import ipaddress
+
+    h = (host or "").strip().lower()
+    if h in ("localhost", ""):
+        return h == "localhost"
+    try:
+        return ipaddress.ip_address(h).is_loopback
+    except ValueError:
+        return False
+
+
 def build_app(model=None, *, token: str = "", max_concurrency: int = 1, backend=None) -> web.Application:
     """Build the aiohttp app. Pass either a faster-whisper `model` (wrapped in FasterWhisperBackend) or a
     ready `backend` directly; both are injectable so tests pass a fake (no model load / no GPU server)."""
@@ -237,11 +255,22 @@ def main() -> None:
 
     token = os.environ.get("STT_SERVICE_AUTH_TOKEN", "")
     max_concurrency = int(os.environ.get("EM_STT_MAX_CONCURRENCY", "1"))
-    if args.host not in ("127.0.0.1", "localhost", "::1") and not token.strip():
-        logger.warning(
-            f"STT service binding {args.host} (non-loopback) with NO auth token — "
-            "set STT_SERVICE_AUTH_TOKEN so the LAN-reachable /stt requires a bearer token."
-        )
+    # LAN bind + no token = an open transcription service on the network. This used to be a warning; a
+    # warning in a log nobody tails is indistinguishable from a correctly-secured deploy (`/health` answers
+    # `ok` either way), which is the fail-soft-becomes-silent-absence class. Refuse instead, with an
+    # explicit opt-out for a deliberately-open deployment — strong default, gated exception.
+    if not _bind_is_loopback(args.host) and not token.strip():
+        if os.environ.get("STT_SERVICE_ALLOW_OPEN", "") in ("1", "true", "True"):
+            logger.warning(
+                f"STT service binding {args.host} (non-loopback) with NO auth token — "
+                "running OPEN because STT_SERVICE_ALLOW_OPEN is set. Anyone on the LAN can transcribe."
+            )
+        else:
+            raise SystemExit(
+                f"REFUSING to bind {args.host}:{args.port} with no auth token — /stt would be open to "
+                "the whole LAN. Set STT_SERVICE_AUTH_TOKEN (recommended), bind 127.0.0.1, or set "
+                "STT_SERVICE_ALLOW_OPEN=1 if an open service is genuinely what you want."
+            )
 
     backend = _load_backend()
     app = build_app(backend=backend, token=token, max_concurrency=max_concurrency)

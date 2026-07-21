@@ -279,6 +279,21 @@ class TtsApp:
         return resp
 
 
+def _bind_is_loopback(host: str) -> bool:
+    """True if ``host`` is a loopback bind (safe to run without a token). See the STT twin: ``0.0.0.0``/
+    ``::`` bind every interface and are never loopback, and an unparseable bind is treated as
+    non-loopback so it cannot claim the no-token exemption."""
+    import ipaddress
+
+    h = (host or "").strip().lower()
+    if h in ("localhost", ""):
+        return h == "localhost"
+    try:
+        return ipaddress.ip_address(h).is_loopback
+    except ValueError:
+        return False
+
+
 def build_app(kokoro, *, token: str = "", default_voice: str = "af_heart", max_concurrency: int = 1,
               cache_size: int = 64, prewarm_phrases=()) -> web.Application:
     """Build the aiohttp app. `kokoro` is injectable so tests pass a fake (no model load)."""
@@ -310,11 +325,19 @@ def main() -> None:
     # Optional: phrases to synth into the cache at startup (so even the FIRST occurrence is instant — e.g.
     # the brain-down/error apologies). '|'-separated. Unset = cache-on-first-use only (default behavior).
     prewarm = [p for p in (os.environ.get("TTS_PREWARM_PHRASES", "") or "").split("|") if p.strip()]
-    if args.host not in ("127.0.0.1", "localhost", "::1") and not token.strip():
-        logger.warning(
-            f"TTS service binding {args.host} (non-loopback) with NO auth token — "
-            "set TTS_SERVICE_AUTH_TOKEN so the LAN-reachable /tts requires a bearer token."
-        )
+    # See the STT twin: a warning here is indistinguishable from a secured deploy, so refuse instead.
+    if not _bind_is_loopback(args.host) and not token.strip():
+        if os.environ.get("TTS_SERVICE_ALLOW_OPEN", "") in ("1", "true", "True"):
+            logger.warning(
+                f"TTS service binding {args.host} (non-loopback) with NO auth token — "
+                "running OPEN because TTS_SERVICE_ALLOW_OPEN is set. Anyone on the LAN can synthesize."
+            )
+        else:
+            raise SystemExit(
+                f"REFUSING to bind {args.host}:{args.port} with no auth token — /tts would be open to "
+                "the whole LAN. Set TTS_SERVICE_AUTH_TOKEN (recommended), bind 127.0.0.1, or set "
+                "TTS_SERVICE_ALLOW_OPEN=1 if an open service is genuinely what you want."
+            )
 
     kokoro = _load_kokoro()
     app = build_app(kokoro, token=token, default_voice=default_voice, max_concurrency=max_concurrency,
