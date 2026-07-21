@@ -183,13 +183,44 @@ def test_reresolve_keeps_reachable_and_never_browses():
     assert (host, reason) == ("10.0.0.5", "written-reachable")
 
 
-def test_reresolve_adopts_routable_rediscovery_when_unreachable():
+def test_reresolve_adopts_rediscovery_only_after_confirm_probe():
+    # written host down, discovered host answers /health → adopt. The confirm-probe is what earns
+    # the word "rediscovered": zeroconf answers from cache, so the advert alone proves nothing.
+    probed: list[str] = []
+
+    def _probe(h, _p):
+        probed.append(h)
+        return h == "10.0.0.9"
+
     host, reason = _reresolve(
         written_host="10.0.0.5", port=8765,
-        probe_fn=lambda h, p: False,
+        probe_fn=_probe,
         discover_fn=lambda: BrainEndpoint("10.0.0.9", 8765, "mdns"),
     )
     assert (host, reason) == ("10.0.0.9", "rediscovered")
+    assert probed == ["10.0.0.5", "10.0.0.9"]  # written first, then the confirm
+
+
+def test_reresolve_keeps_written_when_advert_fails_confirm_probe():
+    # THE cache-stale case: a brain that died inside its mDNS TTL still resolves. Adopting it would
+    # swap a merely-unreachable host for a definitely-unreachable one and log a success never observed.
+    host, reason = _reresolve(
+        written_host="10.0.0.5", port=8765,
+        probe_fn=lambda h, p: False,  # nothing is reachable, including the advert
+        discover_fn=lambda: BrainEndpoint("10.0.0.9", 8765, "mdns"),
+    )
+    assert (host, reason) == ("10.0.0.5", "written-kept(unconfirmed)")
+
+
+def test_reresolve_reports_port_divergence_instead_of_silently_pointing_at_a_dead_port():
+    host, reason = _reresolve(
+        written_host="10.0.0.5", port=8765,
+        probe_fn=lambda h, p: h == "10.0.0.9",
+        discover_fn=lambda: BrainEndpoint("10.0.0.9", 8766, "mdns"),
+    )
+    assert host == "10.0.0.9"
+    assert reason.startswith("rediscovered(")
+    assert "advert-port=8766" in reason and "8765" in reason
 
 
 def test_reresolve_keeps_written_on_discovery_miss():
@@ -198,7 +229,7 @@ def test_reresolve_keeps_written_on_discovery_miss():
         probe_fn=lambda h, p: False,
         discover_fn=lambda: None,
     )
-    assert (host, reason) == ("10.0.0.5", "written-kept")
+    assert (host, reason) == ("10.0.0.5", "written-kept(no-adverts)")
 
 
 def test_reresolve_rejects_loopback_rediscovery():
@@ -208,7 +239,58 @@ def test_reresolve_rejects_loopback_rediscovery():
         probe_fn=lambda h, p: False,
         discover_fn=lambda: BrainEndpoint("127.0.0.1", 8765, "mdns"),
     )
-    assert (host, reason) == ("10.0.0.5", "written-kept")
+    assert (host, reason) == ("10.0.0.5", "written-kept(loopback-advert)")
+
+
+def test_reresolve_miss_distinguishes_filtered_from_no_adverts():
+    # "nothing was advertising" and "brains advertised but the room filter rejected them" are the same
+    # outcome but completely different diagnoses — the second is an operator misconfiguration.
+    shared: dict = {}
+
+    def _discover():
+        shared.update({"seen": 2, "filtered": 2})
+        return None
+
+    host, reason = _reresolve(
+        written_host="10.0.0.5", port=8765,
+        probe_fn=lambda h, p: False, discover_fn=_discover, stats=shared,
+    )
+    assert (host, reason) == ("10.0.0.5", "written-kept(filtered=2)")
+
+
+def test_mdns_discover_seeds_stats_even_when_zeroconf_absent(monkeypatch):
+    real_import = builtins.__import__
+
+    def _no_zeroconf(name, *a, **kw):
+        if name == "zeroconf":
+            raise ImportError("no zeroconf")
+        return real_import(name, *a, **kw)
+
+    monkeypatch.setattr(builtins, "__import__", _no_zeroconf)
+    stats: dict = {}
+    assert d.mdns_discover(stats=stats) is None
+    assert stats == {"seen": 0, "filtered": 0}
+
+
+def test_reresolve_skips_a_non_ip_written_host():
+    # a hostname has an unbounded getaddrinfo phase that urlopen's timeout does not cover, so we
+    # refuse to probe it at all rather than pretend it is bounded. The probe must not run.
+    def _probe(_h, _p):
+        raise AssertionError("probe must not be called for a non-IP host")
+
+    host, reason = _reresolve(written_host="brain.local", port=8765, probe_fn=_probe)
+    assert (host, reason) == ("brain.local", "not-ip-skip")
+
+
+@pytest.mark.parametrize(
+    "host,expected",
+    [
+        ("192.168.1.100", True), ("10.0.0.5", True), ("::1", True), ("fe80::1", True),
+        ("brain.local", False), ("em", False), ("", False), ("192.168.1.100:8765", False),
+    ],
+)
+def test_is_ip_literal(host, expected):
+    assert d.is_ip_literal(host) is expected
 
 
 def test_reresolve_never_raises_returns_error_kept():

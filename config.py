@@ -1709,6 +1709,106 @@ def build_wake_word_gate(llm):
 
 
 # --------------------------------------------------------------------------- brain lifecycle
+# --------------------------------------------------------------------------- boot re-resolve
+def _swap_url_host(url: str, new_host: str) -> str:
+    """``url`` with its hostname replaced by ``new_host``; scheme/port/path/credentials preserved."""
+    from urllib.parse import urlsplit, urlunsplit
+
+    parts = urlsplit(url)
+    netloc = new_host if parts.port is None else f"{new_host}:{parts.port}"
+    if parts.username:
+        cred = parts.username + (f":{parts.password}" if parts.password else "")
+        netloc = f"{cred}@{netloc}"
+    return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+
+
+def _repoint_remote_services(old_host: str, new_host: str) -> None:
+    """Follow the brain to its new address for the remote STT/TTS offload services.
+
+    WHY: on the flagship Pi satellite the brain, STT and TTS all live on the same box, and
+    ``STT_REMOTE_URL``/``TTS_REMOTE_URL`` are absolute + pinned. Re-resolving ONLY the brain would leave
+    that satellite with a rediscovered brain and still deaf and mute — the feature would not fix the one
+    install that has the problem it exists for.
+
+    Rewrites a URL ONLY when its host is the OLD brain host, so a service that genuinely lives on a third
+    box is never blind-repointed.
+    """
+    from urllib.parse import urlsplit
+
+    for key in ("STT_REMOTE_URL", "TTS_REMOTE_URL"):
+        url = _env(key)
+        if not url:
+            continue
+        try:
+            if urlsplit(url).hostname != old_host:
+                continue
+            updated = _swap_url_host(url, new_host)
+        except Exception:
+            continue  # a malformed URL is build_stt/build_tts's problem to report, not ours to crash on
+        os.environ[key] = updated
+        logger.info(f"BRAIN | re-resolve: {key} {url} -> {updated}")
+
+
+async def reresolve_brain_host() -> None:
+    """Boot re-resolve of the external brain's host (see ``voice_agent_install.discovery``).
+
+    OFF BY DEFAULT (``BRAIN_REDISCOVER=0``) — the maintainer's call 2026-07-20, and the portability SOP's
+    "safe universal default = the historical no-op": an install that never asked for discovery must
+    behave byte-for-byte as before. Adoption is a real trust decision, not a convenience: mDNS is
+    unauthenticated and spoofable, and the adopted host receives ``GAB_AUTH_TOKEN`` as a client-wide
+    bearer header plus everything the user says. The PoC's auto-detect still happens at INSTALL time,
+    which is operator-supervised. Opt in per box with ``BRAIN_REDISCOVER=1``.
+
+    Fail-soft on EVERY path, and that is load-bearing rather than defensive: ``main()`` catches only
+    ``KeyboardInterrupt`` and the user unit is ``Restart=on-failure`` with ``StartLimitBurst=5``, so an
+    escaping exception here (a partially-synced satellite missing ``voice_agent_install``, say) would
+    crash-loop five times and leave voice-agent PERMANENTLY dead until a manual reset. A discovery
+    failure must never be able to do that.
+
+    The outer ``wait_for`` is the only hard bound in the system: the callee's internal timeouts are
+    promises (``urlopen``'s timeout excludes DNS and is per-address; ``asyncio.to_thread`` cannot be
+    cancelled), so startup is bounded here even when they are exceeded. A wedged worker thread can
+    still outlive us, but it no longer holds up boot.
+    """
+    import asyncio
+
+    if (_env("BRAIN", "local") or "local").lower() != "gabagent":
+        return  # a local LLM brain has no host to find
+    if (_env("BRAIN_REDISCOVER", "0") or "0") in ("0", "false", "False", "no"):
+        return  # historical no-op
+
+    host = _env("GAB_HOST", "127.0.0.1") or "127.0.0.1"
+    try:
+        port = int(_env("GAB_PORT", "8765") or 8765)
+    except ValueError:
+        logger.warning("BRAIN | re-resolve skipped: GAB_PORT is not an integer")
+        return
+    try:
+        budget = float(_env("BRAIN_RERESOLVE_BUDGET_SECS", "9.0") or 9.0)
+    except ValueError:
+        budget = 9.0
+
+    try:
+        from voice_agent_install.discovery import reresolve_brain_host_async
+
+        new_host, reason = await asyncio.wait_for(
+            reresolve_brain_host_async(host, port, room_id=_room_id()), timeout=budget
+        )
+    except asyncio.TimeoutError:
+        logger.warning(f"BRAIN | re-resolve exceeded {budget}s budget — keeping written host {host}")
+        return
+    except Exception as e:  # incl. ImportError on a partially-synced satellite
+        logger.warning(f"BRAIN | re-resolve unavailable ({type(e).__name__}: {e}) — keeping {host}")
+        return
+
+    if new_host != host:
+        os.environ["GAB_HOST"] = new_host
+        logger.info(f"BRAIN | re-resolve: {host} -> {new_host} ({reason})")
+        _repoint_remote_services(host, new_host)
+    else:
+        logger.info(f"BRAIN | re-resolve: keeping {host} ({reason})")
+
+
 async def start_brain(llm) -> None:
     """If `llm` wraps an external brain that needs starting (spawn + health), do it.
 

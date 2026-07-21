@@ -160,6 +160,15 @@ async def run() -> None:
     # obvious cause — 2026-06-15). Diagnostic only; the app never force-unmutes the user's master volume.
     await config.warn_if_output_muted()
 
+    # A satellite's written GAB_HOST goes stale when the brain box changes address (DHCP / rehome).
+    # Probe it once and, ONLY if unreachable, do one bounded mDNS browse + confirm-probe and adopt a
+    # verified new host (also following it for the remote STT/TTS offload URLs, which are pinned at the
+    # same box — otherwise the satellite re-finds its brain and stays deaf and mute). Runs HERE, ahead of
+    # build_stt/build_tts/build_llm, because all three read the addresses this may rewrite.
+    # OFF by default (BRAIN_REDISCOVER=1 to opt in); bounded, fail-soft, and a miss never overwrites a
+    # good host. Tier-0 boot-safety: an in-app library call, never a systemd remote dependency.
+    await config.reresolve_brain_host()
+
     transport = config.build_transport()
     stt = config.build_stt()
     tts = config.build_tts()

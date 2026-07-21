@@ -45,9 +45,20 @@ BRAIN_MDNS_TYPE = "_voice-brain._tcp.local."
 # Matches config.py's GAB_PORT default (the brain's per-room HTTP/SSE port).
 DEFAULT_BRAIN_PORT = 8765
 
-# Boot-safety budgets (seconds). probe + browse worst case = 8s < the 10s ceiling.
-HEALTH_PROBE_TIMEOUT = 3.0
-MDNS_BROWSE_TIMEOUT = 5.0
+# Boot-safety budgets (seconds). Re-budgeted 2026-07-20 after a 4-way adversarial pass found the old
+# 3+5=8-against-a-10s-ceiling had NO headroom and was not actually enforced anywhere:
+#   - `urlopen(timeout=)` is applied PER RESOLVED ADDRESS and excludes `getaddrinfo` entirely (measured:
+#     timeout=1.0 against 3 blackhole addresses returned in 3.01s), so a hostname host is unbounded →
+#     `reresolve_brain_host_async` now refuses to probe a non-IP-literal host at all (see is_ip_literal).
+#   - the per-advert `get_service_info` resolve used to be handed the WHOLE browse budget, so one slow
+#     advert on zeroconf's callback thread could eat the entire browse and starve the right brain's
+#     callback — a miss DESPITE the brain advertising. It gets its own small slice now.
+# Worst case is probe + confirm-probe + browse = 8.0s, and the CALLER still wraps the whole thing in a hard
+# outer deadline (config.reresolve_brain_host) because these are the callee's promises, not a guarantee.
+HEALTH_PROBE_TIMEOUT = 2.0
+MDNS_BROWSE_TIMEOUT = 4.0
+# Per-advert resolve slice — deliberately a small fraction of the browse budget, never equal to it.
+MDNS_INFO_TIMEOUT = 1.0
 
 
 @dataclass(frozen=True)
@@ -71,6 +82,23 @@ def is_loopback(host: str) -> bool:
         h in ("localhost", "::1", "0.0.0.0", "::")
         or h.startswith("127.")
     )
+
+
+def is_ip_literal(host: str) -> bool:
+    """True if ``host`` is a bare IPv4/IPv6 address rather than a name.
+
+    Load-bearing for boot-safety, not cosmetics: ``urllib``'s ``timeout=`` is applied per-resolved-address
+    and covers no part of ``getaddrinfo``, so probing a NAME has an unbounded DNS phase that nothing in
+    this module can bound (an nss-mdns lookup with Avahi down is the ~5s stall this file's own header
+    warns about). ``GAB_HOST`` is a free-form hand-edited field, so the guard has to live here.
+    """
+    import ipaddress
+
+    try:
+        ipaddress.ip_address((host or "").strip())
+        return True
+    except ValueError:
+        return False
 
 
 def _room_matches(advertised: Optional[bytes], want_room: Optional[bytes]) -> bool:
@@ -137,6 +165,8 @@ def mdns_discover(
     timeout: float = MDNS_BROWSE_TIMEOUT,
     service_type: str = BRAIN_MDNS_TYPE,
     room_id: Optional[str] = None,
+    info_timeout: float = MDNS_INFO_TIMEOUT,
+    stats: Optional[dict] = None,
 ) -> Optional[BrainEndpoint]:
     """Single bounded mDNS browse for the brain advert. Fail-soft by construction:
 
@@ -149,7 +179,18 @@ def mdns_discover(
     with the ``Zeroconf`` instance always closed in ``finally`` so no browser thread
     or socket outlives the call (GA reinforcement — discovery never leaks a thread
     out of startup, just as it never raises out of it).
+
+    ``info_timeout`` bounds EACH advert's resolve and is deliberately a small fraction of ``timeout``:
+    handing a per-advert resolve the whole browse budget lets one slow advert on zeroconf's callback
+    thread starve the right brain's callback, producing a miss even though the brain was advertising.
+
+    ``stats`` (optional) is filled in place with ``{"seen": n, "filtered": m}`` so a caller can tell
+    "nothing was advertising" apart from "a brain advertised and I filtered it out as another room's" —
+    the second is an operator misconfiguration and is otherwise invisible.
     """
+    if stats is not None:
+        stats.setdefault("seen", 0)
+        stats.setdefault("filtered", 0)
     try:
         from zeroconf import Zeroconf, ServiceBrowser, ServiceListener
     except Exception:
@@ -160,14 +201,18 @@ def mdns_discover(
     found: dict[str, object] = {}
     done = threading.Event()
     want_room = room_id.encode() if room_id is not None else None
-    info_timeout_ms = max(1, int(timeout * 1000))
+    info_timeout_ms = max(1, int(info_timeout * 1000))
 
     class _Listener(ServiceListener):  # type: ignore[misc]
         def _consider(self, zc, type_, name):
             info = zc.get_service_info(type_, name, timeout=info_timeout_ms)
             if info is None:
                 return
+            if stats is not None:
+                stats["seen"] += 1
             if not _room_matches((info.properties or {}).get(b"room_id"), want_room):
+                if stats is not None:
+                    stats["filtered"] += 1
                 return  # a different room's brain — keep browsing
             for addr in info.parsed_addresses():
                 if not is_loopback(addr):
@@ -262,6 +307,7 @@ async def reresolve_brain_host_async(
     browse_timeout: float = MDNS_BROWSE_TIMEOUT,
     probe_fn: Optional[Callable[[str, int], bool]] = None,
     discover_fn: Optional[Callable[[], Optional[BrainEndpoint]]] = None,
+    stats: Optional[dict] = None,
 ) -> tuple[str, str]:
     """In-app boot re-resolve of the brain host — the async runtime counterpart to the
     install-time seam. Returns ``(host, reason)`` (same shape as :func:`decide_host`).
@@ -271,42 +317,73 @@ async def reresolve_brain_host_async(
     oneshot with a remote dependency. Bounded and non-fatal by construction:
 
     - a loopback ``written_host`` is a local brain → skip (never re-resolve to another box).
+    - a NON-IP-LITERAL ``written_host`` → skip: its DNS phase is unbounded and nothing here can
+      bound it (see :func:`is_ip_literal`). Boot-safety beats convenience; the manual host still works.
     - ONE bounded ``GET /health`` on the written host; reachable → keep it, no browse.
-    - only if unreachable, ONE bounded mDNS browse; then :func:`decide_host` decides —
-      adopt a routable rediscovery, else KEEP the written host (a miss/loopback never
-      overwrites a good value). The app's existing in-process connect-retry then covers a
-      transiently-down brain.
+    - only if unreachable, ONE bounded mDNS browse, then **one bounded confirm-probe of the discovered
+      host before adopting it**. zeroconf answers from its cache, so an advert on its own is NOT
+      evidence the brain is up: adopting on the advert alone would swap a merely-unreachable host for a
+      definitely-unreachable one while logging "rediscovered" — a success claim never observed. Only a
+      200 earns adoption; otherwise :func:`decide_host` KEEPS the written host.
 
-    Worst case = one probe + one browse, each run OFF the event loop via ``asyncio.to_thread``
-    so a slow lookup never stalls the loop. ANY internal error → ``(written_host, "error-kept")``
-    so app startup never dies on discovery. The port is left as written (per-room brains use a
-    stable port; :func:`decide_host` policy is host-only) — a moved port is the operator's
-    manual re-provision, not an auto-adopt.
+    Worst case = probe + browse + confirm-probe, each run OFF the event loop via ``asyncio.to_thread``
+    so a slow lookup never stalls the loop. ANY internal error → ``(written_host, "error-kept")`` so app
+    startup never dies on discovery. These are the callee's promises, not a guarantee — ``to_thread`` is
+    not cancellable, so the CALLER must still impose a hard outer deadline.
+
+    The port is left as written (per-room brains use a stable port; :func:`decide_host` policy is
+    host-only) — a moved port is the operator's manual re-provision, not an auto-adopt. But a divergence
+    is reported in the reason rather than swallowed: silently pointing at a live host on a dead port is
+    the confusing failure this used to produce.
+
+    The ``reason`` is deliberately diagnosable — ``written-kept(no-adverts)`` (nothing was advertising)
+    reads differently from ``written-kept(filtered=2)`` (brains advertised; the room filter rejected
+    them), which is an operator misconfiguration that is otherwise invisible.
 
     ``probe_fn``/``discover_fn`` are injection seams for tests (sync stubs); unset ⇒ the real
-    stdlib health probe and mDNS browse.
+    stdlib health probe and mDNS browse. ``probe_fn`` is called as ``probe_fn(host, port)`` for BOTH the
+    written host and the confirm-probe of a discovered one.
     """
     import asyncio
 
     if is_loopback(written_host):
         return written_host, "loopback-skip"
+    if not is_ip_literal(written_host):
+        return written_host, "not-ip-skip"
 
-    async def _probe() -> bool:
+    stats = {} if stats is None else stats
+
+    async def _probe(host: str) -> bool:
         if probe_fn is not None:
-            return probe_fn(written_host, port)
-        return await asyncio.to_thread(http_health_ok, written_host, port, timeout=health_timeout)
+            return probe_fn(host, port)
+        return await asyncio.to_thread(http_health_ok, host, port, timeout=health_timeout)
 
     async def _discover() -> Optional[BrainEndpoint]:
         if discover_fn is not None:
             return discover_fn()
-        return await asyncio.to_thread(mdns_discover, timeout=browse_timeout, room_id=room_id)
+        return await asyncio.to_thread(
+            mdns_discover, timeout=browse_timeout, room_id=room_id, stats=stats
+        )
 
     try:
-        reachable = await _probe()
-        discovered_host: Optional[str] = None
-        if not reachable:
-            endpoint = await _discover()
-            discovered_host = endpoint.host if endpoint is not None else None
-        return decide_host(written_host, reachable, discovered_host)
+        if await _probe(written_host):
+            return decide_host(written_host, True, None)
+
+        endpoint = await _discover()
+        if endpoint is None:
+            filtered = stats.get("filtered", 0)
+            detail = f"filtered={filtered}" if filtered else "no-adverts"
+            return written_host, f"written-kept({detail})"
+        if is_loopback(endpoint.host):
+            return written_host, "written-kept(loopback-advert)"
+
+        port_note = f",advert-port={endpoint.port}" if endpoint.port != port else ""
+        if not await _probe(endpoint.host):
+            return written_host, f"written-kept(unconfirmed{port_note})"
+
+        host, reason = decide_host(written_host, False, endpoint.host)
+        if port_note:
+            reason = f"{reason}({port_note.lstrip(',')}!={port} — re-provision GAB_PORT)"
+        return host, reason
     except Exception:
         return written_host, "error-kept"
