@@ -32,6 +32,20 @@ Each choice here fixes a specific way the naive translation fails:
 - **No ``Requires=`` on anything remote, ever.** The brain is on another box; boot-safety says a
   remote dependency may never gate startup. An unreachable brain is a degraded start, not a failed
   boot.
+
+**AND THE EXCEPTION THAT IS NOT OURS TO REFUSE — KEEP THE INSTALL ROOT ON A LOCAL FILESYSTEM.**
+Omitting ``Requires=`` from this generator does NOT mean a rendered unit carries none. systemd derives
+an implicit ``RequiresMountsFor=`` — a genuine ``Requires=``/``After=`` on mount units — from every
+path-taking directive, and ``WorkingDirectory=`` is one (``systemd.exec(5)``; measured on a live
+``--user`` manager: ``WorkingDirectory=/tmp`` → ``RequiresMountsFor=/tmp``, ``After=… tmp.mount``).
+``UnitSpec.working_directory`` is REQUIRED, so **every unit this module emits carries one.**
+
+On a local disk that is inert. Point it at NFS, autofs, sshfs or removable media and the satellite's
+unit gains a hard mount dependency on a network filesystem — the Tier-0 cascade-failure shape the rest
+of this docstring exists to forbid, arrived at by a path nobody would think to look for. It is not
+hypothetical for the XDG layout, whose root sits under ``$HOME``, and a home directory on NFS is an
+ordinary deployment. The string leaves here clean and systemd adds the dependency afterwards, so **no
+test of rendered text can catch it** — which is exactly why it is written down instead of guarded.
 """
 
 from __future__ import annotations

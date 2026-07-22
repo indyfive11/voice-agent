@@ -236,3 +236,197 @@ def test_apply_writes_nothing_when_declined(tmp_path):
 
     assert backup is None and changes == {}
     assert env_path.read_text() == "GAB_HOST=10.0.0.1\n"
+
+
+# =================================================================================================== #
+# The DRIVER — the caller these modules did not have.
+#
+# These are still in-process, with every side effect injected, so they prove the flow and NOTHING
+# about whether a real box comes up. What they CAN observe that the previous 26 could not: that the
+# entry point exists, runs, and exits non-zero when it provisions nothing. That is the specific
+# failure this suite was blind to — `python -m voice_agent_install.satellite` used to import the
+# module, run nothing and exit 0, and every green test agreed.
+# =================================================================================================== #
+
+import subprocess
+import sys
+from pathlib import Path
+
+from voice_agent_install import discovery, profile
+
+
+class FakeConsole(sat.Console):
+    """A scripted console: answers come off a list, secrets off another, output is captured."""
+
+    def __init__(self, answers, secrets=("btok", "stok", "ttok")):
+        self._answers = list(answers)
+        self._secrets = list(secrets)
+        self.lines = []
+        super().__init__(input_fn=self._next, secret_fn=lambda p: self._next_secret(),
+                         out=self.lines.append, interactive=True)
+
+    def _next(self, prompt=""):
+        return self._answers.pop(0) if self._answers else ""
+
+    def _next_secret(self):
+        return self._secrets.pop(0) if self._secrets else ""
+
+
+def _endpoint(host="10.0.0.9", port=8765):
+    return lambda: discovery.BrainEndpoint(host, port, "test")
+
+
+def _ok_run(argv):
+    return subprocess.CompletedProcess(list(argv), 0, stdout="", stderr="")
+
+
+def _fail_run_for(match):
+    def run(argv):
+        rc = 1 if match in " ".join(argv) else 0
+        return subprocess.CompletedProcess(list(argv), rc, stdout="", stderr="boom")
+    return run
+
+
+ANSWERS = ["living_room", "mic-name", "spk-name", "aria", "y"]   # room, in, out, wake, confirm
+
+
+def _probes_ok(monkeypatch):
+    monkeypatch.setattr(sat.verify, "probe_brain",
+                        lambda *a, **k: sat.verify.LegResult("brain", True, "ok"))
+    monkeypatch.setattr(sat.verify, "probe_stt",
+                        lambda *a, **k: sat.verify.LegResult("stt", True, "ok"))
+    monkeypatch.setattr(sat.verify, "probe_tts",
+                        lambda *a, **k: sat.verify.LegResult("tts", True, "ok"))
+
+
+# --- the P10 regression: the entry point must not succeed while doing nothing --------------------- #
+
+def test_module_run_as_main_does_not_exit_zero_having_provisioned_nothing():
+    # THE regression. Before main() existed this exited 0 with no output and ignored argv entirely,
+    # so bootstrap.sh reported a successful install of nothing — and a DoD checking $? agreed.
+    out = subprocess.run([sys.executable, "-m", "voice_agent_install.satellite", "--non-interactive"],
+                         capture_output=True, text=True, cwd=str(Path(__file__).resolve().parent.parent))
+    assert out.returncode != 0
+    assert "NOT provisioned" in out.stdout
+
+
+def test_module_exposes_a_real_cli():
+    out = subprocess.run([sys.executable, "-m", "voice_agent_install.satellite", "--help"],
+                         capture_output=True, text=True, cwd=str(Path(__file__).resolve().parent.parent))
+    assert out.returncode == 0
+    for flag in ("--root", "--dry-run", "--non-interactive", "--skip-verify"):
+        assert flag in out.stdout
+
+
+# --- the flow -------------------------------------------------------------------------------------- #
+
+def test_provision_writes_env_unit_and_enables_linger(tmp_path, monkeypatch):
+    _probes_ok(monkeypatch)
+    units_dir = tmp_path / "systemd"
+    calls = []
+
+    def run(argv):
+        calls.append(list(argv))
+        return _ok_run(argv)
+
+    console = FakeConsole(ANSWERS)
+    code, steps = sat.provision(console, root=str(tmp_path), providers=(_endpoint(),),
+                                run=run, unit_dir=units_dir, proc_asound=str(tmp_path / "nope"))
+
+    assert code == sat.EXIT_OK, [str(s) for s in steps]
+    # ARTIFACTS, not step status — the class of bug here is a step reporting success with no output.
+    env_text = (tmp_path / ".env").read_text()
+    for key in profile.REQUIRED_KEYS:
+        assert f"{key}=" in env_text
+    assert oct((tmp_path / ".env").stat().st_mode & 0o777) == "0o600"
+    unit = (units_dir / sat.DEFAULT_UNIT_NAME).read_text()
+    assert "ExecStart=" in unit and str(tmp_path) in unit
+    assert ["systemctl", "--user", "daemon-reload"] in calls
+    assert ["systemctl", "--user", "enable", sat.DEFAULT_UNIT_NAME] in calls
+    assert any(c[:2] == ["loginctl", "enable-linger"] for c in calls)
+
+
+def test_dry_run_writes_absolutely_nothing(tmp_path):
+    console = FakeConsole(ANSWERS)
+    code, _ = sat.provision(console, root=str(tmp_path), providers=(_endpoint(),), dry_run=True,
+                            proc_asound=str(tmp_path / "nope"))
+    assert code == sat.EXIT_OK
+    assert not (tmp_path / ".env").exists()
+
+
+def test_dry_run_output_never_contains_a_token(tmp_path):
+    console = FakeConsole(ANSWERS, secrets=("SUPERSECRET1", "SUPERSECRET2", "SUPERSECRET3"))
+    sat.provision(console, root=str(tmp_path), providers=(_endpoint(),), dry_run=True,
+                  proc_asound=str(tmp_path / "nope"))
+    assert "SUPERSECRET" not in "\n".join(console.lines)
+
+
+def test_declining_the_diff_provisions_nothing_and_enables_nothing(tmp_path):
+    calls = []
+    console = FakeConsole(["living_room", "mic-name", "spk-name", "aria", "n"])   # <- declines
+    code, steps = sat.provision(console, root=str(tmp_path), providers=(_endpoint(),),
+                                run=lambda a: (calls.append(list(a)), _ok_run(a))[1],
+                                unit_dir=tmp_path / "systemd", proc_asound=str(tmp_path / "nope"))
+    assert code == sat.EXIT_PROVISION_FAILED
+    assert calls == []                     # nothing enabled after a refusal
+    assert not (tmp_path / "systemd" / sat.DEFAULT_UNIT_NAME).exists()
+
+
+def test_linger_failure_fails_the_install(tmp_path, monkeypatch):
+    # Without linger a headless satellite never starts after a power cut — the exact remote-hands
+    # dependency this installer removes. It must not scroll past as a warning.
+    _probes_ok(monkeypatch)
+    console = FakeConsole(ANSWERS)
+    code, steps = sat.provision(console, root=str(tmp_path), providers=(_endpoint(),),
+                                run=_fail_run_for("enable-linger"), unit_dir=tmp_path / "systemd",
+                                proc_asound=str(tmp_path / "nope"))
+    assert code == sat.EXIT_PROVISION_FAILED
+    linger = [s for s in steps if s.name == "linger"][0]
+    assert not linger.ok and "enable-linger" in linger.detail
+
+
+def test_unreachable_service_is_a_distinct_exit_code_with_artifacts_intact(tmp_path, monkeypatch):
+    # Config + unit ARE written; a leg did not answer. Collapsing this into EXIT_PROVISION_FAILED
+    # would tell the operator to re-provision when the remedy is to fix the service or the token.
+    monkeypatch.setattr(sat.verify, "probe_brain",
+                        lambda *a, **k: sat.verify.LegResult("brain", False, "unreachable"))
+    monkeypatch.setattr(sat.verify, "probe_stt",
+                        lambda *a, **k: sat.verify.LegResult("stt", True, "ok"))
+    monkeypatch.setattr(sat.verify, "probe_tts",
+                        lambda *a, **k: sat.verify.LegResult("tts", True, "ok"))
+    console = FakeConsole(ANSWERS)
+    code, _ = sat.provision(console, root=str(tmp_path), providers=(_endpoint(),), run=_ok_run,
+                            unit_dir=tmp_path / "systemd", proc_asound=str(tmp_path / "nope"))
+    assert code == sat.EXIT_VERIFY_FAILED
+    assert (tmp_path / ".env").exists()
+    assert (tmp_path / "systemd" / sat.DEFAULT_UNIT_NAME).exists()
+
+
+def test_missing_token_is_an_error_not_an_assumption_that_the_service_is_open(tmp_path):
+    # An absent token is indistinguishable from "deliberately open" to an authenticated probe, so it
+    # must fail BEFORE probing rather than certify a credential the install never had.
+    console = FakeConsole(ANSWERS, secrets=("", "", ""))     # all three left blank
+    code, steps = sat.provision(console, root=str(tmp_path), providers=(_endpoint(),), run=_ok_run,
+                                unit_dir=tmp_path / "systemd", proc_asound=str(tmp_path / "nope"))
+    assert code == sat.EXIT_VERIFY_FAILED
+    assert any(s.name.endswith("-credential") and not s.ok for s in steps)
+
+
+def test_no_brain_host_fails_rather_than_writing_a_broken_config(tmp_path):
+    console = FakeConsole(ANSWERS)
+    code, steps = sat.provision(console, root=str(tmp_path), providers=(lambda: None,),
+                                run=_ok_run, proc_asound=str(tmp_path / "nope"))
+    assert code == sat.EXIT_PROVISION_FAILED
+    assert not (tmp_path / ".env").exists()
+
+
+def test_reprovision_is_idempotent_and_preserves_hand_tuned_keys(tmp_path, monkeypatch):
+    _probes_ok(monkeypatch)
+    (tmp_path / ".env").write_text("# hand-tuned\nWAKE_WORD_THRESHOLD=0.42\n")
+    for _ in range(2):
+        code, _ = sat.provision(FakeConsole(ANSWERS), root=str(tmp_path), providers=(_endpoint(),),
+                                run=_ok_run, unit_dir=tmp_path / "systemd",
+                                proc_asound=str(tmp_path / "nope"))
+        assert code == sat.EXIT_OK
+    text = (tmp_path / ".env").read_text()
+    assert "WAKE_WORD_THRESHOLD=0.42" in text and "# hand-tuned" in text

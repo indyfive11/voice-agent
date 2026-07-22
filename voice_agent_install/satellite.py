@@ -1,6 +1,17 @@
-"""The satellite role provisioner — the piece that had no caller.
+"""The satellite role provisioner, and the entry point ``bootstrap.sh`` hands off to.
 
-This is the module GA's tree-audit was pointing at: ``discover_brain``/``default_providers`` and
+INSTALL-TIME ONLY. Nothing in the running application may import this package: the satellite sync
+manifest is ``git ls-files '*.py'`` + ``run.sh``, so a runtime importer drags every module here onto
+that manifest and any module NOT tracked becomes a guaranteed satellite crash. The one sanctioned
+runtime import is ``config.py``'s boot re-resolve of ``discovery`` alone.
+
+Run as ``python -m voice_agent_install.satellite`` — which is what ``bootstrap.sh`` execs after it has
+provisioned ``uv`` and the venv. Until this module had a ``main()``, that exec imported the module,
+ran nothing, and exited 0: a clean-box install that reported SUCCESS having provisioned nothing.
+Every failure path below therefore exits NON-ZERO, and the summary names the step that failed —
+an installer whose only signal is ``$?`` cannot be trusted if ``$?`` can be 0 for a no-op.
+
+This is also the module GA's tree-audit was pointing at: ``discover_brain``/``default_providers`` and
 ``detect_output_sample_rate`` were built, tested, and imported by nothing outside tests. A seam with
 no caller is unbuilt work that looks shipped. This calls them.
 
@@ -19,13 +30,31 @@ and an unwritten ``STT_REMOTE_URL`` is a hard startup error (``config.py:130``).
 
 from __future__ import annotations
 
+import argparse
+import getpass
+import os
+import subprocess
+import sys
 from dataclasses import dataclass, field
-from typing import Callable, Optional
+from pathlib import Path
+from typing import Callable, Optional, Sequence
 
-from . import envfile, profile
-from .paths import Layout
+from . import audio_detect, discovery, envfile, profile, units, verify
+from .paths import Layout, detect_layout
 
-__all__ = ["SatelliteAnswers", "compose_env", "service_url", "DEFAULT_STT_PORT", "DEFAULT_TTS_PORT"]
+__all__ = ["SatelliteAnswers", "compose_env", "service_url", "DEFAULT_STT_PORT", "DEFAULT_TTS_PORT",
+           "StepResult", "Console", "gather", "provision", "main",
+           "EXIT_OK", "EXIT_PROVISION_FAILED", "EXIT_VERIFY_FAILED", "EXIT_USAGE"]
+
+# Exit codes are a CONTRACT with bootstrap.sh and with any deploy-verify script, so they distinguish
+# the cases an operator would act on differently. A single non-zero would collapse "nothing was
+# written" and "everything was written but the brain is unreachable" — opposite remedies.
+EXIT_OK = 0
+EXIT_PROVISION_FAILED = 1   # nothing usable was written; re-run after fixing the reported step
+EXIT_USAGE = 2              # bad arguments / no terminal to prompt on
+EXIT_VERIFY_FAILED = 3      # config + unit ARE written; a service leg did not answer
+
+DEFAULT_UNIT_NAME = "aria-voice.service"
 
 # These are voice-agent's OWN default service ports, declared server-side with an env override
 # (`stt_service/server.py:235`, `tts_service/server.py:303`) — structurally identical to
@@ -157,3 +186,332 @@ def apply(layout: Layout, env: dict[str, Optional[str]], *,
     backup_path = envfile.backup(path)
     envfile.write(path, text)
     return backup_path, changes
+
+
+# =================================================================================================== #
+# The driver — everything below is the CALLER the modules above were missing.
+#
+# Design rule: every side effect (terminal, subprocess, network) enters through an injected seam, so
+# the whole flow is testable without a box. The parts that touch reality are small and named; the
+# parts that decide are pure. That is deliberate — the last time this package shipped, its tests
+# measured only the pure half and could not observe that nothing invoked it.
+# =================================================================================================== #
+
+
+@dataclass
+class StepResult:
+    """One provisioning step's outcome. ``detail`` is written for a human staring at a failed install,
+    so it names the remedy rather than the symptom."""
+
+    name: str
+    ok: bool
+    detail: str
+
+    def __str__(self) -> str:  # pragma: no cover - formatting only
+        return f"{'OK  ' if self.ok else 'FAIL'} {self.name}: {self.detail}"
+
+
+@dataclass
+class Console:
+    """The IO seam. Secrets go through ``secret_fn`` (no echo) — an install that prints three tokens
+    into the operator's scrollback has leaked them to every subsequent `screen`/`tmux` scrollback and
+    to anyone reading over their shoulder."""
+
+    input_fn: Callable[[str], str] = input
+    secret_fn: Callable[[str], str] = getpass.getpass
+    out: Callable[[str], None] = print
+    interactive: bool = True
+
+    def ask(self, text: str, default: str = "") -> str:
+        if not self.interactive:
+            if default:
+                return default
+            raise _NonInteractive(text)
+        suffix = f" [{default}]" if default else ""
+        answer = self.input_fn(f"{text}{suffix}: ").strip()
+        return answer or default
+
+    def secret(self, text: str) -> Optional[str]:
+        """Empty answer → None ("leave unset"), which is NOT the same as an empty token: an empty
+        value asserts the service runs open, and we have not verified that."""
+        if not self.interactive:
+            raise _NonInteractive(text)
+        return self.secret_fn(f"{text} (blank = leave unset): ").strip() or None
+
+
+class _NonInteractive(RuntimeError):
+    """Raised when a prompt is needed but the run was told not to prompt. Never swallowed: a
+    provisioner that silently substitutes a default for an unanswerable question is how a box ends up
+    configured with values nobody chose."""
+
+
+def _unit_dir() -> Path:
+    base = os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")
+    return Path(base) / "systemd" / "user"
+
+
+def gather(console: Console, *, layout: Layout, proc_asound: str = "/proc/asound",
+           providers: Optional[Sequence[Callable[[], Optional[discovery.BrainEndpoint]]]] = None
+           ) -> SatelliteAnswers:
+    """Detection + prompts → the full answer set. Pure of side effects apart from the console.
+
+    ``providers`` overrides the discovery seam. Default is the maintainer-locked ``(mdns, manual)`` order;
+    a test supplies its own so the flow never opens a socket, and a future provider slots in here
+    without touching this function.
+    """
+    room_id = console.ask("Room id for this satellite (e.g. the room it lives in)", "")
+    while not room_id:
+        room_id = console.ask("Room id is required (it names this box to the brain)", "")
+
+    # Discovery runs AFTER room_id because the mDNS provider filters adverts by room, and the manual
+    # provider is the floor beneath it. A miss is not fatal — manual_prompt is inside the seam.
+    console.out("Looking for a LAN brain (mDNS, then manual)…")
+    endpoint = discovery.discover_brain(
+        providers if providers is not None
+        else discovery.default_providers(room_id=room_id, input_fn=console.input_fn)
+    )
+    if endpoint is None:
+        raise _ProvisionError("no brain host was supplied — a satellite must point at another box")
+    console.out(f"  brain: {endpoint.host}:{endpoint.port} (via {endpoint.source})")
+
+    # Three secrets, from two different services. This is the honest floor; 3c's pairing handshake is
+    # what removes the typing, and nothing below depends on HOW they arrive.
+    brain_token = console.secret("Brain auth token (the brain's GABAI_VOICE_AUTH_TOKEN)")
+    stt_token = console.secret("STT service token (STT_SERVICE_AUTH_TOKEN)")
+    tts_token = console.secret("TTS service token (TTS_SERVICE_AUTH_TOKEN)")
+
+    cards = audio_detect.list_alsa_cards(proc_asound=proc_asound)
+    if cards:
+        console.out("ALSA cards on this box:")
+        for idx, card_id, desc in cards:
+            console.out(f"  {idx}: {card_id} — {desc}")
+    input_device = console.ask("Input (mic) device name", "")
+    while not input_device:
+        input_device = console.ask("Input device is required (the wake gate listens on it)", "")
+    output_device = console.ask("Output (speaker) device name", "")
+    while not output_device:
+        output_device = console.ask("Output device is required", "")
+
+    wake_word = console.ask("Wake word", "aria")
+
+    # The chipmunk guard's read half. Never a guess in either direction: an unclassifiable device
+    # yields None, which leaves AUDIO_OUTPUT_SAMPLE_RATE unset — the historical no-op.
+    decision = audio_detect.detect_output_sample_rate(output_device, proc_asound=proc_asound)
+    console.out(f"  output rate: {decision.reason}")
+
+    return SatelliteAnswers(
+        brain_host=endpoint.host, brain_port=endpoint.port, room_id=room_id,
+        brain_token=brain_token, stt_token=stt_token, tts_token=tts_token,
+        input_device=input_device, output_device=output_device, wake_word=wake_word,
+        output_sample_rate=decision.sample_rate,
+    )
+
+
+class _ProvisionError(RuntimeError):
+    """A step could not be completed. Carries operator-facing text, never a stack trace."""
+
+
+def _default_run(argv: Sequence[str]) -> subprocess.CompletedProcess:
+    return subprocess.run(list(argv), capture_output=True, text=True, timeout=30, check=False)
+
+
+def install_unit(layout: Layout, *, unit_name: str = DEFAULT_UNIT_NAME,
+                 run: Callable[[Sequence[str]], subprocess.CompletedProcess] = _default_run,
+                 unit_dir: Optional[Path] = None) -> list[StepResult]:
+    """Render, write, enable and linger the satellite's ``--user`` unit.
+
+    This is the half that did not exist: ``units.py`` rendered a string with no writer, so a
+    provisioned box had a config file and no way to start itself at boot.
+    """
+    steps: list[StepResult] = []
+    target = (unit_dir or _unit_dir())
+    target.mkdir(parents=True, exist_ok=True)
+    path = target / unit_name
+
+    text = units.render_unit(units.satellite_unit(root=str(layout.root),
+                                                  venv_python=str(layout.venv_python)))
+    path.write_text(text, encoding="utf-8")
+    # Assert the ARTIFACT, not the call: the whole class of bug this package keeps hitting is a step
+    # that reports success without producing anything.
+    steps.append(StepResult("unit-write", path.is_file() and path.stat().st_size > 0, str(path)))
+
+    reload_rc = run(["systemctl", "--user", "daemon-reload"])
+    steps.append(StepResult("daemon-reload", reload_rc.returncode == 0,
+                            "systemd re-read the unit" if reload_rc.returncode == 0
+                            else f"systemctl --user daemon-reload failed: {reload_rc.stderr.strip()}"))
+
+    enable_rc = run(["systemctl", "--user", "enable", unit_name])
+    steps.append(StepResult("unit-enable", enable_rc.returncode == 0,
+                            f"{unit_name} starts at login" if enable_rc.returncode == 0
+                            else f"systemctl --user enable {unit_name} failed: {enable_rc.stderr.strip()}"))
+
+    # Linger is what makes "at login" mean "at boot" on a headless satellite nobody logs into. Its
+    # absence is not cosmetic — without it the box comes up silent after a power cut, which is the
+    # exact remote-hands dependency this installer exists to remove. So a failure here is a FAILED
+    # step with the remedy in it, never a warning that scrolls past.
+    user = getpass.getuser()
+    linger_rc = run(["loginctl", "enable-linger", user])
+    steps.append(StepResult("linger", linger_rc.returncode == 0,
+                            f"{user} lingers → the unit starts at boot without a login"
+                            if linger_rc.returncode == 0
+                            else f"could not enable linger; run: sudo loginctl enable-linger {user}"))
+    return steps
+
+
+def run_verify(env: dict[str, Optional[str]], *,
+               probe_brain=None, probe_stt=None, probe_tts=None) -> list[StepResult]:
+    """Probe all three legs on AUTHENTICATED routes, after deciding absent-vs-empty for each token.
+
+    A missing token is an ERROR rather than "assume the service is open": both services read an empty
+    token as run-open, so an authenticated probe passes either way and the install would certify a
+    credential it never had.
+
+    The probes resolve at CALL time, not as default arguments. A default is bound once when the
+    function is defined, so `probe_brain=verify.probe_brain` looks like an injection seam and is not
+    one — the caller's substitution is silently ignored. Caught by a test that patched the module and
+    watched the real probe run anyway.
+    """
+    probe_brain = probe_brain or verify.probe_brain
+    probe_stt = probe_stt or verify.probe_stt
+    probe_tts = probe_tts or verify.probe_tts
+    steps: list[StepResult] = []
+    for leg, key in (("brain", "GAB_AUTH_TOKEN"), ("stt", "STT_REMOTE_TOKEN"), ("tts", "TTS_REMOTE_TOKEN")):
+        kind = verify.classify_credential(env.get(key), present_in_config=key in env and env[key] is not None)
+        if kind == "missing":
+            steps.append(StepResult(f"{leg}-credential", False,
+                                    f"{key} was not supplied — cannot prove {leg} is deliberately open"))
+    if any(not s.ok for s in steps):
+        return steps
+
+    host, port = (env.get("GAB_HOST") or ""), int(env.get("GAB_PORT") or 0)
+    results = [
+        probe_brain(host, port, env.get("GAB_AUTH_TOKEN"), room_id=env.get("ROOM_ID") or "install-check"),
+        probe_stt(env.get("STT_REMOTE_URL") or "", env.get("STT_REMOTE_TOKEN")),
+        probe_tts(env.get("TTS_REMOTE_URL") or "", env.get("TTS_REMOTE_TOKEN")),
+    ]
+    steps.extend(StepResult(f"{r.leg}-probe", r.ok, r.detail) for r in results)
+    return steps
+
+
+def _confirm_diff(console: Console) -> Callable[[str, dict], bool]:
+    """Show the operator exactly what changes, with secrets masked, and let them refuse."""
+    def confirm(path: str, changes: dict[str, tuple[str, str]]) -> bool:
+        console.out(f"\nAbout to write {path}:")
+        for key in sorted(changes):
+            old, new = changes[key]
+            if "TOKEN" in key or "KEY" in key:
+                old, new = ("***" if old else ""), ("***" if new else "")
+            console.out(f"  {key}: {old or '(unset)'} → {new or '(unset)'}")
+        if not console.interactive:
+            return True   # --non-interactive is an explicit "don't ask me", not "don't write"
+        return console.ask("Write it? [y/N]", "n").lower().startswith("y")
+    return confirm
+
+
+def provision(console: Console, *, root: Optional[str] = None, dry_run: bool = False,
+              skip_verify: bool = False, unit_name: str = DEFAULT_UNIT_NAME,
+              proc_asound: str = "/proc/asound",
+              providers: Optional[Sequence[Callable[[], Optional[discovery.BrainEndpoint]]]] = None,
+              run: Callable[[Sequence[str]], subprocess.CompletedProcess] = _default_run,
+              unit_dir: Optional[Path] = None) -> tuple[int, list[StepResult]]:
+    """The whole flow. Returns ``(exit_code, steps)`` — never raises for an operator-caused failure."""
+    steps: list[StepResult] = []
+    layout = detect_layout(override=root)
+    console.out(f"Install layout: {layout.kind} at {layout.root} ({layout.reason})")
+
+    try:
+        answers = gather(console, layout=layout, proc_asound=proc_asound, providers=providers)
+    except (_ProvisionError, _NonInteractive) as e:
+        steps.append(StepResult("gather", False, str(e)))
+        return EXIT_PROVISION_FAILED, steps
+    except (KeyboardInterrupt, EOFError):
+        steps.append(StepResult("gather", False, "cancelled by the operator — nothing was written"))
+        return EXIT_PROVISION_FAILED, steps
+
+    env = compose_env(answers)
+    problems = validate(env)
+    if problems:
+        steps.extend(StepResult("validate", False, p) for p in problems)
+        return EXIT_PROVISION_FAILED, steps
+    steps.append(StepResult("validate", True, f"{len(profile.REQUIRED_KEYS)} required keys present"))
+
+    if dry_run:
+        console.out("\n--dry-run: composed and validated, writing nothing.")
+        console.out(envfile.render({k: v for k, v in env.items() if not ("TOKEN" in k and v)}))
+        return EXIT_OK, steps
+
+    apply(layout, env, confirm=_confirm_diff(console))
+
+    # Assert the ARTIFACT rather than the call's return. `apply` returns (None, {}) both when the
+    # operator declined AND when a re-provision found nothing to change — indistinguishable from
+    # here — so the only trustworthy question is whether the file on disk is now a valid satellite
+    # config. This is also what makes a re-run idempotent instead of "already done, therefore failed".
+    try:
+        written = envfile.parse(Path(layout.env_path).read_text(encoding="utf-8"))
+        on_disk = {line.key: line.value for line in written if line.key}
+    except FileNotFoundError:
+        on_disk = {}
+    missing = [k for k in profile.REQUIRED_KEYS if not (on_disk.get(k) or "").strip()]
+    if missing:
+        steps.append(StepResult("env-write", False,
+                                f"{layout.env_path} is missing {', '.join(missing)} — declined, or the "
+                                f"write did not land. Nothing was enabled."))
+        return EXIT_PROVISION_FAILED, steps
+    mode = oct(Path(layout.env_path).stat().st_mode & 0o777)
+    steps.append(StepResult("env-write", True, f"{layout.env_path} ({mode}) has every required key"))
+
+    steps.extend(install_unit(layout, unit_name=unit_name, run=run, unit_dir=unit_dir))
+    if any(not s.ok for s in steps):
+        return EXIT_PROVISION_FAILED, steps
+
+    if skip_verify:
+        steps.append(StepResult("verify", True, "skipped at the operator's request (--skip-verify)"))
+        return EXIT_OK, steps
+
+    verify_steps = run_verify(env)
+    steps.extend(verify_steps)
+    if any(not s.ok for s in verify_steps):
+        # Config and unit ARE written; a leg did not answer. Distinct code: the remedy is to fix the
+        # service or the token, not to re-provision this box.
+        return EXIT_VERIFY_FAILED, steps
+    return EXIT_OK, steps
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="python -m voice_agent_install.satellite",
+        description="Provision this box as a voice satellite: write .env, install a --user unit, "
+                    "enable linger, and verify all three service legs on authenticated routes.")
+    parser.add_argument("--root", help="install root to provision (default: the tree this module runs from)")
+    parser.add_argument("--dry-run", action="store_true", help="compose and validate, write nothing")
+    parser.add_argument("--non-interactive", action="store_true",
+                        help="never prompt; fail instead of guessing an unanswerable value")
+    parser.add_argument("--skip-verify", action="store_true",
+                        help="do not probe the brain/STT/TTS legs after writing")
+    parser.add_argument("--unit-name", default=DEFAULT_UNIT_NAME, help=f"(default: {DEFAULT_UNIT_NAME})")
+    args = parser.parse_args(list(argv) if argv is not None else None)
+
+    console = Console(interactive=not args.non_interactive)
+    if console.interactive and not sys.stdin.isatty():
+        console.out("No terminal to prompt on. Re-run attached to a TTY, or pass --non-interactive "
+                    "once every value can be supplied without asking.")
+        return EXIT_USAGE
+
+    code, steps = provision(console, root=args.root, dry_run=args.dry_run,
+                            skip_verify=args.skip_verify, unit_name=args.unit_name)
+
+    console.out("\n--- provisioning summary ---")
+    for step in steps:
+        console.out(f"  {'OK  ' if step.ok else 'FAIL'} {step.name}: {step.detail}")
+    if code == EXIT_OK:
+        console.out("\nProvisioned. `systemctl --user start " + args.unit_name + "` to bring it up now.")
+    elif code == EXIT_VERIFY_FAILED:
+        console.out("\nConfig and unit are written, but a service leg did not answer (see FAIL above). "
+                    "Fix the service or the token and re-run; the .env merge is idempotent.")
+    else:
+        console.out("\nNOT provisioned. Nothing was enabled. Fix the FAIL above and re-run.")
+    return code
+
+
+if __name__ == "__main__":  # pragma: no cover - exercised via `python -m`
+    raise SystemExit(main())
