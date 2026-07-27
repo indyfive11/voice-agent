@@ -5,10 +5,10 @@
 # root (installkit/); nothing depends on the sibling checkout at runtime, and the Pi rsync ships the
 # vendored copy because it is git-tracked (`git ls-files '*.py'`).
 #
-# PROVISIONAL PIN (push freeze): installkit is not yet on its public origin, so INSTALLKIT_PIN is a LOCAL
-# commit today and `vendor-check` compares the vendored bytes against the local installkit repo. When the maintainer
-# lifts the freeze and pushes installkit, the same SHA is the public pin and the check runs unchanged
-# against the public origin. This is deliberately NOT wired into pytest/CI as a blocking gate until then.
+# PUBLIC PIN: installkit is published, so INSTALLKIT_PIN 78ff1cd is a REAL PUBLIC commit on
+# github.com/indyfive11/installkit. `vendor-check` content-derives the SHA-match by comparing the vendored
+# bytes against installkit@INSTALLKIT_PIN in INSTALLKIT_SRC — a local checkout OR a fresh CI clone that
+# contains the pinned commit. Wired as a blocking CI gate in .github/workflows/vendor-check.yml.
 
 INSTALLKIT_PIN ?= 78ff1cd
 INSTALLKIT_SRC ?= $(HOME)/dev/installkit

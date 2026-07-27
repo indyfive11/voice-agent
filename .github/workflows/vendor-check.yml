@@ -1,0 +1,27 @@
+name: vendor-check
+
+# Blocking gate: the vendored installkit/ copy MUST stay byte-identical to installkit@INSTALLKIT_PIN
+# (the public pin). Content-derives the SHA-match — see Makefile `vendor-check`. Fails the build on drift,
+# so a vendored-copy edit that diverges from the pin (or a stale pin) can't merge silently.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - 'installkit/**'
+      - 'Makefile'
+      - '.github/workflows/vendor-check.yml'
+
+jobs:
+  vendor-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout voice-agent
+        uses: actions/checkout@v4
+
+      - name: Clone installkit (public) — must contain the pinned commit
+        run: git clone https://github.com/indyfive11/installkit.git "$RUNNER_TEMP/installkit"
+
+      - name: Vendored installkit == installkit@pin
+        run: make vendor-check INSTALLKIT_SRC="$RUNNER_TEMP/installkit"
