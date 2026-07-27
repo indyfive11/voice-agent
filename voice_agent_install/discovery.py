@@ -287,14 +287,225 @@ def default_providers(
     *,
     room_id: Optional[str] = None,
     input_fn: Callable[[str], str] = input,
+    report: Optional[Callable[["DiscoveryDiagnosis"], None]] = None,
 ) -> tuple[Callable[[], Optional[BrainEndpoint]], ...]:
     """The maintainer-locked ordered seam: ``(mdns, manual)``. Add a future provider (e.g. a
     broadcast fallback, only if live evidence ever warrants it) as another entry on
-    this tuple — no call-site change."""
+    this tuple — no call-site change.
+
+    ``report`` upgrades the mDNS leg from a silent hit-or-miss into the §10d firewall-aware
+    detect-and-report: on a miss it is called with a :class:`DiscoveryDiagnosis` (reason +
+    rendered operator remedy) *before* the seam falls through to the manual floor, so the
+    operator learns WHY they are being asked to type a host (filtered responder vs dead one).
+    ``report is None`` preserves the historical behavior exactly — a plain ``mdns_discover``
+    leg — so a caller that just wants the endpoint (and any test) is unaffected.
+    """
+    if report is None:
+        mdns_leg: Callable[[], Optional[BrainEndpoint]] = lambda: mdns_discover(room_id=room_id)
+    else:
+        def mdns_leg() -> Optional[BrainEndpoint]:
+            diag = diagnose_brain_discovery(room_id=room_id)
+            if diag.ok:
+                return diag.endpoint
+            report(diag)  # detect-and-report; NON-FATAL — fall through to the manual floor
+            return None
     return (
-        lambda: mdns_discover(room_id=room_id),
+        mdns_leg,
         lambda: manual_prompt(input_fn=input_fn),
     )
+
+
+# ------------------------------------------------------- §10d firewall-aware discovery diagnosis
+# A brain host with a default-drop input policy silently drops inbound mDNS (5353/udp). Because mDNS
+# is query/response, the browse then returns nothing and the symptom is INDISTINGUISHABLE from a
+# broken advertiser — the failure looks like the wrong layer (measured on a live default-drop host:
+# firewall closed → ~12s → None; the same host with 224.0.0.251:5353/udp allowed → ~0.3s → endpoint).
+# This diagnosis runs at SATELLITE-INSTALL time only (an off-box reachability check structurally needs
+# a second box; the brain host cannot run it on itself) and obeys three rules from the ratified design:
+#   (1) detect-and-report, NEVER mutate — it prints the gap + remedy, never edits a host firewall;
+#   (2) effect-check, NOT rule-parse — it attempts the browse and reads the result, never parses
+#       nftables/iptables/firewalld (not portably introspectable → fail-open);
+#   (3) non-fatal — a filtered/absent responder never aborts the install; the caller falls back to the
+#       typed host+port floor (§10c pairing) and the operator sees the remedy.
+MDNS_MULTICAST_HINT = "224.0.0.251:5353/udp"
+
+
+class _ZeroconfUnavailable(Exception):
+    """zeroconf is NOT installed — mDNS is simply an absent optional path, not a fault."""
+
+
+class _ZeroconfBroken(Exception):
+    """zeroconf IS installed but the browse raised — an installed-but-broken stack. Corollary from the
+    mDNS close-out: this must NOT render as ``no-adverts``; a bare ``except`` that swallowed it would
+    convert a hard local failure into a silent absence and point the operator at the wrong layer."""
+
+
+@dataclass(frozen=True)
+class DiscoveryDiagnosis:
+    """The outcome of a §10d discovery browse. ``ok`` is True only when a routable brain endpoint was
+    found AND answered a confirm-probe. ``reason`` is the stable vocabulary token; ``label`` renders
+    the operator-facing form (``filtered=N``). ``remedy`` is the multi-line, firewall-aware operator
+    guidance (empty when ``ok``)."""
+
+    ok: bool
+    reason: str
+    detail: str
+    endpoint: Optional[BrainEndpoint]
+    remedy: str
+
+    @property
+    def label(self) -> str:
+        return f"filtered={self.detail}" if self.reason == "filtered" else self.reason
+
+
+def _brain_browse(room_id: Optional[str], timeout: float, info_timeout: float):
+    """Real brain-type browse that DISTINGUISHES not-installed from installed-but-broken.
+
+    ``mdns_discover`` swallows the import as ``None`` (correct for its own fail-soft contract) and lets a
+    runtime browse error propagate; here we want both distinguished, so we probe the import explicitly
+    (``ImportError`` ⇒ :class:`_ZeroconfUnavailable`) and wrap the browse (any raise ⇒
+    :class:`_ZeroconfBroken`). Returns ``(endpoint, stats)`` on a clean run."""
+    try:
+        import zeroconf  # noqa: F401  (explicit installed-check; ImportError == not installed)
+    except ImportError as e:
+        raise _ZeroconfUnavailable(str(e))
+    stats: dict = {}
+    try:
+        endpoint = mdns_discover(room_id=room_id, timeout=timeout, info_timeout=info_timeout, stats=stats)
+    except Exception as e:  # installed, but the browse itself failed → broken, NOT "no adverts"
+        raise _ZeroconfBroken(str(e))
+    return endpoint, stats
+
+
+def _broad_browse(timeout: float, *, exclude_type: str = BRAIN_MDNS_TYPE) -> Optional[int]:
+    """The firewall DISCRIMINATOR: count OTHER mDNS service *types* visible on this box via the
+    DNS-SD meta-query. ``>0`` ⇒ multicast reaches this satellite, so a missing brain is the brain's gap
+    (advertiser off, or the brain host's firewall dropping its responses). ``0`` ⇒ no mDNS of any kind
+    reaches here — multicast itself is likely blocked. ``None`` ⇒ zeroconf unavailable (no broad signal).
+    Single bounded browse, closed in ``finally`` — never a retry loop, never leaks a thread."""
+    try:
+        from zeroconf import Zeroconf, ServiceBrowser, ServiceListener
+    except Exception:
+        return None
+
+    import threading
+
+    types: set = set()
+    saw = threading.Event()
+
+    class _Enum(ServiceListener):  # type: ignore[misc]
+        def add_service(self, zc, type_, name):
+            # Under the meta-query, ``name`` is a discovered service TYPE (e.g. "_ipp._tcp.local.").
+            if name and name != exclude_type:
+                types.add(name)
+                saw.set()
+
+        def update_service(self, zc, type_, name):
+            self.add_service(zc, type_, name)
+
+        def remove_service(self, zc, type_, name):
+            pass
+
+    zc = Zeroconf()
+    try:
+        ServiceBrowser(zc, "_services._dns-sd._udp.local.", _Enum())
+        saw.wait(timeout=timeout)  # single bounded wait
+    finally:
+        zc.close()
+    return len(types)
+
+
+def _render_remedy(reason: str, detail: str, port: int) -> str:
+    """Firewall-aware operator remedy per reason. Every path ends by pointing at the manual floor —
+    detect-and-report is non-fatal, so the operator always has a way forward."""
+    manual = "Provide the brain's LAN IP + port manually below to proceed — discovery is an enhancement, not required."
+    if reason == "no-mdns":
+        return ("mDNS auto-discovery is unavailable (the 'zeroconf' package is not installed on this "
+                "satellite). This is not an error. " + manual + "\n"
+                "To enable auto-discovery later, install zeroconf on this box.")
+    if reason == "zeroconf-error":
+        return (f"The mDNS stack is installed but failed to run a browse ({detail}). This is a broken "
+                "LOCAL mDNS — not an absent brain — so auto-discovery can't run here. " + manual + "\n"
+                "Check multicast/interface permissions on this box if you want discovery working.")
+    if reason == "loopback-advert":
+        return (f"The brain advertised a loopback address ({detail}) — its advertiser is bound to "
+                "localhost, so no satellite can reach it. On the BRAIN host, bind the mDNS advertiser to "
+                "the LAN interface, then re-run. " + manual)
+    if reason == "unconfirmed":
+        return (f"A brain advert was seen ({detail}) but the endpoint did not answer a health probe on "
+                f"port {port}. The advert may be stale (zeroconf caches), or the brain's HTTP port is "
+                f"filtered while its mDNS is open. Verify the brain is up and {port}/tcp is reachable. " + manual)
+    if reason == "room-filtered":
+        return (f"A brain is advertising ({detail}) but for a DIFFERENT room. mDNS is working — this is a "
+                "room-id mismatch, not a firewall issue. Re-run with the room id the brain serves. " + manual)
+    if reason == "filtered":
+        return (f"Other mDNS services are visible here ({detail} service type(s)) but the brain is not — "
+                "so multicast reaches this box and the gap is at the brain. Either the brain's advertiser "
+                "is off (set voice_advertise: true on the voice-host role) OR the brain host's firewall is "
+                f"dropping inbound mDNS (allow {MDNS_MULTICAST_HINT} on the BRAIN host). " + manual)
+    # no-adverts
+    return ("No mDNS adverts of ANY kind reached this box — so multicast itself is likely blocked "
+            "(this satellite's network path, or a firewall on the brain host dropping "
+            f"{MDNS_MULTICAST_HINT}), OR nothing is advertising. " + manual + "\n"
+            f"To enable discovery: set voice_advertise: true on the brain's voice-host role AND allow "
+            f"{MDNS_MULTICAST_HINT} end-to-end.")
+
+
+def _diag(reason: str, detail: str, endpoint: Optional[BrainEndpoint], port: int) -> "DiscoveryDiagnosis":
+    return DiscoveryDiagnosis(False, reason, detail, endpoint, _render_remedy(reason, detail, port))
+
+
+def diagnose_brain_discovery(
+    *,
+    room_id: Optional[str] = None,
+    port: int = DEFAULT_BRAIN_PORT,
+    browse_timeout: float = MDNS_BROWSE_TIMEOUT,
+    probe_timeout: float = HEALTH_PROBE_TIMEOUT,
+    brain_browse_fn: Optional[Callable[[], tuple]] = None,
+    broad_browse_fn: Optional[Callable[[], Optional[int]]] = None,
+    probe_fn: Optional[Callable[[str, int], bool]] = None,
+) -> DiscoveryDiagnosis:
+    """Run the §10d brain browse and classify the result into the reason vocabulary + operator remedy.
+
+    Effect-check only: it attempts the browse (never inspects a firewall). Order of decision:
+      - zeroconf not installed → ``no-mdns``; installed-but-raised → ``zeroconf-error`` (NOT masked as
+        ``no-adverts`` — the corollary);
+      - a brain endpoint found → ``loopback-advert`` (bound to localhost) / ``unconfirmed`` (no probe
+        answer) / else ``found`` (ok=True);
+      - no endpoint but brain adverts were room-filtered → ``room-filtered`` (mDNS works; wrong room);
+      - no endpoint and OTHER services are visible → ``filtered`` (multicast works, brain is the gap);
+      - nothing at all → ``no-adverts`` (multicast likely blocked, or nothing advertising).
+
+    The ``*_fn`` params are test-injection seams (no sockets); unset ⇒ the real bounded browses/probe.
+    Bounded and non-raising by construction — this is install-time, not the boot loop, but it still
+    never runs an unbounded browse and never leaks a thread.
+    """
+    do_brain = brain_browse_fn or (lambda: _brain_browse(room_id, browse_timeout, MDNS_INFO_TIMEOUT))
+    probe = probe_fn or (lambda h, p: http_health_ok(h, p, timeout=probe_timeout))
+
+    try:
+        endpoint, stats = do_brain()
+    except _ZeroconfUnavailable as e:
+        return _diag("no-mdns", str(e) or "zeroconf is not installed", None, port)
+    except _ZeroconfBroken as e:
+        return _diag("zeroconf-error", str(e) or "the mDNS stack raised during the browse", None, port)
+
+    if endpoint is not None:
+        if is_loopback(endpoint.host):
+            return _diag("loopback-advert", endpoint.host, endpoint, port)
+        if not probe(endpoint.host, endpoint.port):
+            return _diag("unconfirmed", f"{endpoint.host}:{endpoint.port}", endpoint, port)
+        return DiscoveryDiagnosis(True, "found", f"{endpoint.host}:{endpoint.port}", endpoint, "")
+
+    filtered = (stats or {}).get("filtered", 0)
+    if filtered:
+        return _diag("room-filtered", f"{filtered} advert(s), room '{room_id or ''}'", None, port)
+
+    do_broad = broad_browse_fn or (lambda: _broad_browse(browse_timeout))
+    others = do_broad()
+    if others and others > 0:
+        return _diag("filtered", str(others), None, port)
+    return _diag("no-adverts", "no mDNS adverts of any kind seen", None, port)
 
 
 # --------------------------------------------------------------- in-app boot re-resolve

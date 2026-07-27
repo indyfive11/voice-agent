@@ -315,3 +315,120 @@ def test_reresolve_never_raises_returns_error_kept():
 )
 def test_room_matches(advertised, want_room, expected):
     assert d._room_matches(advertised, want_room) is expected
+
+
+# ============================================================ §10d firewall-aware discovery diagnosis
+# All injected — no sockets. `brain_browse_fn` returns (endpoint, stats) or raises the internal
+# unavailable/broken signals; `broad_browse_fn` returns the OTHER-service count; `probe_fn` confirms.
+def _diagnose(**kw):
+    return d.diagnose_brain_discovery(**kw)
+
+
+def test_diagnose_found_when_routable_and_probe_answers():
+    ep = BrainEndpoint("192.168.1.42", 8765, "mdns")
+    diag = _diagnose(brain_browse_fn=lambda: (ep, {}), probe_fn=lambda h, p: True)
+    assert diag.ok is True
+    assert diag.reason == "found"
+    assert diag.endpoint is ep
+    assert diag.remedy == ""            # no remedy needed on success
+
+
+def test_diagnose_loopback_advert():
+    ep = BrainEndpoint("127.0.0.1", 8765, "mdns")
+    diag = _diagnose(brain_browse_fn=lambda: (ep, {}),
+                     probe_fn=lambda h, p: pytest.fail("must not probe a loopback advert"))
+    assert diag.ok is False and diag.reason == "loopback-advert"
+    assert "127.0.0.1" in diag.detail and "localhost" in diag.remedy
+
+
+def test_diagnose_unconfirmed_when_advert_fails_probe():
+    ep = BrainEndpoint("192.168.1.42", 8765, "mdns")
+    diag = _diagnose(brain_browse_fn=lambda: (ep, {}), probe_fn=lambda h, p: False)
+    assert diag.ok is False and diag.reason == "unconfirmed"
+    assert diag.endpoint is ep and "8765" in diag.remedy
+
+
+def test_diagnose_room_filtered_when_adverts_seen_but_room_mismatch():
+    # brain adverts WERE seen (mDNS works) but none matched → a room-id mismatch, NOT a firewall gap.
+    diag = _diagnose(room_id="bedroom",
+                     brain_browse_fn=lambda: (None, {"seen": 2, "filtered": 2}),
+                     broad_browse_fn=lambda: pytest.fail("room-filter is decided before the broad browse"))
+    assert diag.reason == "room-filtered"
+    assert "different room" in diag.remedy.lower() and "firewall" in diag.remedy.lower()
+
+
+def test_diagnose_filtered_when_other_services_visible_but_no_brain():
+    # THE firewall discriminator: multicast reaches this box (other services seen) but the brain does
+    # not → the gap is at the brain (advertiser off, or its host firewall drops 5353/udp).
+    diag = _diagnose(brain_browse_fn=lambda: (None, {}), broad_browse_fn=lambda: 4)
+    assert diag.reason == "filtered"
+    assert diag.detail == "4" and diag.label == "filtered=4"
+    assert d.MDNS_MULTICAST_HINT in diag.remedy and "voice_advertise" in diag.remedy
+
+
+def test_diagnose_no_adverts_when_nothing_at_all():
+    diag = _diagnose(brain_browse_fn=lambda: (None, {}), broad_browse_fn=lambda: 0)
+    assert diag.reason == "no-adverts"
+    assert d.MDNS_MULTICAST_HINT in diag.remedy   # firewall-aware
+
+
+def test_diagnose_no_mdns_when_zeroconf_absent_is_not_a_fault():
+    def _unavailable():
+        raise d._ZeroconfUnavailable("no zeroconf")
+    diag = _diagnose(brain_browse_fn=_unavailable)
+    assert diag.reason == "no-mdns"
+    assert "not an error" in diag.remedy.lower()
+
+
+def test_diagnose_broken_zeroconf_is_not_masked_as_no_adverts():
+    # THE corollary: an installed-but-broken zeroconf must render as its own reason, never as
+    # "no-adverts" — otherwise a local mDNS fault points the operator at the brain/firewall.
+    def _broken():
+        raise d._ZeroconfBroken("multicast socket denied")
+    diag = _diagnose(brain_browse_fn=_broken)
+    assert diag.reason == "zeroconf-error"
+    assert diag.reason != "no-adverts"
+    assert "multicast socket denied" in diag.remedy and "broken" in diag.remedy.lower()
+
+
+def test_diagnose_never_runs_broad_browse_when_brain_is_found():
+    ep = BrainEndpoint("192.168.1.42", 8765, "mdns")
+    _diagnose(brain_browse_fn=lambda: (ep, {}), probe_fn=lambda h, p: True,
+              broad_browse_fn=lambda: pytest.fail("broad browse must not run once the brain is found"))
+
+
+# ----------------------------------------------- default_providers report wiring (detect-and-report)
+def test_default_providers_report_fires_on_miss_then_falls_to_manual(monkeypatch):
+    # With a `report` callback the mDNS leg runs the diagnosis; on a miss it reports and returns None,
+    # and the seam falls through to the manual floor — NON-FATAL by construction.
+    reported: list = []
+    miss = d.DiscoveryDiagnosis(False, "no-adverts", "none", None, "remedy text")
+    monkeypatch.setattr(d, "diagnose_brain_discovery", lambda **k: miss)
+    floor = BrainEndpoint("10.0.0.9", 8765, "manual")
+    monkeypatch.setattr(d, "manual_prompt", lambda **k: floor)
+
+    seam = d.default_providers(report=reported.append)
+    assert d.discover_brain(seam) is floor
+    assert reported == [miss]           # the operator was told WHY before being asked to type a host
+
+
+def test_default_providers_report_hit_returns_endpoint_without_manual(monkeypatch):
+    ep = BrainEndpoint("192.168.1.42", 8765, "mdns")
+    hit = d.DiscoveryDiagnosis(True, "found", "192.168.1.42:8765", ep, "")
+    monkeypatch.setattr(d, "diagnose_brain_discovery", lambda **k: hit)
+    monkeypatch.setattr(d, "manual_prompt", lambda **k: pytest.fail("manual floor must not run on a hit"))
+
+    seam = d.default_providers(report=lambda _diag: pytest.fail("report must not fire on a hit"))
+    assert d.discover_brain(seam) is ep
+
+
+def test_default_providers_without_report_is_unchanged(monkeypatch):
+    # Backward-compat: no report → the mDNS leg is a plain mdns_discover, no diagnosis.
+    calls = []
+    monkeypatch.setattr(d, "mdns_discover", lambda **k: calls.append("mdns") or None)
+    monkeypatch.setattr(d, "diagnose_brain_discovery",
+                        lambda **k: pytest.fail("diagnosis must not run without a report callback"))
+    monkeypatch.setattr(d, "manual_prompt", lambda **k: BrainEndpoint("10.0.0.9", 8765, "manual"))
+    seam = d.default_providers()
+    assert d.discover_brain(seam).source == "manual"
+    assert calls == ["mdns"]

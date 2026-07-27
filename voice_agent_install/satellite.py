@@ -267,10 +267,24 @@ def gather(console: Console, *, layout: Layout, proc_asound: str = "/proc/asound
 
     # Discovery runs AFTER room_id because the mDNS provider filters adverts by room, and the manual
     # provider is the floor beneath it. A miss is not fatal — manual_prompt is inside the seam.
+    #
+    # §10d: on an mDNS miss the seam reports WHY before falling to the manual floor — a filtered
+    # responder (brain host firewall dropping 5353/udp) is indistinguishable from a dead advertiser
+    # unless the browse names the difference. `report` is detect-and-report only: it prints the reason
+    # + firewall-aware remedy, never touches a firewall, never aborts. A test that injects `providers`
+    # bypasses this (it supplies its own seam), so the reporting is real-install-only by construction.
+    def _report_discovery(diag: "discovery.DiscoveryDiagnosis") -> None:
+        # `label` already embeds the count for filtered=N; only append `detail` when it adds something.
+        suffix = f" ({diag.detail})" if diag.detail and diag.detail not in diag.label else ""
+        console.out(f"  mDNS: {diag.label}{suffix}")
+        for line in diag.remedy.splitlines():
+            console.out(f"    {line}")
+
     console.out("Looking for a LAN brain (mDNS, then manual)…")
     endpoint = discovery.discover_brain(
         providers if providers is not None
-        else discovery.default_providers(room_id=room_id, input_fn=console.input_fn)
+        else discovery.default_providers(room_id=room_id, input_fn=console.input_fn,
+                                         report=_report_discovery)
     )
     if endpoint is None:
         raise _ProvisionError("no brain host was supplied — a satellite must point at another box")
