@@ -19,4 +19,10 @@ case "${1:-}" in
   -h|--help)    sed -n '2,9p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'; exit 0 ;;
 esac
 
-exec uv run python main.py "$@"
+# --frozen --no-sync: run the venv EXACTLY as it was provisioned — never re-lock, never re-sync at start.
+# The lock is shared across satellites (x86_64 EM, aarch64 Pi, laptop); a bare `uv run` would (a) re-lock
+# on any pyproject drift, diverging that shared lock from a runtime box, and (b) re-sync dev deps in/out
+# every start. run.sh is a PURE RUNNER; deploy-time reconcile is owned by the deploy step (pi-voice-launch:
+# bounded, guarded `uv sync --locked --no-dev --inexact`). Fresh boxes: bootstrap.sh builds the venv first.
+# (Tests run via `uv run python -m pytest`, which syncs dev deps on demand — unaffected by --no-sync here.)
+exec uv run --frozen --no-sync python main.py "$@"
