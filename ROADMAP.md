@@ -89,10 +89,6 @@ re-attach hardening (currently catches cleanly ~1/3, else a ~15s restart-fallbac
 
 - **Portability hardening** *(internal #55)* — output-rate **autodetect-write** + kill the remaining
   path hardcodes (brain-binary path, TTS TMPDIR). This *is* "every hardcode = a ship blocker."
-- **Slim the install** *(internal #72)* — pin torch to the CPU wheel index (~3 GB → ~200 MB on every
-  non-NVIDIA box; a 3 GB CUDA download on a CPU box is a bad publishable first-run). Folds into the
-  installer's model-prefetch step. Caveat: the lockfile is shared across all satellites — re-resolve
-  + re-verify all three import before trusting it.
 
 ---
 
@@ -165,6 +161,11 @@ re-attach hardening (currently catches cleanly ~1/3, else a ~15s restart-fallbac
   (`e8225f6`, 06-20).
 - **SmartTurn-honoring endpointing**, duck single-writer, convo-hold — no mid-sentence cut-offs
   (`e8225f6`/`1ef8c71`).
+- **Slim the install** *(internal #72)* — dropped the dead `local-smart-turn` extra (`9a57573`, 07-27).
+  The default turn analyzer (SmartTurn v3) is pure-onnx and ships in pipecat core, so the extra's
+  torch/CUDA/nvidia stack was never imported at runtime — removing it takes a fresh install ~5.6 GB →
+  ~0.9 GB with zero behavior change. *(Supersedes the earlier "pin torch to the CPU wheel" plan — the
+  whole stack was dead, not just mis-indexed.)*
 - **Long-form dictation hold** + the `send_to_builder` deferred-speak seam (`a3f6fab`, 06-24).
 - **Image-gen display consumer** — voice "make a picture" → mpv sink with locality routing
   (`4a7ad55`, 07-04); live on the workstation, TV-satellite verify open.
