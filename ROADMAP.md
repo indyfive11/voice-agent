@@ -72,6 +72,11 @@ converts "the PoC" from an aspiration into the forcing function.
      commit/push + the Pi clean-box deploy-test + freeze-lift (finalize pin, wire SHA-match CI).
 2. **Auto-detect the LAN brain** — mDNS/zeroconf or known-port probe → auto-fill brain host + token,
    replacing the hand-edited `.env`. "Fire it up and it finds the brain."
+   - **Firewall-aware reachability** (a filtered mDNS responder reads identically to a dead one) — the
+     ratified detect-and-report design lives in **gabagent `INSTALL_PLAN.md` §10d** (named link, not
+     restated here, per the cross-repo "named links not merged content" rule). Layer-B owns the browse
+     + reason vocabulary + rendered operator remedy; detect-only, never mutates a host firewall.
+     **Unbuilt** — the `discovery.py` browse primitive exists + is tested but is unwired. *(internal: P9)*
 3. **HW-tiering** — detect-once-write-config (never a per-startup probe): strong HW runs local
    STT/TTS, weak HW (Pi-class) offloads. Per the no-hardcodes portability SOP.
 4. **Protocol de-branding — [GitHub #1](https://github.com/indyfive11/voice-agent/issues/1)**
