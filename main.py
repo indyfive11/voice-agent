@@ -68,6 +68,7 @@ from turn_cap import MaxTurnDurationUserTurnStopStrategy
 from turn_stop import LongHoldState, SmartTurnHonoringStopStrategy
 from turn_mute import BotThinkingMuteStrategy
 from response_latency import ResponseLatencyObserver
+from bot_speaking_watchdog import BotSpeakingWatchdog
 from tts_gain import TTSGainProcessor
 
 import aria_state
@@ -502,6 +503,19 @@ async def run() -> None:
         hard_reset=hard_reset,
     )
 
+    # Output-side twin of the input stall watchdog (incident 2026-07-27): the transport shares ONE PyAudio
+    # instance between the callback input and the blocking-write output, so the input-stall recovery's
+    # synchronous C-layer open() starves the output write → the trailing TTSStoppedFrame never drains →
+    # bot-speaking hangs open and the output stream underruns into a "broken record" loop. This belt breaks
+    # the loop (broadcast_interruption) but ONLY while the input watchdog confirms the shared device is
+    # wedged (co-signal), so it can never cut a live narration; device recovery (usb-reset → clean restart)
+    # stays owned by the input ladder above. No-op if the input watchdog is disabled. See
+    # bot_speaking_watchdog.py.
+    bot_speaking_watchdog = BotSpeakingWatchdog(
+        device_wedged=(lambda: input_watchdog.stalled) if input_watchdog else None,
+        escalate_recovery=input_watchdog.request_fast_exit if input_watchdog else None,
+    )
+
     # Deferred out-of-band announcements (builder results, timers, …): voiced at a free conversational floor.
     # Only with a brain that owns floor state (BrainLLMService exposes is_floor_free); a raw-LLM service has
     # no floor authority, so None → not inserted (exact current behavior). Sits right after the LLM service:
@@ -560,6 +574,7 @@ async def run() -> None:
             *([announcer] if announcer else []),  # deferred out-of-band speech at a free floor (builder/timers)
             tts,                   # Kokoro (local)
             tts_gain_proc,         # attenuate Aria's voice (TTS_GAIN) so she's not louder than ducked music
+            bot_speaking_watchdog, # break a stuck-open bot-speaking loop (broken record) → clean restart
             transport.output(),    # speaker
             assistant_aggregator,  # assistant-side context (after output, so it logs spoken text)
         ]

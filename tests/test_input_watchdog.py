@@ -410,6 +410,65 @@ def test_hard_reset_fires_after_kicks_then_rekicks_then_escalates():
     assert order == ["cycle", "esc"]
 
 
+def test_fast_exit_skips_kicks_does_one_usb_reset_then_escalates():
+    # Output-side broken-record fast-track (incident 2026-07-27): request_fast_exit() proves the shared
+    # PyAudio instance is poisoned → in-process kicks are futile. The ladder must skip them, do ONE
+    # usb-reset (clear the class-B wedge so the restart lands clean), then exit — no kick rounds.
+    kicks, hard, escalations = [], [], []
+
+    async def restart(_):
+        kicks.append(1)
+        return True
+
+    async def hard_reset():
+        hard.append(1)
+        return True
+
+    d = InputStallDetector(stall_secs=5.0, restart=restart, max_restarts=3,
+                           hard_reset=hard_reset, max_hard_resets=1,
+                           on_unrecoverable=lambda: escalations.append(1))
+    d._armed = True
+    now = time.monotonic()
+    d._last = now - 10            # stalled
+    d._last_nonsilent = now - 10
+    d.request_fast_exit("output broken-record loop")
+
+    lines, remove = _capture_transcript()
+    try:
+        asyncio.run(d._on_stall("no mic frames", 10.0))
+    finally:
+        remove()
+
+    assert kicks == []            # NO in-process kicks — they're futile on a poisoned instance
+    assert len(hard) == 1         # exactly one usb power-cycle before the exit (Hole-2 ordering)
+    assert len(escalations) == 1  # straight to the clean restart
+    order = [t for ln in lines for t in (["cycle"] if "USB power-cycling" in ln
+                                         else ["esc"] if "escalating" in ln else [])]
+    assert order == ["cycle", "esc"]
+
+
+def test_fast_exit_self_cancels_when_the_stall_clears():
+    # If the stall self-clears (frames resume) before the fast-exit tick, the pending fast-exit is dropped
+    # → NO restart. Guards against restarting on a transient blip the output belt happened to observe.
+    escalations = []
+
+    async def restart(_):
+        return True
+
+    d = InputStallDetector(stall_secs=5.0, restart=restart, hard_reset=None,
+                           on_unrecoverable=lambda: escalations.append(1))
+    d._armed = True
+    d._stalled = True
+    d.request_fast_exit("blip")
+    now = time.monotonic()
+    d._last = now                 # frames flowing again
+    d._last_nonsilent = now
+
+    asyncio.run(d._tick())        # takes the 'good frames again' branch → clears stall + fast_exit
+    assert d._fast_exit is False and d._stalled is False
+    assert escalations == []      # never escalated on a cleared blip
+
+
 def test_no_hard_reset_when_unconfigured_is_unchanged():
     # hard_reset=None (default / INPUT_USB_RESET_VIDPID unset) → today's exact ladder: kicks then escalate,
     # never a USB power-cycle line.

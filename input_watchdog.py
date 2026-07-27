@@ -100,6 +100,7 @@ class InputStallDetector(FrameProcessor):
         self._started_at = 0.0      # monotonic of StartFrame (arms the no-first-frame deadline)
         self._armed = False         # seen ≥1 frame (don't warn before capture starts)
         self._stalled = False       # currently in a stall episode
+        self._fast_exit = False     # output side confirmed the shared device is wedged → skip to exit
         self._restarts = 0          # restart attempts this episode
         self._hard_resets = 0       # hardware power-cycles this episode
         self._start_frame: StartFrame | None = None  # captured for the restart
@@ -110,6 +111,26 @@ class InputStallDetector(FrameProcessor):
         self._hb_at = 0.0
         self._hb_frames = 0
         self._hb_silent = 0
+
+    @property
+    def stalled(self) -> bool:
+        """True while the mic capture is in a stall episode. Read by the output-side BotSpeakingWatchdog
+        as the wedge CO-SIGNAL: because input and output share ONE PyAudio instance, a genuine device
+        wedge stalls both faces, so this distinguishes a real wedge from a long narration's audio gap."""
+        return self._stalled
+
+    def request_fast_exit(self, reason: str) -> None:
+        """Short-circuit this stall episode straight to the terminal rung (usb-reset → exit), skipping the
+        remaining in-process kicks. Called by the output-side BotSpeakingWatchdog when a broken-record loop
+        proves the shared PyAudio instance is poisoned: `broadcast_interruption()` can't stop a loop whose
+        blocking C `write()` is stuck (asyncio can't cancel the executor thread), so only PROCESS DEATH
+        reclaims the device — and further kicks on a poisoned instance are futile. Keeps this the SINGLE
+        exit-caller (one `StartLimitBurst` spend, correct usb-reset-before-exit ordering). Self-correcting:
+        if the stall self-clears before the next tick, `_tick` resets the flag and no exit happens."""
+        if self._fast_exit:
+            return
+        self._fast_exit = True
+        _tlog(f"INPUT STALL | {reason} — fast-tracking to a clean restart (kicks are futile on a poisoned device)")
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
@@ -178,6 +199,7 @@ class InputStallDetector(FrameProcessor):
             self._stalled = False
             self._restarts = 0
             self._hard_resets = 0
+            self._fast_exit = False  # a transient stall that self-cleared cancels any pending fast-exit
             _tlog(f"INPUT RESUMED | mic audio back after {silent:.1f}s")
         self._maybe_heartbeat(now)
 
@@ -204,6 +226,20 @@ class InputStallDetector(FrameProcessor):
             self._stalled = True  # log once per episode
             _tlog(f"INPUT STALL | {mode} for {secs:.1f}s — capture may have stalled")
         if self._restart is None:
+            return
+        if self._fast_exit:
+            # The output side proved the shared instance is poisoned → in-process kicks are futile. Go
+            # straight to the terminal rung: one usb power-cycle (if available & not yet spent this episode)
+            # so the restart lands on a cleared device (the Hole-2 ordering), then exit. Serialized with the
+            # normal ladder because both run in this one awaited watch loop — no double cycle, no race.
+            if self._hard_reset is not None and self._hard_resets < self._max_hard_resets:
+                self._hard_resets += 1
+                _tlog("INPUT STALL | fast-exit: USB power-cycling the mic port before the clean restart")
+                try:
+                    await self._hard_reset()
+                except Exception as e:  # noqa: BLE001 - recovery must never crash the watch loop
+                    _tlog(f"INPUT STALL | usb power-cycle FAILED: {type(e).__name__}: {e}")
+            await self._escalate()
             return
         if self._restarts >= self._max_restarts:
             # In-process kicks are exhausted this round. Before giving up, try the HARDWARE rung: a
