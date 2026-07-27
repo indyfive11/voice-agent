@@ -10,7 +10,12 @@ requires-python = ">=3.12,<3.14"
 # Pipecat is PINNED so the local-fork escape hatch below has a stable base and the
 # SmartTurn V2->V3 / extras-rename drift can't recur silently. Bump deliberately.
 dependencies = [
-    "pipecat-ai[anthropic,silero,whisper,local,kokoro,local-smart-turn]==1.3.0",
+    # local-smart-turn DROPPED (#72): it pulled torch/torchaudio/transformers/coremltools + the whole
+    # nvidia/cuda/triton stack (~5G) that nothing here runs. The default turn analyzer is
+    # LocalSmartTurnAnalyzerV3 (main.py) = pure-onnx (numpy/onnxruntime/soxr), bundled onnx in pipecat
+    # core — present without this extra. Torch is 100% runtime-dead here. Re-add ONLY if a torch-based
+    # V2/CoreML analyzer is ever wanted (then CPU-pin torch — see project-torch-slim-72 fallback).
+    "pipecat-ai[anthropic,silero,whisper,local,kokoro]==1.3.0",
     "onnxruntime",
     "python-dotenv",
     "loguru",
