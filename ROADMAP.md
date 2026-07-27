@@ -54,6 +54,22 @@ converts "the PoC" from an aspiration into the forcing function.
    voice-agent role-provisioner (audio detect, LAN-brain discovery, role units + `.env` emit) →
    brain-side addon plugins. Delivery = `git clone → ./bootstrap.sh` (uv-based; reaches both Debian
    satellites and Arch). *Phased, each phase gated.*
+   - **Progress (git-anchored, unpushed):** the entry point + satellite role-provisioner shipped
+     (`af4d656`: tracked `bootstrap.sh` → `voice_agent_install.satellite`, gather→provision→
+     install-unit→verify). installkit A.4 — the `render_unit` `RestartSec`/`WorkingDirectory`
+     chokepoint — fixed + signed (`9b389a4` + `0b8ae18`).
+   - **Decided (the maintainer, 2026-07-27) — keep the shared-`installkit` vendor model** (resolves the §10c
+     vendor-vs-duplicate fork). Scope that follows: **vendor `installkit` into voice-agent at a pinned
+     SHA and wire its first real consumer** — route `voice_agent_install/units.py` through
+     `installkit.templating.render_unit`, killing the mount-dependency invariant now **duplicated**
+     across `installkit/templating.py` + `units.py`. GA is scoping + self-pressure-testing the spec;
+     VAC pressure-tests it, drives collab-adversarial to full consensus, then codes (the maintainer's gate: no
+     code until GA sign-off). Constraint: the public pin can't be *real* until the push freeze lifts —
+     vendor from the local SHA now, formalize the pinned public SHA + SHA-match CI at push.
+   - **Status (2026-07-27): DONE — coded + GA review-passed, UNCOMMITTED.** Whole `installkit`
+     vendored at `78ff1cd`; `units.py` renders via `installkit.templating`; the duplicated invariant is
+     gone; isolation tests + `Makefile` (provisional pin) in place. 714 green. Awaits the maintainer's gates:
+     commit/push + the Pi clean-box deploy-test + freeze-lift (finalize pin, wire SHA-match CI).
 2. **Auto-detect the LAN brain** — mDNS/zeroconf or known-port probe → auto-fill brain host + token,
    replacing the hand-edited `.env`. "Fire it up and it finds the brain."
 3. **HW-tiering** — detect-once-write-config (never a per-startup probe): strong HW runs local

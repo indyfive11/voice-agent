@@ -1,4 +1,10 @@
-"""systemd ``--user`` unit generation for the voice roles.
+"""The satellite's systemd ``--user`` unit — its SHAPE and pacing intent.
+
+This module owns *which* unit a voice satellite needs (Layer B, app-domain intent). It does NOT render
+it: the safe render is delegated to ``installkit.templating.render_unit`` (Layer A, the vendored
+boot-safety chokepoint whose API cannot even express a Tier-0 boot-network violation — no ``Type=``, no
+``Requires=``, no ``ExecStartPre``, ``RestartSec`` floored, newlines rejected). ``satellite_unit()``
+returns the kwargs; the caller renders with ``render_unit(**satellite_unit(...))``.
 
 GROUND TRUTH, snapshotted from the reference satellite 2026-07-21 before writing a line of this
 (INSTALL_PLAN §9 item 3 requires it, and the snapshot immediately earned its keep — the live unit
@@ -20,39 +26,47 @@ Each choice here fixes a specific way the naive translation fails:
   dependency resolve off the boot path — that resolve can touch the network, and a network operation
   on the boot path is a Tier-0 boot-safety violation.
 - **Because we bypass ``run.sh``, ``BRAIN`` must be in ``.env``.** ``run.sh gab`` is what exported
-  ``BRAIN=gabagent``; drop the wrapper and that argv is gone. The role provisioner writes it.
+  ``BRAIN=gabagent``; drop the wrapper and that argv is gone. The role provisioner writes it. The unit
+  needs no ``EnvironmentFile=``: ``WorkingDirectory=<root>`` puts cwd at the root, and the app
+  self-loads ``<root>/.env`` via ``load_dotenv(override=True)`` at import (``main.py``/``config.py``).
 - **Sound-server ordering.** The transient unit never raced PipeWire because a human started it long
   after login. A linger-started boot unit does race it, and losing that race is the ``-9997``
-  output-failure class already in the tracker.
+  output-failure class already in the tracker. Hence ``Wants=``/``After=`` the sound stack — ``Wants=``
+  not ``Requires=`` so a box running bare ALSA still starts the agent.
 - **``RestartSec`` is load-bearing, not boilerplate.** ``main.py`` deliberately ``os._exit(1)``s so a
   supervisor re-initialises a wedged mic. With systemd's 100ms default, three mic stalls inside the
   start-limit window latch the unit ``failed`` PERMANENTLY — the satellite is bricked until someone
-  SSHes in and runs ``reset-failed``, which is precisely the remote-hands dependency this whole
-  exercise exists to remove.
+  SSHes in and runs ``reset-failed``. installkit's renderer floors this by construction; we pass the
+  measured pacing (``15 × (5−1) = 60s`` latch window) explicitly so the intent is declared here, not
+  inherited from installkit's identical default.
 - **No ``Requires=`` on anything remote, ever.** The brain is on another box; boot-safety says a
-  remote dependency may never gate startup. An unreachable brain is a degraded start, not a failed
-  boot.
+  remote dependency may never gate startup. installkit's ``render_unit`` has no ``Requires=`` parameter
+  at all, so this is guaranteed structurally rather than remembered.
 
 **AND THE EXCEPTION THAT IS NOT OURS TO REFUSE — KEEP THE INSTALL ROOT ON A LOCAL FILESYSTEM.**
-Omitting ``Requires=`` from this generator does NOT mean a rendered unit carries none. systemd derives
-an implicit ``RequiresMountsFor=`` — a genuine ``Requires=``/``After=`` on mount units — from every
-path-taking directive, and ``WorkingDirectory=`` is one (``systemd.exec(5)``; measured on a live
-``--user`` manager: ``WorkingDirectory=/tmp`` → ``RequiresMountsFor=/tmp``, ``After=… tmp.mount``).
-``UnitSpec.working_directory`` is REQUIRED, so **every unit this module emits carries one.**
-
-On a local disk that is inert. Point it at NFS, autofs, sshfs or removable media and the satellite's
-unit gains a hard mount dependency on a network filesystem — the Tier-0 cascade-failure shape the rest
-of this docstring exists to forbid, arrived at by a path nobody would think to look for. It is not
-hypothetical for the XDG layout, whose root sits under ``$HOME``, and a home directory on NFS is an
-ordinary deployment. The string leaves here clean and systemd adds the dependency afterwards, so **no
-test of rendered text can catch it** — which is exactly why it is written down instead of guarded.
+Omitting ``Requires=`` does NOT mean a rendered unit carries none. systemd derives an implicit
+``RequiresMountsFor=`` — a genuine ``Requires=``/``After=`` on mount units — from every path-taking
+directive, and ``WorkingDirectory=`` is one (``systemd.exec(5)``; measured on a live ``--user``
+manager: ``WorkingDirectory=/tmp`` → ``RequiresMountsFor=/tmp``, ``After=… tmp.mount``). We always pass
+``working_directory=root``, so every emitted unit carries one. On a local disk that is inert. Point it
+at NFS, autofs, sshfs or removable media and the satellite's unit gains a hard mount dependency on a
+network filesystem — the Tier-0 cascade-failure shape the rest of this docstring exists to forbid,
+arrived at by a path nobody would think to look for. It is not hypothetical for the XDG layout, whose
+root sits under ``$HOME``, and a home directory on NFS is an ordinary deployment. The string leaves
+here clean and systemd adds the dependency afterwards, so **no test of rendered text can catch it** —
+which is exactly why it is written down instead of guarded. (installkit's ``render_unit`` documents the
+identical caveat at its own chokepoint; neither layer can mitigate it.)
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-
-__all__ = ["UnitSpec", "render_unit", "SATELLITE_SOUND_UNITS"]
+__all__ = [
+    "satellite_unit",
+    "SATELLITE_SOUND_UNITS",
+    "DEFAULT_RESTART_SEC",
+    "DEFAULT_START_LIMIT_BURST",
+    "DEFAULT_START_LIMIT_INTERVAL",
+]
 
 # The user-session sound stack. Wants= (not Requires=) so a box running bare ALSA — no PipeWire at all
 # — still starts the agent instead of failing on a dependency it never needed.
@@ -61,79 +75,32 @@ SATELLITE_SOUND_UNITS = ("pipewire.service", "pipewire-pulse.service", "wireplum
 # Restart pacing. 15s is chosen against main.py's watchdog: long enough that a genuine restart loop is
 # visibly slow rather than a CPU-spinning hot loop, short enough that a real recovery (USB re-enumeration
 # after the power-cycle rung) completes well inside one interval. The start limit is then sized so the
-# unit tolerates several watchdog restarts in a row WITHOUT latching failed.
+# unit tolerates several watchdog restarts in a row WITHOUT latching failed: 15 × (5−1) = 60s, which is
+# exactly installkit's chokepoint-5 latch-window floor — we pass it explicitly rather than lean on the
+# renderer's (identical) default, so the value is asserted as this role's declared intent.
 DEFAULT_RESTART_SEC = 15
 DEFAULT_START_LIMIT_BURST = 5
 DEFAULT_START_LIMIT_INTERVAL = 600
 
 
-@dataclass(frozen=True)
-class UnitSpec:
-    """Everything needed to render one ``--user`` service unit."""
+def satellite_unit(*, root: str, venv_python: str,
+                   description: str = "Aria voice satellite") -> dict[str, object]:
+    """Return the kwargs for ``installkit.templating.render_unit`` describing the satellite's unit:
+    run the agent, survive a cold boot, never gate on the brain.
 
-    description: str
-    exec_start: str
-    working_directory: str
-    wants: tuple[str, ...] = ()
-    after: tuple[str, ...] = ()
-    environment: dict[str, str] = field(default_factory=dict)
-    restart: str = "on-failure"
-    restart_sec: int = DEFAULT_RESTART_SEC
-    start_limit_burst: int = DEFAULT_START_LIMIT_BURST
-    start_limit_interval: int = DEFAULT_START_LIMIT_INTERVAL
-    wanted_by: str = "default.target"
-
-
-def _check_no_newline(value: str, field_name: str) -> str:
-    """A newline in a rendered field would inject arbitrary directives into the unit. Reject rather
-    than escape — every value here comes from detection or an operator prompt, and there is no
-    legitimate multi-line unit field in this generator."""
-    if "\n" in value or "\r" in value:
-        raise ValueError(f"{field_name} must not contain a newline: {value!r}")
-    return value
-
-
-def render_unit(spec: UnitSpec) -> str:
-    """Render ``spec`` to systemd unit text.
-
-    Note what is deliberately ABSENT: no ``Requires=``, no ``ExecStartPre`` that touches the network,
-    and no ``TimeoutStartSec`` long enough to stall a boot. The unit's whole remote story is "start,
-    and let the app's in-process retry handle a brain that is not up yet."
+    No ``environment_file`` is passed — the app self-loads ``<root>/.env`` from cwd, and cwd is
+    ``WorkingDirectory=root``. Pacing is passed explicitly so this role declares its own intent (the
+    values equal installkit's safe defaults, but relying on the default would make the value-asserts in
+    the tests meaningless).
     """
-    for name, value in (("description", spec.description), ("exec_start", spec.exec_start),
-                        ("working_directory", spec.working_directory)):
-        _check_no_newline(value, name)
-
-    lines = ["[Unit]", f"Description={_check_no_newline(spec.description, 'description')}"]
-    if spec.wants:
-        lines.append("Wants=" + " ".join(spec.wants))
-    if spec.after:
-        lines.append("After=" + " ".join(spec.after))
-    # StartLimit* belong in [Unit] on modern systemd; Restart*/RestartSec belong in [Service].
-    lines.append(f"StartLimitIntervalSec={int(spec.start_limit_interval)}")
-    lines.append(f"StartLimitBurst={int(spec.start_limit_burst)}")
-
-    lines += ["", "[Service]", "Type=simple",
-              f"WorkingDirectory={spec.working_directory}",
-              f"ExecStart={spec.exec_start}"]
-    for key in sorted(spec.environment):
-        lines.append(f'Environment="{key}={_check_no_newline(spec.environment[key], key)}"')
-    lines += [f"Restart={spec.restart}", f"RestartSec={int(spec.restart_sec)}"]
-
-    lines += ["", "[Install]", f"WantedBy={spec.wanted_by}", ""]
-    return "\n".join(lines)
-
-
-def satellite_unit(*, root: str, venv_python: str, description: str = "Aria voice satellite") -> UnitSpec:
-    """The satellite's unit: run the agent, survive a cold boot, never gate on the brain."""
-    return UnitSpec(
+    return dict(
         description=description,
         exec_start=f"{venv_python} main.py",
         working_directory=root,
         wants=SATELLITE_SOUND_UNITS,
         after=SATELLITE_SOUND_UNITS,
-        # XDG_RUNTIME_DIR is normally set for a --user unit by the user manager itself; we do NOT
-        # hardcode /run/user/<uid> here, because pinning a uid is exactly the installation-specific
-        # constant the portability SOP forbids.
-        environment={},
+        restart="on-failure",
+        restart_sec=DEFAULT_RESTART_SEC,
+        start_limit_burst=DEFAULT_START_LIMIT_BURST,
+        start_limit_interval=DEFAULT_START_LIMIT_INTERVAL,
     )

@@ -10,6 +10,7 @@ the code, so that a regression reintroducing one fails here instead of on a sate
 
 import pytest
 
+from installkit import templating
 from voice_agent_install import envfile, profile, units
 from voice_agent_install import satellite as sat
 from voice_agent_install import verify
@@ -152,8 +153,9 @@ def test_sample_rate_unset_unless_detected():
 
 # ------------------------------------------------------------------ unit generation
 def _unit(**kw):
-    return units.render_unit(units.satellite_unit(root="/home/x/voice-agent",
-                                                  venv_python="/home/x/voice-agent/.venv/bin/python", **kw))
+    return templating.render_unit(**units.satellite_unit(
+        root="/home/x/voice-agent",
+        venv_python="/home/x/voice-agent/.venv/bin/python", **kw))
 
 
 def test_unit_execs_venv_python_not_uv():
@@ -187,9 +189,11 @@ def test_unit_restart_sec_prevents_the_permanent_failed_latch():
 
 
 def test_unit_rejects_newline_injection():
+    # installkit's render_unit raises ValueError on a newline in any rendered field (its message text
+    # differs from the old local renderer's, so assert the TYPE, not the message).
     with pytest.raises(ValueError):
-        units.render_unit(units.UnitSpec(description="x\nExecStartPre=/bin/rm -rf /",
-                                         exec_start="/bin/true", working_directory="/tmp"))
+        templating.render_unit(description="x\nExecStartPre=/bin/rm -rf /",
+                               exec_start="/bin/true", working_directory="/tmp")
 
 
 # ------------------------------------------------------------------ credential classification

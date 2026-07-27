@@ -39,6 +39,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional, Sequence
 
+from installkit import templating  # vendored Layer-A boot-safety chokepoint (see installkit/ + Makefile pin)
+
 from . import audio_detect, discovery, envfile, profile, units, verify
 from .paths import Layout, detect_layout
 
@@ -328,8 +330,8 @@ def install_unit(layout: Layout, *, unit_name: str = DEFAULT_UNIT_NAME,
     target.mkdir(parents=True, exist_ok=True)
     path = target / unit_name
 
-    text = units.render_unit(units.satellite_unit(root=str(layout.root),
-                                                  venv_python=str(layout.venv_python)))
+    text = templating.render_unit(**units.satellite_unit(root=str(layout.root),
+                                                         venv_python=str(layout.venv_python)))
     path.write_text(text, encoding="utf-8")
     # Assert the ARTIFACT, not the call: the whole class of bug this package keeps hitting is a step
     # that reports success without producing anything.
