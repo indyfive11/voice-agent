@@ -66,17 +66,22 @@ converts "the PoC" from an aspiration into the forcing function.
      VAC pressure-tests it, drives collab-adversarial to full consensus, then codes (the maintainer's gate: no
      code until GA sign-off). Constraint: the public pin can't be *real* until the push freeze lifts —
      vendor from the local SHA now, formalize the pinned public SHA + SHA-match CI at push.
-   - **Status (2026-07-27): DONE — coded + GA review-passed, UNCOMMITTED.** Whole `installkit`
-     vendored at `78ff1cd`; `units.py` renders via `installkit.templating`; the duplicated invariant is
-     gone; isolation tests + `Makefile` (provisional pin) in place. 714 green. Awaits the maintainer's gates:
-     commit/push + the Pi clean-box deploy-test + freeze-lift (finalize pin, wire SHA-match CI).
+   - **Status (2026-07-27): SHIPPED — published, deploy-verified.** Whole `installkit` vendored at
+     `78ff1cd`; `units.py` renders via `installkit.templating`; the duplicated invariant is gone. Public
+     `origin/main` (PII-clean whole history); the pin is finalized against public `installkit` with a
+     **SHA-match / tree-OID vendor-check CI (green)**, a fresh-public-clone **clean-box test passed**, and
+     a real-ARM **Pi deploy-test passed** (`PROVISION_EXIT 0`). The maintainer's remaining gate is the live
+     spoken wake→response on the redeployed Pi.
 2. **Auto-detect the LAN brain** — mDNS/zeroconf or known-port probe → auto-fill brain host + token,
    replacing the hand-edited `.env`. "Fire it up and it finds the brain."
    - **Firewall-aware reachability** (a filtered mDNS responder reads identically to a dead one) — the
      ratified detect-and-report design lives in **gabagent `INSTALL_PLAN.md` §10d** (named link, not
      restated here, per the cross-repo "named links not merged content" rule). Layer-B owns the browse
      + reason vocabulary + rendered operator remedy; detect-only, never mutates a host firewall.
-     **Unbuilt** — the `discovery.py` browse primitive exists + is tested but is unwired. *(internal: P9)*
+     **SHIPPED** — `diagnose_brain_discovery()` wired into the satellite-install path (reason vocabulary
+     + firewall-aware operator remedy, non-fatal fall-through to the typed host+port floor); public on
+     `origin/main`, full suite green, live-verified on the reference box against the real LAN (no firewall
+     touched). *(internal: P9)*
 3. **HW-tiering** — detect-once-write-config (never a per-startup probe): strong HW runs local
    STT/TTS, weak HW (Pi-class) offloads. Per the no-hardcodes portability SOP.
 4. **Protocol de-branding — [GitHub #1](https://github.com/indyfive11/voice-agent/issues/1)**
