@@ -102,6 +102,10 @@ keeps adding it later backward-compatible.
 - **Loopback by default.** The reference deployment binds `127.0.0.1` and is not a network service. A LAN
   deployment instead binds the brain to the LAN address behind a bearer token the front-end presents on every
   request — the endpoints and event types are unchanged.
+- **Token provisioning & pairing.** Obtaining that bearer token is a brain concern. A brain may support
+  zero-touch pairing — the satellite claims the token over the wire during a short operator-opened window —
+  documented in the reference brain's pairing spec (gabagent `docs/PAIRING.md`); a brain that enforces auth
+  must hold a config-visible token (an env-provided token is honored).
 
 ## Building your own side
 
