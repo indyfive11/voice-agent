@@ -70,3 +70,11 @@ aur/voice-agent-git/
 comms/
 wake-train/
 docs/research/
+
+# Local-only scratch + hardware artifacts (never shipped):
+#   scratchpad/  session working docs (folded into memory when finalized)
+#   hardware/    local CAD / 3D-print sources (e.g. mega4-case OpenSCAD) — kept on disk, not tracked
+#   result.json  OrcaSlicer slice-export byproduct
+scratchpad/
+hardware/
+result.json
