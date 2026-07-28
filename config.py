@@ -267,35 +267,41 @@ def build_llm():
     Returns just the LLM service; `main.py` wraps it in the universal LLMContext /
     LLMContextAggregatorPair, so this stays provider-agnostic for the caller.
 
-    BRAIN selects an *external* agent as the brain (e.g. gabagent) instead of a raw LLM:
-    BRAIN=local (default) uses the LLM_PROVIDER path below; BRAIN=gabagent will return a
-    BrainLLMService talking to gabagent over the Brain protocol.
+    BRAIN selects an *external* agent as the brain instead of a raw LLM. BRAIN=local
+    (default) uses the LLM_PROVIDER path below; BRAIN=remote (brain-neutral) — or the
+    reference-brain alias BRAIN=gabagent — returns a BrainLLMService talking to any brain
+    that speaks the HTTP/SSE Brain protocol (see gabagent's docs/VOICE_PROTOCOL.md).
     """
     brain = (_env("BRAIN", "local") or "local").lower()
-    if brain == "gabagent":
+    # Brain-neutral selector: `remote` drives any HTTP/SSE brain; `gabagent` is the
+    # reference-brain alias kept for back-compat (both take the same client path).
+    if brain in ("remote", "gabagent"):
         from brains.brain_llm_service import BrainLLMService
         from brains.http_brain_client import HttpBrainClient
 
-        # SOP (no install-specific hardcode): GAB_BIN override → `gab` on PATH → legacy home fallback.
+        # Connection knobs: brain-neutral BRAIN_* wins, else the reference-brain GAB_* (back-compat),
+        # else the default. Per issue #1 the GAB_* names stay valid — they're allowed behind the selector.
         import shutil
-        gab_bin = (
-            _env("GAB_BIN")
+        host = _env("BRAIN_HOST") or _env("GAB_HOST") or "127.0.0.1"
+        port = _env("BRAIN_PORT") or _env("GAB_PORT") or "8765"
+        project = _env("BRAIN_PROJECT_DIR") or _env("GAB_PROJECT_DIR") or os.getcwd()
+        base_url = f"http://{host}:{port}"
+        # A LAN bearer token for a remote brain (Pi satellite, Topology B) — must match the brain's
+        # voice auth token. None on loopback (the default), where the brain runs unauthenticated.
+        auth_token = _env("BRAIN_AUTH_TOKEN") or _env("GAB_AUTH_TOKEN")
+        # Spawn is reference-brain-only: we can launch the gabagent `gab` binary on loopback, but a
+        # generic `remote` brain is always attach-only (the user runs it; we just connect). A non-
+        # loopback host is attach-only either way. BRAIN_LAUNCH / GAB_LAUNCH override (0 = never spawn).
+        # SOP (no install-specific hardcode): BRAIN_BIN/GAB_BIN override → `gab` on PATH → home fallback.
+        brain_bin = (
+            _env("BRAIN_BIN") or _env("GAB_BIN")
             or shutil.which("gab")
             or os.path.expanduser("~/dev/gabagent/.venv/bin/gab")
         )
-        host = _env("GAB_HOST", "127.0.0.1")
-        port = _env("GAB_PORT", "8765")
-        project = _env("GAB_PROJECT_DIR", os.getcwd())
-        base_url = f"http://{host}:{port}"
-        # A LAN bearer token for a remote brain (Pi satellite, Topology B) — must match the brain's
-        # GABAI_VOICE_AUTH_TOKEN. None on loopback (the default), where the brain runs unauthenticated.
-        auth_token = _env("GAB_AUTH_TOKEN")
-        # Attach vs spawn: a remote brain can't be spawned from here, so a non-loopback GAB_HOST
-        # defaults to attach-only (the brain runs on the other box). Loopback defaults to connect-or-
-        # spawn (HttpBrainClient.start() attaches if one is already healthy, else launches its own).
-        # GAB_LAUNCH overrides either way (0 = attach-only even on loopback).
         is_remote = host not in ("127.0.0.1", "localhost", "::1")
-        do_launch = _env("GAB_LAUNCH", "0" if is_remote else "1") not in ("0", "false", "False")
+        spawnable = brain == "gabagent" and not is_remote
+        do_launch = (_env("BRAIN_LAUNCH") or _env("GAB_LAUNCH") or ("1" if spawnable else "0")) \
+            not in ("0", "false", "False")
         # Multi-room foundation: ROOM_ID is the durable per-room/device routing key (default = hostname);
         # capabilities is this client's profile (what it does locally vs offloads), declared once at /attach.
         room_id = _room_id()
@@ -304,11 +310,11 @@ def build_llm():
         # already sends per turn; default=hostname keeps EM-local on its existing bucket, no migration
         # (process-per-room: one brain per room — see the brain-topology decision).
         launch = (
-            [gab_bin, "--voice-serve", "--port", str(port), "--cwd", project, "--room-id", room_id]
+            [brain_bin, "--voice-serve", "--port", str(port), "--cwd", project, "--room-id", room_id]
             if do_launch else None
         )
         logger.info(
-            f"Brain: gabagent (HTTP/SSE {base_url}, project={project}, "
+            f"Brain: {brain} (HTTP/SSE {base_url}, project={project}, "
             f"{'spawn' if launch else 'attach'}, auth={'on' if auth_token else 'off'})"
         )
         stt_provider = (_env("STT_PROVIDER", "whisper") or "whisper").lower()
@@ -324,7 +330,7 @@ def build_llm():
             room_id=room_id, capabilities=capabilities,
         ))
     if brain != "local":
-        raise ValueError(f"Unknown BRAIN={brain!r} (expected local|gabagent)")
+        raise ValueError(f"Unknown BRAIN={brain!r} (expected local|remote|gabagent)")
 
     provider = (_env("LLM_PROVIDER", "anthropic") or "anthropic").lower()
     model = _env("LLM_MODEL")
@@ -1772,16 +1778,18 @@ async def reresolve_brain_host() -> None:
     """
     import asyncio
 
-    if (_env("BRAIN", "local") or "local").lower() != "gabagent":
+    if (_env("BRAIN", "local") or "local").lower() not in ("remote", "gabagent"):
         return  # a local LLM brain has no host to find
     if (_env("BRAIN_REDISCOVER", "0") or "0") in ("0", "false", "False", "no"):
         return  # historical no-op
 
-    host = _env("GAB_HOST", "127.0.0.1") or "127.0.0.1"
+    # Neutral BRAIN_HOST/BRAIN_PORT win, else the reference-brain GAB_* (back-compat).
+    host_key = "BRAIN_HOST" if _env("BRAIN_HOST") else "GAB_HOST"
+    host = _env(host_key, "127.0.0.1") or "127.0.0.1"
     try:
-        port = int(_env("GAB_PORT", "8765") or 8765)
+        port = int(_env("BRAIN_PORT") or _env("GAB_PORT", "8765") or 8765)
     except ValueError:
-        logger.warning("BRAIN | re-resolve skipped: GAB_PORT is not an integer")
+        logger.warning("BRAIN | re-resolve skipped: brain port is not an integer")
         return
     try:
         budget = float(_env("BRAIN_RERESOLVE_BUDGET_SECS", "9.0") or 9.0)
@@ -1802,7 +1810,7 @@ async def reresolve_brain_host() -> None:
         return
 
     if new_host != host:
-        os.environ["GAB_HOST"] = new_host
+        os.environ[host_key] = new_host
         logger.info(f"BRAIN | re-resolve: {host} -> {new_host} ({reason})")
         _repoint_remote_services(host, new_host)
     else:

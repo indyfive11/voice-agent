@@ -10,20 +10,21 @@ full tool-using agent. There is no code dependency on any particular brain.
 
 ## Companion project
 
-[`gabagent`](https://github.com/indyfive11/gabagent) is the reference **brain** — a tool-using
+[`gabagent`](https://github.com/indyfive11/gabagent) is one reference **brain** — a tool-using
 coding/desktop agent with an escalating-tier safety model. The two are **loosely coupled — docs and
-protocol only, no code dependency** in either direction. The brain↔shell contract lives in gabagent's
-[`docs/VOICE_PROTOCOL.md`](https://github.com/indyfive11/gabagent/blob/master/docs/VOICE_PROTOCOL.md).
-Run voice-agent with `BRAIN=local` and never touch gabagent, or wire them
-together for a full voice-driven agent.
+protocol only, no code dependency** in either direction. The brain↔shell contract is the brain-agnostic
+[`docs/VOICE_PROTOCOL.md`](docs/VOICE_PROTOCOL.md) owned here (the front-end defines what any brain must
+speak); each brain implements it. Run voice-agent with `BRAIN=local` and never touch gabagent, or wire
+them together for a full voice-driven agent.
 
-> **Brain-agnostic; de-branding in progress ([#1](https://github.com/indyfive11/voice-agent/issues/1)).**
-> The design is brain-agnostic (the `brains/` seam, `BRAIN=local` default). The neutral output-stream
-> property is `voicebrain.duck_exclude` — specified under
-> [Stream properties](https://github.com/indyfive11/gabagent/blob/master/docs/VOICE_PROTOCOL.md#stream-properties);
-> the shell stamps it alongside the legacy `gabagent.duck_exclude` during the brain's dual-read migration
-> (the legacy key is dropped once every brain reads the neutral one). Neutralizing the `/media/*` names
-> is the remaining part of #1.
+> **Brain-agnostic; de-branding all but complete ([#1](https://github.com/indyfive11/voice-agent/issues/1)).**
+> The design is brain-agnostic (the `brains/` seam, `BRAIN=local` default). Select any HTTP/SSE brain with
+> `BRAIN=remote` (set `BRAIN_HOST`/`BRAIN_PORT`); `BRAIN=gabagent` and the `GAB_*` env are kept as the
+> reference-brain aliases. The neutral output-stream property is `voicebrain.duck_exclude` — specified under
+> [Stream properties](docs/VOICE_PROTOCOL.md#stream-properties-audio-duck-exclude); the shell stamps it
+> alongside the legacy `gabagent.duck_exclude` during the brain's dual-read migration (the legacy key is
+> dropped once every brain reads the neutral one). The `/media/*` endpoint names are already neutral — all
+> that remains of #1 is that fleet-gated flag-day drop.
 
 ## Stack
 
