@@ -309,8 +309,14 @@ def build_llm():
         # not the brain's implicit 'default'. This just makes explicit-at-launch the room_id the client
         # already sends per turn; default=hostname keeps EM-local on its existing bucket, no migration
         # (process-per-room: one brain per room — see the brain-topology decision).
+        # Bind the SPAWNED brain to the same (loopback) host the client connects to — explicitly.
+        # Spawn only happens when host is loopback (not is_remote), and the client talks to `host`.
+        # Passing --voice-host pins the bind; without it the brain resolves voice_host from the shared
+        # settings.json (which may hold a LAN IP for a co-resident LAN brain) and collides / binds the
+        # wrong address.
         launch = (
-            [brain_bin, "--voice-serve", "--port", str(port), "--cwd", project, "--room-id", room_id]
+            [brain_bin, "--voice-serve", "--voice-host", host,
+             "--port", str(port), "--cwd", project, "--room-id", room_id]
             if do_launch else None
         )
         logger.info(
