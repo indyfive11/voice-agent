@@ -41,7 +41,7 @@ from typing import Callable, Optional, Sequence
 
 from installkit import templating  # vendored Layer-A boot-safety chokepoint (see installkit/ + Makefile pin)
 
-from . import audio_detect, discovery, envfile, profile, units, verify
+from . import audio_detect, discovery, envfile, pairing, profile, units, verify
 from .paths import Layout, detect_layout
 
 __all__ = ["SatelliteAnswers", "compose_env", "service_url", "DEFAULT_STT_PORT", "DEFAULT_TTS_PORT",
@@ -253,13 +253,21 @@ def _unit_dir() -> Path:
 
 
 def gather(console: Console, *, layout: Layout, proc_asound: str = "/proc/asound",
-           providers: Optional[Sequence[Callable[[], Optional[discovery.BrainEndpoint]]]] = None
-           ) -> SatelliteAnswers:
+           providers: Optional[Sequence[Callable[[], Optional[discovery.BrainEndpoint]]]] = None,
+           pair: bool = False,
+           pair_fn: Optional[Callable[..., pairing.PairOutcome]] = None) -> SatelliteAnswers:
     """Detection + prompts → the full answer set. Pure of side effects apart from the console.
 
     ``providers`` overrides the discovery seam. Default is the maintainer-locked ``(mdns, manual)`` order;
     a test supplies its own so the flow never opens a socket, and a future provider slots in here
     without touching this function.
+
+    ``pair`` (``--pair``) replaces the hand-typed brain token with the 3c pairing handshake: the brain
+    hands its auth token to this box over the wire during a human-opened window (all human interaction is
+    brain-side — this box stays headless). A pairing failure raises before ``compose``/``apply``, so a
+    box that could not pair writes and enables NOTHING (no headless wedge). ``pair_fn`` injects the client
+    for tests; unset ⇒ the real bounded :func:`pairing.pair_for_token`. STT/TTS tokens are still prompted —
+    MVP pairing carries the brain auth token only (STT/TTS auto-fetch is a flagged later increment).
     """
     room_id = console.ask("Room id for this satellite (e.g. the room it lives in)", "")
     while not room_id:
@@ -290,9 +298,28 @@ def gather(console: Console, *, layout: Layout, proc_asound: str = "/proc/asound
         raise _ProvisionError("no brain host was supplied — a satellite must point at another box")
     console.out(f"  brain: {endpoint.host}:{endpoint.port} (via {endpoint.source})")
 
-    # Three secrets, from two different services. This is the honest floor; 3c's pairing handshake is
-    # what removes the typing, and nothing below depends on HOW they arrive.
-    brain_token = console.secret("Brain auth token (the brain's GABAI_VOICE_AUTH_TOKEN)")
+    # Three secrets, from two different services. Prompting is the honest floor; 3c's pairing handshake
+    # removes the typing of the BRAIN token — nothing below depends on HOW it arrives.
+    if pair:
+        # The brain hands out its token over the wire during a human-opened window. This box never
+        # prompts for it — every human action is on the brain console (`gab pairvoiceagent`). A failure
+        # aborts the whole gather (raised below) so nothing is written/enabled: a headless box has no
+        # prompt floor, so "could not pair" must mean "install failed," never "silently unconfigured."
+        import socket
+        pair_call = pair_fn or pairing.pair_for_token
+        console.out("Pairing with the brain for its auth token — open a window on the BRAIN: "
+                    "`gab pairvoiceagent`, then accept this box…")
+        outcome = pair_call(endpoint.host, endpoint.port, room_id=room_id,
+                            label=socket.gethostname(),
+                            state=pairing.PairState.for_root(layout.root),
+                            on_status=lambda m: console.out(f"  {m}"))
+        if not outcome.ok:
+            for line in outcome.remedy.splitlines():
+                console.out(f"  {line}")
+            raise _ProvisionError(f"pairing failed ({outcome.reason}): {outcome.detail}")
+        brain_token = outcome.token
+    else:
+        brain_token = console.secret("Brain auth token (the brain's GABAI_VOICE_AUTH_TOKEN)")
     stt_token = console.secret("STT service token (STT_SERVICE_AUTH_TOKEN)")
     tts_token = console.secret("TTS service token (TTS_SERVICE_AUTH_TOKEN)")
 
@@ -428,15 +455,23 @@ def provision(console: Console, *, root: Optional[str] = None, dry_run: bool = F
               skip_verify: bool = False, unit_name: str = DEFAULT_UNIT_NAME,
               proc_asound: str = "/proc/asound",
               providers: Optional[Sequence[Callable[[], Optional[discovery.BrainEndpoint]]]] = None,
+              pair: bool = False,
+              pair_fn: Optional[Callable[..., pairing.PairOutcome]] = None,
               run: Callable[[Sequence[str]], subprocess.CompletedProcess] = _default_run,
               unit_dir: Optional[Path] = None) -> tuple[int, list[StepResult]]:
-    """The whole flow. Returns ``(exit_code, steps)`` — never raises for an operator-caused failure."""
+    """The whole flow. Returns ``(exit_code, steps)`` — never raises for an operator-caused failure.
+
+    ``pair`` routes the brain token through the 3c pairing handshake instead of a prompt; because pairing
+    runs inside ``gather`` (before ``compose``/``apply``), a pairing failure returns ``EXIT_PROVISION_FAILED``
+    with nothing written or enabled — the bounded-deadline abort-before-apply property, for free.
+    """
     steps: list[StepResult] = []
     layout = detect_layout(override=root)
     console.out(f"Install layout: {layout.kind} at {layout.root} ({layout.reason})")
 
     try:
-        answers = gather(console, layout=layout, proc_asound=proc_asound, providers=providers)
+        answers = gather(console, layout=layout, proc_asound=proc_asound, providers=providers,
+                         pair=pair, pair_fn=pair_fn)
     except (_ProvisionError, _NonInteractive) as e:
         steps.append(StepResult("gather", False, str(e)))
         return EXIT_PROVISION_FAILED, steps
@@ -504,6 +539,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         help="never prompt; fail instead of guessing an unanswerable value")
     parser.add_argument("--skip-verify", action="store_true",
                         help="do not probe the brain/STT/TTS legs after writing")
+    parser.add_argument("--pair", action="store_true",
+                        help="obtain the brain auth token via the pairing handshake instead of typing it "
+                             "(open a window on the brain with `gab pairvoiceagent` and accept this box)")
     parser.add_argument("--unit-name", default=DEFAULT_UNIT_NAME, help=f"(default: {DEFAULT_UNIT_NAME})")
     args = parser.parse_args(list(argv) if argv is not None else None)
 
@@ -514,7 +552,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return EXIT_USAGE
 
     code, steps = provision(console, root=args.root, dry_run=args.dry_run,
-                            skip_verify=args.skip_verify, unit_name=args.unit_name)
+                            skip_verify=args.skip_verify, pair=args.pair, unit_name=args.unit_name)
 
     console.out("\n--- provisioning summary ---")
     for step in steps:
