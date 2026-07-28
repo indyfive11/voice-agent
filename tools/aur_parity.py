@@ -54,9 +54,13 @@ def _norm(tok: str) -> str:
 
 def _parse_pkgbuild(text: str) -> tuple[set[str], set[str]]:
     """Return (depends, launcher_excludes). Raises ValueError on an unparseable PKGBUILD."""
-    dm = re.search(r"^depends=\(([^)]*)\)", text, re.MULTILINE)
+    # [^)\n]* is bounded to the depends LINE on purpose: a missing closing paren must FAIL LOUD (no
+    # match -> parse error), never silently over-capture across newlines into the next array (which
+    # would "parse" a malformed PKGBUILD and could pass on a coincidental token overlap). depends is a
+    # single-line array here; a deliberately multi-line depends would need this widened with intent.
+    dm = re.search(r"^depends=\(([^)\n]*)\)", text, re.MULTILINE)
     if not dm:
-        raise ValueError("no depends=(...) array found")
+        raise ValueError("no depends=(...) array found (malformed/missing closing paren?)")
     depends = {
         _norm(a or b) for a, b in re.findall(r"'([^']*)'|\"([^\"]*)\"", dm.group(1)) if (a or b)
     }
