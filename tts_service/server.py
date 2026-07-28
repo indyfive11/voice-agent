@@ -10,7 +10,7 @@ Design (same foundation as the STT service):
   spawn/collapse one per room later with zero protocol change.
 - **/health open**; everything else needs ``Authorization: Bearer <token>`` once a token is set.
 - **Non-blocking**: Kokoro ``create`` is sync/CPU-bound → run in a thread (``asyncio.to_thread``); an
-  ``asyncio.Semaphore`` (``EM_TTS_MAX_CONCURRENCY``, default 1) bounds concurrent synths on one model.
+  ``asyncio.Semaphore`` (``TTS_SERVICE_MAX_CONCURRENCY``, default 1) bounds concurrent synths on one model.
 - Reuses pipecat's Kokoro model resolution (``KOKORO_CACHE_DIR`` + ``_ensure_model_files``) so the model
   matches the in-pipeline Kokoro and auto-downloads on a fresh host.
 - **POST /tts** returns a self-describing **WAV** (16-bit mono at Kokoro's native rate); the client
@@ -19,7 +19,8 @@ Design (same foundation as the STT service):
   instead of the full reply — the satellite's biggest latency lever (token→audio: full-reply→first-sentence).
 
 Run:  ``uv run python -m tts_service.server --host 192.168.1.100 --port 8771``
-Env:  ``TTS_VOICE`` (default af_heart), ``TTS_SERVICE_AUTH_TOKEN``, ``EM_TTS_MAX_CONCURRENCY`` (1),
+Env:  ``TTS_VOICE`` (default af_heart), ``TTS_SERVICE_AUTH_TOKEN``,
+      ``TTS_SERVICE_MAX_CONCURRENCY`` (1; alias ``EM_TTS_MAX_CONCURRENCY``),
       ``TTS_SERVICE_HOST``/``TTS_SERVICE_PORT``, ``TTS_CACHE_SIZE`` (64; 0 disables the synth cache),
       ``TTS_PREWARM_PHRASES`` ('|'-separated fixed phrases synthesized into the cache at startup).
 
@@ -320,7 +321,9 @@ def main() -> None:
 
     token = os.environ.get("TTS_SERVICE_AUTH_TOKEN", "")
     default_voice = os.environ.get("TTS_VOICE") or "af_heart"
-    max_concurrency = int(os.environ.get("EM_TTS_MAX_CONCURRENCY", "1"))
+    # Machine-agnostic name; EM_TTS_MAX_CONCURRENCY kept as a deprecated back-compat alias.
+    max_concurrency = int(os.environ.get("TTS_SERVICE_MAX_CONCURRENCY")
+                          or os.environ.get("EM_TTS_MAX_CONCURRENCY") or "1")
     cache_size = int(os.environ.get("TTS_CACHE_SIZE", "64"))
     # Optional: phrases to synth into the cache at startup (so even the FIRST occurrence is instant — e.g.
     # the brain-down/error apologies). '|'-separated. Unset = cache-on-first-use only (default behavior).

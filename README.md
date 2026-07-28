@@ -40,7 +40,25 @@ them together for a full voice-driven agent.
 
 Everything is selected by environment variables — see [`.env.example`](.env.example).
 
-## Quick start
+## Install (self-provisioning)
+
+To stand up a box — especially a headless satellite — clone the repo and run one script. It provisions
+`uv` + the venv, then prompts, detects hardware, writes `.env`, and installs a systemd `--user` unit:
+
+```bash
+git clone https://github.com/indyfive11/voice-agent && cd voice-agent
+./bootstrap.sh                       # provision this box as a satellite (a thin client → LAN brain)
+./bootstrap.sh --role voice-host     # …or as the brain box, advertising itself for discovery
+```
+
+A **satellite** auto-discovers its brain over mDNS (or you type the IP); add `--pair` to claim the
+brain's auth token over the wire instead of typing it. Re-running is safe — it merges into an existing
+`.env`. Full walkthrough (roles, discovery, pairing, verification, exit codes): **[`docs/INSTALL.md`](docs/INSTALL.md)**.
+
+## Quick start (dev checkout)
+
+To run from a development checkout and edit `.env` by hand (no unit, no provisioning), use the steps
+below instead of the installer above.
 
 Requires **Python 3.12 or 3.13** (provisioned automatically by [`uv`](https://github.com/astral-sh/uv)) and
 system `portaudio` + `espeak-ng`. The **brain is pluggable**, so the API-key requirement depends on which one

@@ -12,7 +12,7 @@ Design (foundation for multi-room, hot-pluggable thin clients):
 - **/health is open** (unauthenticated liveness); every other route requires ``Authorization: Bearer
   <token>`` once a token is configured (mirrors the brain's bearer seam). Loopback with no token = open.
 - **Non-blocking.** The CPU-bound transcribe runs in a thread (``asyncio.to_thread``) so the event loop
-  stays free; an ``asyncio.Semaphore`` (``EM_STT_MAX_CONCURRENCY``, default 1) bounds concurrent
+  stays free; an ``asyncio.Semaphore`` (``STT_SERVICE_MAX_CONCURRENCY``, default 1) bounds concurrent
   transcribes against one shared model (multi-room contention later needs no protocol change).
 - Mirrors the in-pipeline Whisper config (``config.py`` build_stt): faster-whisper, ``STT_MODEL`` default
   ``small.en``, ``device=auto``.
@@ -21,7 +21,8 @@ Run:  ``uv run python -m stt_service.server --host 192.168.1.100 --port 8770``
 Env:  ``STT_SERVICE_BACKEND`` (faster | whispercpp; default faster), ``WHISPER_CPP_URL``
       (http://127.0.0.1:8079, the warm GPU whisper-server when backend=whispercpp),
       ``STT_MODEL`` (small.en), ``STT_SERVICE_DEVICE`` (auto), ``STT_SERVICE_COMPUTE_TYPE`` (default),
-      ``STT_SERVICE_AUTH_TOKEN``, ``EM_STT_MAX_CONCURRENCY`` (1), ``STT_SERVICE_HOST``/``STT_SERVICE_PORT``.
+      ``STT_SERVICE_AUTH_TOKEN``, ``STT_SERVICE_MAX_CONCURRENCY`` (1; alias ``EM_STT_MAX_CONCURRENCY``),
+      ``STT_SERVICE_HOST``/``STT_SERVICE_PORT``.
 
 Backends: faster-whisper is CPU-only here (CTranslate2 has no AMD/ROCm build). For GPU on the EM
 RX 7900 XT, run a loopback ``whisper-server`` (whisper.cpp, Vulkan) and set ``STT_SERVICE_BACKEND=
@@ -254,7 +255,9 @@ def main() -> None:
     args = parser.parse_args()
 
     token = os.environ.get("STT_SERVICE_AUTH_TOKEN", "")
-    max_concurrency = int(os.environ.get("EM_STT_MAX_CONCURRENCY", "1"))
+    # Machine-agnostic name; EM_STT_MAX_CONCURRENCY kept as a deprecated back-compat alias.
+    max_concurrency = int(os.environ.get("STT_SERVICE_MAX_CONCURRENCY")
+                          or os.environ.get("EM_STT_MAX_CONCURRENCY") or "1")
     # LAN bind + no token = an open transcription service on the network. This used to be a warning; a
     # warning in a log nobody tails is indistinguishable from a correctly-secured deploy (`/health` answers
     # `ok` either way), which is the fail-soft-becomes-silent-absence class. Refuse instead, with an
