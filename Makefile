@@ -18,7 +18,7 @@ INSTALLKIT_SRC ?= $(HOME)/dev/installkit
 VENDOR_DIR     := installkit
 MODULES        := __init__.py deps.py hardware.py secrets.py templating.py wizard.py
 
-.PHONY: vendor-sync vendor-check
+.PHONY: vendor-sync vendor-check installer-parity aur-parity bootstrap-smoke install-hooks
 
 vendor-sync:   ## Re-copy installkit modules from $(INSTALLKIT_SRC) at $(INSTALLKIT_PIN) into $(VENDOR_DIR)/
 	@for m in $(MODULES); do \
@@ -51,3 +51,19 @@ vendor-check:  ## Fail if vendored installkit/ diverges from installkit@$(INSTAL
 	done; \
 	[ $$rc -eq 0 ] || echo "vendor-check FAILED — run 'make vendor-sync' or reconcile the pin."; \
 	exit $$rc
+
+# --- Installer-parity gates (SOP: CLAUDE.md "Installer parity") ---
+
+installer-parity:  ## Run the stateless parity pytest + the config-knob (canary/ignore-lint) gate
+	uv run python -m pytest -q tests/test_installer_parity.py
+	bash scripts/installer-parity.sh
+
+aur-parity:  ## Cross-repo AUR bridge. `make aur-parity` = skip-loud if clone absent; BUMP=1 = hard-fail.
+	python3 tools/aur_parity.py $(if $(BUMP),--bump,)
+
+bootstrap-smoke:  ## Reachability backstop: only the git-tracked tree must reach every install surface
+	bash tools/bootstrap_smoke.sh
+
+install-hooks:  ## Install the repo-local pre-push hook (the global identity guard chains to it)
+	@install -Dm755 tools/hooks/pre-push "$$(git rev-parse --absolute-git-dir)/hooks/pre-push"
+	@echo "installed $$(git rev-parse --absolute-git-dir)/hooks/pre-push"

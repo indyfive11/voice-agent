@@ -54,3 +54,38 @@ A change that adds a **new module** which already-tracked/deployed code imports 
 blocked. The fail-soft guard is the durable primary — it immunizes the *whole class*, not just one file; wrap
 import **and** construction so an optional feature can never take down the core loop. Mirrored in
 `gabagent/CLAUDE.md` (cross-repo SOP).
+
+## Installer parity (hard SOP, cross-repo — GATED, not willpower)
+
+**The installer must never lag the code.** A change that adds an install-relevant surface MUST update the
+matching installer artifact **in the same change**, and that parity is enforced by an automatic **gate**
+(a test / a hook), never by a checklist. gabagent enforces the same goal in its own frame (a
+contract/registry pytest); this is voice-agent's flat-role-provisioner frame. Consensus with GA, 2026-07-28.
+
+**Single source of truth:** `pyproject.toml [tool.voice-agent.install]` — `system_pkgs` (app system libs;
+the AUR `depends` must be a superset) + `user_writable_dirs` (dirs the app writes; the AUR launcher's
+`rsync --delete` MUST `--exclude` each, or an upgrade wipes user data). Consumed dev/CI/release-side ONLY —
+never on the runtime path (the Pi content-syncs pyproject; a runtime read would couple the boot path to it).
+
+**The gates** (all automatic — CI `installer-parity.yml` + the chained repo `pre-push` hook via
+`make install-hooks`; bypass `--no-verify` still hits CI):
+- **Tier 1 — hermetic pytest `tests/test_installer_parity.py` (BLOCKS):** `uv lock --check` (stale lock
+  breaks the satellite's `uv sync --locked`); the `bootstrap.sh --inexact` invariant (a bare `uv sync`
+  silently drops the mdns extra → box loses discovery); untracked `*.py`/`*.sh` importer **exits 1**
+  (New-Module SOP as a gate); manifest well-formedness; the AUR bridge in skip-loud mode.
+- **Config-knob gate `scripts/installer-parity.sh` (delta-scoped + BLOCKS):** a NEW env knob read in code
+  must be in `.env.example` or `.installer-parity-ignore` (pre-existing internal knobs are grandfathered by
+  delta scope); a **canary** asserts the detector still matches ≥ floor known keys (a scan that matches
+  nothing = a false green, not a pass); default-flip is WARN (non-blocking — `.env.example` may hold a
+  sample, not the default).
+- **Tier 2 — cross-repo AUR bridge `tools/aur_parity.py` / `make aur-parity`:** asserts PKGBUILD `depends`
+  ⊇ `system_pkgs` and launcher `--exclude` ⊇ `user_writable_dirs` (missing exclude = data-loss FAIL);
+  parse-fail = FAIL LOUD. Clone absent → **SKIP-LOUD in suite, but HARD-FAIL in bump context**
+  (`make aur-parity BUMP=1`, a required step in the AUR publish recipe — at bump time the clone is present
+  by definition, so absence = misconfig; skipping there is the v0.8.0-class hole).
+- **Tier 3 — reachability backstop `tools/bootstrap_smoke.sh`:** materialises ONLY the git-tracked tree
+  (fresh-clone / satellite-rsync equivalent) and asserts every install surface is reachable in it — grep
+  proves *edited*, this proves *reached*.
+
+**Gated exception:** `.installer-parity-ignore` — one token per line, each with a `# reason`, diff-visible;
+a reasonless entry is itself a lint failure. Mirrored in `gabagent/CLAUDE.md` (cross-repo SOP).

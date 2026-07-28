@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# voice-agent repo-local pre-push hook — Installer-Parity SOP forcing-function (local half).
+#
+# The global identity guard (~/.config/git/hooks/pre-push) chains to THIS file after the identity check
+# passes, replaying the push refs on stdin. Install with `make install-hooks`. Bypass: `--no-verify`
+# (auditable) — CI (.github/workflows/installer-parity.yml) still gates, so a bypass can't merge.
+#
+# Runs: stateless pytest gates + the DELTA config-knob gate (base = the push range) + the AUR bridge in
+# suite/skip-loud mode (a push is not an AUR bump).
+set -uo pipefail
+cd "$(git rev-parse --show-toplevel)" || exit 0
+
+# base = oldest remote_oid in the pushed range (what the remote already has); else merge-base origin/main.
+base=""
+while read -r _lref loid _rref roid; do
+    [ -z "${loid:-}" ] && continue
+    [[ "$loid" =~ ^0+$ ]] && continue
+    if [[ -n "${roid:-}" && ! "$roid" =~ ^0+$ ]]; then base="$roid"; else base=""; fi
+done
+[ -z "$base" ] && base=$(git merge-base @ origin/main 2>/dev/null || true)
+
+fail=0
+echo "installer-parity(pre-push): running gates…"
+
+if command -v uv >/dev/null 2>&1; then
+    uv run --no-sync python -m pytest -q tests/test_installer_parity.py 2>/dev/null \
+      || uv run python -m pytest -q tests/test_installer_parity.py \
+      || { echo "  ✗ stateless parity pytest failed" >&2; fail=1; }
+else
+    echo "  ! uv not found — skipping pytest gates (CI still enforces)" >&2
+fi
+
+bash scripts/installer-parity.sh "$base" || fail=1
+python3 tools/aur_parity.py || fail=1   # suite/skip-loud (a push is not a bump)
+
+if [ "$fail" -ne 0 ]; then
+    echo "" >&2
+    echo "PUSH BLOCKED by installer-parity. Fix the gates above, or bypass with --no-verify (CI still gates)." >&2
+    exit 1
+fi
+echo "installer-parity(pre-push): OK"
+exit 0

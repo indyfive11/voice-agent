@@ -1,0 +1,40 @@
+name: installer-parity
+
+# Blocking gate: new code must ship with its installer coverage (SOP: CLAUDE.md "Installer parity").
+# Runs the stateless parity pytest + the delta-scoped config-knob gate. Catches a `--no-verify` local
+# push bypass. Light by design — the tests shell out to uv/git/bash and never import the app, so no
+# multi-GB dependency sync is needed.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  installer-parity:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (full history for merge-base)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install uv + pytest
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          python -m pip install --quiet pytest
+
+      - name: uv.lock consistent with pyproject
+        run: uv lock --check
+
+      - name: Stateless parity gates (pytest)
+        run: python -m pytest -q tests/test_installer_parity.py
+
+      - name: Delta config-knob gate (vs origin/main)
+        run: bash scripts/installer-parity.sh "origin/${{ github.base_ref || 'main' }}"

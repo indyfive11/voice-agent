@@ -68,6 +68,21 @@ dev = [
 # This is an application, not a library — don't try to build/install it as a package.
 package = false
 
+# --- Installer-parity manifest (dev/CI/release-side ONLY — never read on the runtime path) ---
+# Single declared source of truth for the installer-parity gates (SOP: "Installer parity", CLAUDE.md).
+# Consumed by tests/test_installer_parity.py, tools/aur_parity.py (`make aur-parity`) and the bootstrap
+# smoke — NEVER by run.sh/main.py at runtime (the Pi content-syncs pyproject.toml, so a runtime read here
+# would couple the satellite boot path to this table; keep it release-side).
+[tool.voice-agent.install]
+# System libraries the APP links against / execs (the AUR PKGBUILD `depends` must be a SUPERSET — it may
+# additionally carry packaging-level tooling like uv/rsync that the app itself doesn't link). Non-python
+# deps only: pip-installed deps live in [project.dependencies] and are checked via `uv lock --check`.
+system_pkgs = ["portaudio", "espeak-ng"]
+# Every dir/file the running app writes UNDER its working copy. The AUR launcher's `rsync -a --delete`
+# on `--update` MUST `--exclude` each of these or a package upgrade WIPES the user's data in it. This
+# list is the data-loss guard: tools/aur_parity.py asserts the launcher excludes ⊇ this set.
+user_writable_dirs = [".env", "wakewords", "logs", "models", "data", ".venv", "wake-train"]
+
 # --- Local fork escape hatch (documented, default OFF) ---
 # Don't fork preemptively; ship on the pinned PyPI release above. When you need to
 # patch Pipecat (fix a bug, set a breakpoint, hack a service), clone your fork to

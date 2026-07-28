@@ -1,0 +1,15 @@
+# installer-parity ignore-list — the gated exception for the Installer-Parity SOP (CLAUDE.md).
+#
+# FORMAT: one token per line, followed by a `# reason`. A line WITHOUT a reason is itself a lint
+# failure (scripts/installer-parity.sh rejects it) — silence must be justified, never a blank dumping
+# ground. Tokens are env-var keys (for env-doc parity / default-flip) OR repo-relative paths (for the
+# untracked-importer check). Entries stay diff-visible so an exemption is reviewable like any change.
+#
+# NOTE on scope: env-doc parity is DELTA-scoped (only knobs ADDED since the push base must be documented
+# in .env.example). The ~84 pre-existing internal/advanced knobs read in code but intentionally NOT in
+# .env.example are GRANDFATHERED by the delta scope — they need no entry here. Add a key here only to
+# exempt a NEW knob you are deliberately keeping undocumented, or to acknowledge an intentional
+# default-flip.
+
+BUMP                  # tooling flag for tools/aur_parity.py (bump-context switch), not runtime app config
+VOICE_AGENT_AUR_DIR   # dev/CI override for the AUR clone path (tools/aur_parity.py), not runtime app config
