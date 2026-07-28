@@ -74,6 +74,15 @@ converts "the PoC" from an aspiration into the forcing function.
      spoken wake→response on the redeployed Pi.
 2. **Auto-detect the LAN brain** — mDNS/zeroconf or known-port probe → auto-fill brain host + token,
    replacing the hand-edited `.env`. "Fire it up and it finds the brain."
+   - **Voice-host role (the discovery emitter)** — the install-time provisioner that runs *on the brain
+     box*, detects its primary-route LAN IP, and turns the brain's `_voice-brain._tcp` advertiser on so a
+     satellite can find it without a hand-typed IP. **SHIPPED** — `voice_agent_install/voice_host.py`
+     (Layer-B caller; `bootstrap.sh --role voice-host`) invokes the brain-side seam cross-process
+     (`gabagent-install --enable-voice-host --host <ip>`, never an import). The graft: Layer-B passes the
+     detected LAN IP, Layer-C writes `voice_host` + `voice_advertise` together and *refuses on loopback*
+     (a bare `voice_advertise:true` on a default box advertises nothing). Discovery is an enhancement, not
+     a hard dependency — every failure degrades to the honest floor (type the brain's IP). Public on
+     `origin/main` (`ca56619`), paired with gabagent Layer-C (`aea1306`).
    - **Firewall-aware reachability** (a filtered mDNS responder reads identically to a dead one) — the
      ratified detect-and-report design lives in **gabagent `INSTALL_PLAN.md` §10d** (named link, not
      restated here, per the cross-repo "named links not merged content" rule). Layer-B owns the browse
@@ -88,6 +97,15 @@ converts "the PoC" from an aspiration into the forcing function.
    *(promoted to a ship-blocker by the charter)*: the wire contract still carries brain-specific
    names (`gabagent.duck_exclude`, `/media/*`). "Brain-agnostic" is not shippable while the protocol
    names one brain. Neutralize the names + document the protocol.
+   - **Status (2026-07-27): PARTIAL — shipped both sides.** The duck-exclude stream property is
+     neutralized: the VUI dual-stamps both the neutral `voicebrain.duck_exclude` and the legacy
+     `gabagent.duck_exclude` on both audio paths (`PIPEWIRE_PROPS` + `PULSE_PROP`), and the brain
+     dual-reads both keys through one shared predicate feeding both consumers (local-duck exclusion +
+     media-state backstop). Additive/non-breaking. Public: voice-agent `ca56619` + gabagent `de3b489`,
+     protocol documented at `VOICE_PROTOCOL.md#stream-properties`. **Remaining:** `/media/*` name
+     neutralization (cosmetic, VUI lane), a `BRAIN=remote` selector alias, and the flag-day drop of the
+     legacy `gabagent.duck_exclude` key — the last gated on the brain dual-read being live across the
+     whole running fleet, then a coordinated cut.
 
 **Verification debts that gate ship-confidence** (in-flight, not new work): image-gen display
 joint-verify on the TV satellite; confirm-parser echo live re-drive; the post-USB-cycle in-process
