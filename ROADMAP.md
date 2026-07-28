@@ -94,6 +94,17 @@ converts "the PoC" from an aspiration into the forcing function.
      + firewall-aware operator remedy, non-fatal fall-through to the typed host+port floor); public on
      `origin/main`, full suite green, live-verified on the reference box against the real LAN (no firewall
      touched). *(internal: P9)*
+   - **Token pairing — the last hand-typed step, removed. SHIPPED (2026-07-28).** A fresh satellite
+     obtains the brain's bearer token *over the wire* during a short, operator-opened window, instead
+     of the maintainer reading and typing it into `.env`. `satellite --pair` runs the CLAIM client
+     (`voice_agent_install/pairing.py` — 128-bit random `client_id` persisted before first POST; a
+     server-minted one-time `claim_secret` bound to the accepted peer-IP; replay-until-TTL for
+     dropped-response recovery), and pairing supplies `brain_token` *before* compose/apply so a failure
+     aborts before anything is written. The agnostic wire contract is owned brain-side
+     (gabagent `docs/PAIRING.md`) — the maintainer's direct call for this sub-contract. Public:
+     voice-agent `56d59c1` (client + 19 tests), gabagent `de8edfd` (brain lane). **Live-certified
+     cross-box (2026-07-28):** real Pi → brain → token retrieved over the wire → authenticated call
+     `200` with the token / `401` without, reusing the persisted `client_id` (idempotent re-run).
 3. **HW-tiering** — detect-once-write-config (never a per-startup probe): strong HW runs local
    STT/TTS, weak HW (Pi-class) offloads. Per the no-hardcodes portability SOP.
 4. **Protocol de-branding — [GitHub #1](https://github.com/indyfive11/voice-agent/issues/1)**
@@ -203,6 +214,10 @@ re-attach hardening (currently catches cleanly ~1/3, else a ~15s restart-fallbac
   ~0.9 GB with zero behavior change. *(Supersedes the earlier "pin torch to the CPU wheel" plan — the
   whole stack was dead, not just mis-indexed.)*
 - **Long-form dictation hold** + the `send_to_builder` deferred-speak seam (`a3f6fab`, 06-24).
+- **Token pairing (3c)** — the last hand-typed install step removed: a satellite claims the brain's
+  bearer token over the wire during an operator-opened window (`56d59c1` client, 07-28), designed
+  adversarially with the reference brain and live-certified cross-box. *(Completes "auto-fill the
+  token" under Now #2.)*
 - **Image-gen display consumer** — voice "make a picture" → mpv sink with locality routing
   (`4a7ad55`, 07-04); live on the workstation, TV-satellite verify open.
 - **Pi media-deafness fix** — pause video on wake for a clean mic (`d7fe52f`, 07-04).
