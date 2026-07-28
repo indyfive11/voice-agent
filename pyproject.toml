@@ -47,12 +47,13 @@ speex = [
 piper = [
     "pipecat-ai[piper]==1.3.0",
 ]
-# mDNS LAN-brain discovery (voice_agent_install.discovery + the boot re-resolve). Per-device by design,
-# like [piper]: install only where discovery is wanted, with `uv sync --extra mdns`. Deliberately NOT core —
-# `run.sh` is `uv run python main.py`, which re-syncs against this file on EVERY launch, so a core dep puts a
-# package resolve on the boot path of every satellite; and `pi-voice-launch` syncs only *.py + run.sh, so a
-# core dep would not reach the Pi anyway. discovery.py imports zeroconf lazily inside a try, so its absence
-# degrades to "no mDNS, manual host only" and never raises.
+# mDNS LAN-brain discovery (voice_agent_install.discovery + the boot re-resolve). Installed BY DEFAULT for
+# the `satellite` role (bootstrap.sh adds `--extra mdns` unless `--no-mdns`) — a satellite's job is to find
+# its brain, so "fire it up and it finds the brain" is the default, not opt-in. Still an EXTRA, not core:
+# `run.sh` is `uv run python main.py`, which would re-resolve against this file on every launch if it were
+# core; keeping it an extra means the boot path carries no package resolve, and a box that does not want
+# discovery (voice-host, or a satellite with `--no-mdns`) omits it. discovery.py imports zeroconf lazily
+# inside a try, so its absence degrades to "no mDNS, manual host only" and never raises.
 mdns = [
     "zeroconf>=0.132",
 ]

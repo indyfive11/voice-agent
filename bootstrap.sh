@@ -39,19 +39,21 @@ set -euo pipefail
 ROLE="satellite"
 EXTRAS=()
 ASSUME_YES=0
+NO_MDNS=0
 
 usage() {
     cat <<'EOF'
-Usage: ./bootstrap.sh [--role ROLE] [--extra NAME]... [--yes] [-- ARGS...]
+Usage: ./bootstrap.sh [--role ROLE] [--extra NAME]... [--no-mdns] [--yes] [-- ARGS...]
 
   --role ROLE   Which role to provision this box as. Default: satellite.
                 `satellite` = a thin client that offloads to a LAN brain. `voice-host` = the brain
                 box; enables its mDNS advertiser so satellites can auto-discover it.
   --extra NAME  Optional dependency group to install (repeatable). See pyproject.toml.
-                `mdns` adds zeroconf, which lets the provisioner PRE-FILL the brain host by
-                discovery instead of asking for it. Off by default: discovery degrades to a
-                manual prompt when absent, so an unconfigured install still works. Note that
-                `run.sh` re-syncs on every launch and does not re-select extras.
+                `mdns` adds zeroconf, which lets the box FIND its brain by discovery instead of a
+                typed IP. It is installed BY DEFAULT for the `satellite` role (a satellite's whole
+                job is to find and offload to a LAN brain); pass `--no-mdns` to opt out. Absent it,
+                discovery fail-softs to a manual host prompt, so opting out never breaks an install.
+  --no-mdns     Do NOT install the mdns/zeroconf extra for a satellite (reverts to typed-IP only).
   --yes         Do not ask before installing `uv`. For unattended runs.
   -- ARGS...    Everything after `--` is passed through to the provisioner.
 
@@ -64,12 +66,25 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --role)    ROLE="${2:?--role needs a value}"; shift 2 ;;
         --extra)   EXTRAS+=("--extra" "${2:?--extra needs a value}"); shift 2 ;;
+        --no-mdns) NO_MDNS=1; shift ;;
         --yes|-y)  ASSUME_YES=1; shift ;;
         -h|--help) usage; exit 0 ;;
         --)        shift; break ;;
         *)         echo "bootstrap: unknown option: $1" >&2; usage >&2; exit 10 ;;
     esac
 done
+
+# A satellite discovers its brain by default: mDNS is the "fire it up and it finds the brain" path, so
+# the extra that powers it (zeroconf) ships with the satellite role unless --no-mdns. This is additive
+# and reversible — without it discovery degrades to a manual host prompt, so the box still works. Only
+# the satellite role gets it: the voice-host (brain) box runs the ADVERTISER, which is brain-side, not
+# this extra. An explicit `--extra mdns` is honored without double-adding.
+if [ "$NO_MDNS" -eq 0 ] && [ "$ROLE" = "satellite" ]; then
+    case " ${EXTRAS[*]-} " in
+        *" mdns "*) ;;                          # already requested explicitly — don't double-add
+        *) EXTRAS+=("--extra" "mdns") ;;
+    esac
+fi
 
 # --- where are we -----------------------------------------------------------------------------
 # Resolved from THIS SCRIPT's own location, never from the caller's cwd — same rule as
