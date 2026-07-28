@@ -81,8 +81,10 @@ run, same as v1.
   wake (a `WakeEventFrame` the gate pushes downstream), consumed per-turn. Producer gated by
   `WAKE_SIGNAL_FORWARD` (default on); brain threshold `GABAI_VOICE_BARE_WAKE_THRESHOLD` (default 0.8),
   kill-switch `GABAI_VOICE_WAKE_CONFIDENCE_FILTER`. Absent `wake` → exact prior behavior (back-compat).
-- **Naming debt:** the contract still carries brain-specific names (`gabagent.duck_exclude`,
-  `/media/*`). Decoupling is tracked publicly as GitHub #1.
+- **Naming debt (de-branding in progress, GitHub #1):** the neutral output-stream property is now
+  `voicebrain.duck_exclude`, stamped alongside the legacy `gabagent.duck_exclude` during the brain's
+  dual-read migration (both consumers match either key via one predicate; the flag-day drop of the
+  legacy key is the later coordinated step). The `/media/*` contract names remain to neutralize.
 
 ---
 

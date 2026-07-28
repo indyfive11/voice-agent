@@ -28,22 +28,29 @@ os.environ["TMPDIR"] = _EXEC_TMP
 tempfile.tempdir = None  # drop any cached value so TMPDIR is re-read
 
 # Stamp a stable, collision-proof property on every audio stream this process opens (mic + TTS output)
-# so the gabagent brain's universal local-media duck can EXCLUDE Aria's own TTS output exactly (vs a
-# node-name heuristic) and never mute her, AND so the brain's media-state detection never counts Aria's
-# own voice as "media playing". The brain skips any sink-input whose `pactl list sink-inputs` Properties
-# block contains gabagent.duck_exclude = "1". Like TMPDIR above, both must be set BEFORE any stream opens.
+# so the brain's universal local-media duck can EXCLUDE Aria's own TTS output exactly (vs a node-name
+# heuristic) and never mute her, AND so the brain's local-media detection never counts Aria's own voice
+# as "media playing" (both brain consumers read the same stamped property). The brain skips any sink-input
+# whose `pactl list sink-inputs` Properties block contains the key (rendered `= "1"`). Like TMPDIR above,
+# both must be set BEFORE any stream opens.
+#
+# Protocol de-branding (GitHub #1): `voicebrain.duck_exclude` is the brain-NEUTRAL protocol key. We stamp
+# BOTH it and the legacy `gabagent.duck_exclude` during the brain's dual-read migration — the legacy key
+# keeps a not-yet-migrated brain matching; the neutral key is what any conforming brain reads. Drop the
+# legacy key once every brain in the fleet reads the neutral one (coordinated flag-day, not here).
 #
 # CRITICAL: the stamp must land regardless of which output PATH the stream takes, because that path is
 # config-dependent (AUDIO_OUTPUT_DEVICE_NAME):
 #   - NATIVE PipeWire client (e.g. the old node alsa_playback.python3.x): honours PIPEWIRE_PROPS only.
 #   - libpulse path (AUDIO_OUTPUT_DEVICE_NAME=pulse → ALSA `pulse` PCM → pipewire-pulse, node
 #     "ALSA plug-in [pythonX.Y]"): honours PULSE_PROP only — PIPEWIRE_PROPS is IGNORED here.
-# Set BOTH so the exclude is path-independent. (2026-06-22: the EM audio fix switched output to the
-# libpulse path, which silently dropped the PIPEWIRE_PROPS-only stamp → the brain counted Aria's own TTS
-# sink as playing media. Verified: PIPEWIRE_PROPS confirmed native 2026-06-04; PULSE_PROP covers `pulse`.)
-# The mic stream also gets it (harmless: the duck only scans sink-inputs). setdefault so an override wins.
-os.environ.setdefault("PIPEWIRE_PROPS", "{ gabagent.duck_exclude = 1 }")
-os.environ.setdefault("PULSE_PROP", "gabagent.duck_exclude=1")
+# Set BOTH keys in BOTH vars so the exclude is path- AND migration-independent. (2026-06-22: the EM audio
+# fix switched output to the libpulse path, which silently dropped the PIPEWIRE_PROPS-only stamp → the
+# brain counted Aria's own TTS sink as playing media. Verified: PIPEWIRE_PROPS native 2026-06-04;
+# PULSE_PROP covers `pulse`.) The mic stream also gets it (harmless: the duck only scans sink-inputs).
+# setdefault so an override wins.
+os.environ.setdefault("PIPEWIRE_PROPS", "{ gabagent.duck_exclude = 1 voicebrain.duck_exclude = 1 }")
+os.environ.setdefault("PULSE_PROP", "gabagent.duck_exclude=1 voicebrain.duck_exclude=1")
 
 from dotenv import load_dotenv
 from loguru import logger

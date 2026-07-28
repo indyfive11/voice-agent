@@ -356,7 +356,7 @@ class BrainLLMService(LLMService):
         # reset_transport_intent) and reads it at window-close to decide whether to auto-resume the video.
         self._last_transport_intent = False
         # Log the correlation key so the transcript can be lined up with the brain's own logs.
-        _tlog(f"BRAIN | gabagent session_id={self._session_id}")
+        _tlog(f"BRAIN | session_id={self._session_id}")
 
     def set_acoustic_wake_gated(self, gated: bool) -> None:
         """Tell the brain whether an upstream wake-word gate exists (called from main.py after the gate is

@@ -1,6 +1,6 @@
 """TTSGainProcessor — attenuate Aria's TTS audio so she isn't louder than the (ducked) music.
 
-Aria's TTS output is intentionally duck-excluded (`gabagent.duck_exclude=1`) so the brain's media duck
+Aria's TTS output is intentionally duck-excluded (`voicebrain.duck_exclude=1`) so the brain's media duck
 never silences her — but that leaves her voice at FULL output level while music is ducked (or 0% under
 `mute:true`), so she comes across disproportionately loud, and turning the music up can't rebalance it
 (her stream is independent + excluded). This processor scales the TTS PCM down by a fixed gain (0..1)

@@ -17,10 +17,13 @@ protocol only, no code dependency** in either direction. The brain↔shell contr
 Run voice-agent with `BRAIN=local` and never touch gabagent, or wire them
 together for a full voice-driven agent.
 
-> **Brain-agnostic, with known rough edges.** The design is brain-agnostic (the `brains/` seam,
-> `BRAIN=local` default), but some gabagent-specific naming has crept in (e.g. a `gabagent.duck_exclude`
-> output-stream property, the `/media/*` duck contract). Renaming these to neutral terms is tracked
-> for a later pass.
+> **Brain-agnostic; de-branding in progress ([#1](https://github.com/indyfive11/voice-agent/issues/1)).**
+> The design is brain-agnostic (the `brains/` seam, `BRAIN=local` default). The neutral output-stream
+> property is `voicebrain.duck_exclude` — specified under
+> [Stream properties](https://github.com/indyfive11/gabagent/blob/master/docs/VOICE_PROTOCOL.md#stream-properties);
+> the shell stamps it alongside the legacy `gabagent.duck_exclude` during the brain's dual-read migration
+> (the legacy key is dropped once every brain reads the neutral one). Neutralizing the `/media/*` names
+> is the remaining part of #1.
 
 ## Stack
 

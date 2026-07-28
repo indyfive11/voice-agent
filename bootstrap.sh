@@ -45,6 +45,8 @@ usage() {
 Usage: ./bootstrap.sh [--role ROLE] [--extra NAME]... [--yes] [-- ARGS...]
 
   --role ROLE   Which role to provision this box as. Default: satellite.
+                `satellite` = a thin client that offloads to a LAN brain. `voice-host` = the brain
+                box; enables its mDNS advertiser so satellites can auto-discover it.
   --extra NAME  Optional dependency group to install (repeatable). See pyproject.toml.
                 `mdns` adds zeroconf, which lets the provisioner PRE-FILL the brain host by
                 discovery instead of asking for it. Off by default: discovery degrades to a
@@ -167,5 +169,9 @@ VENV_PYTHON="$ROOT/.venv/bin/python"
 # --- hand off -------------------------------------------------------------------------------------
 # Everything past this line is Python's job. exec, so the provisioner owns the terminal (it prompts)
 # and its exit status is this script's exit status.
+# Roles are hyphenated for the operator (`--role voice-host`) but map to an underscore module name
+# (`voice_agent_install.voice_host`) — Python modules cannot contain hyphens. An unknown role becomes
+# a ModuleNotFoundError and a non-zero exit, which is the honest failure for a typo'd role.
+MODULE="voice_agent_install.$(printf '%s' "$ROLE" | tr '-' '_')"
 echo "bootstrap: provisioning role '$ROLE'…"
-exec "$VENV_PYTHON" -m "voice_agent_install.$ROLE" "$@"
+exec "$VENV_PYTHON" -m "$MODULE" "$@"
