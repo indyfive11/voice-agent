@@ -11,6 +11,7 @@ bump recipe (`make aur-parity BUMP=1`), not here.
 """
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 import tomllib
@@ -55,6 +56,24 @@ def test_bootstrap_sync_is_additive_inexact():
         assert ("SYNC_FLAGS" in s) or ("--inexact" in s), (
             f"non-additive `uv sync` in bootstrap.sh (missing --inexact / SYNC_FLAGS): {s!r}"
         )
+
+
+def test_bootstrap_supports_sync_only_provisioning():
+    """The AUR launcher provisions a fresh venv via `bootstrap.sh --sync-only` (run.sh is a PURE RUNNER,
+    `uv run --no-sync`, and never syncs). Guard the flag + its probe-gated marker so neither can be
+    silently dropped from the tree — that would reintroduce the empty-.venv first-run crash the first
+    from-scratch AUR install exposed (ModuleNotFoundError on the first import)."""
+    text = (REPO / "bootstrap.sh").read_text(encoding="utf-8")
+    assert "--sync-only" in text and "SYNC_ONLY" in text, (
+        "bootstrap.sh must accept + wire --sync-only (the AUR first-run provisioning seam)"
+    )
+    assert ".va-provisioned" in text, (
+        "bootstrap.sh --sync-only must drop the .venv/.va-provisioned marker the launcher fast-stats"
+    )
+    assert re.search(r'-c\s+["\']import ', text), (
+        "bootstrap.sh --sync-only must PROBE a real import before marking provisioned — an empty .venv "
+        "(uv run --no-sync creates one) must not be mistaken for a provisioned one"
+    )
 
 
 def test_no_untracked_importable_modules():

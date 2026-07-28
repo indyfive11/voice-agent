@@ -8,6 +8,9 @@ install manifest (`[tool.voice-agent.install]` in pyproject.toml):
     = a clean-box install that crashes at runtime).
   * the launcher's `rsync --exclude` set MUST be a superset of manifest.user_writable_dirs  (a
     user-writable dir NOT excluded = `rsync -a --delete` WIPES the user's data on package upgrade).
+  * the launcher MUST provision the venv on first run via `bootstrap.sh --sync-only`  (run.sh is a pure
+    runner and never syncs, so a launcher that only mirrors + `exec`s run.sh ships an EMPTY .venv that
+    crashes on first import — a BEHAVIOR gap the two superset checks above are structurally blind to).
 
 Two invocation contexts (maintainer+GA consensus, the v0.8.0 hole):
   * SUITE / general  (default): AUR clone absent -> SKIP-LOUD (portable CI has no clone; never a silent
@@ -68,6 +71,19 @@ def _parse_pkgbuild(text: str) -> tuple[set[str], set[str]]:
     return depends, excludes
 
 
+def _launcher_provisions(text: str) -> bool:
+    """True if the AUR launcher provisions the venv on first run (calls `bootstrap.sh --sync-only`).
+
+    The gap this guards (found by the first from-scratch AUR install): run.sh is a PURE RUNNER
+    (`uv run --no-sync`) and never provisions, so a launcher that only mirrors the tree and `exec`s
+    run.sh leaves a fresh install with an EMPTY .venv -> ModuleNotFoundError on the very first import.
+    First-run provisioning MUST route through the tree's `bootstrap.sh --sync-only` (single source of
+    truth for the sync + its role extras). This checks BEHAVIOR, not a dep/exclude superset — the class
+    the depends/excludes checks are structurally blind to.
+    """
+    return re.search(r"bootstrap\.sh[^\n]*--sync-only", text) is not None
+
+
 def main(argv: list[str]) -> int:
     bump = "--bump" in argv or os.environ.get("BUMP") == "1"
     ctx = "bump" if bump else "suite"
@@ -85,8 +101,9 @@ def main(argv: list[str]) -> int:
         return 0
 
     man = _manifest()
+    text = pkgbuild.read_text(encoding="utf-8")
     try:
-        depends, excludes = _parse_pkgbuild(pkgbuild.read_text(encoding="utf-8"))
+        depends, excludes = _parse_pkgbuild(text)
     except ValueError as e:
         print(f"FAIL   PKGBUILD parse error at {pkgbuild}: {e}", file=sys.stderr)
         print("       Refusing to pass a PKGBUILD I can't verify (would be a false green).", file=sys.stderr)
@@ -106,11 +123,18 @@ def main(argv: list[str]) -> int:
         print(f"       excludes has: {sorted(excludes)}", file=sys.stderr)
         fail = 1
 
+    if not _launcher_provisions(text):
+        print("FAIL   FIRST-RUN CRASH: the AUR launcher never provisions the venv "
+              "(no `bootstrap.sh --sync-only`).", file=sys.stderr)
+        print("       run.sh is a pure runner (uv run --no-sync); without a first-run sync a fresh install "
+              "has an EMPTY .venv and crashes on the first import (ModuleNotFoundError).", file=sys.stderr)
+        fail = 1
+
     if fail:
         print(f"\naur-parity [{ctx}]: FAILED — reconcile {pkgbuild} with the manifest.", file=sys.stderr)
         return 1
     print(f"aur-parity [{ctx}]: OK — depends ⊇ system_pkgs {man['system_pkgs']}, "
-          f"excludes ⊇ user_writable_dirs {man['user_writable_dirs']}")
+          f"excludes ⊇ user_writable_dirs {man['user_writable_dirs']}, launcher provisions via bootstrap --sync-only")
     return 0
 
 

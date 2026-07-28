@@ -40,10 +40,11 @@ ROLE="satellite"
 EXTRAS=()
 ASSUME_YES=0
 NO_MDNS=0
+SYNC_ONLY=0
 
 usage() {
     cat <<'EOF'
-Usage: ./bootstrap.sh [--role ROLE] [--extra NAME]... [--no-mdns] [--yes] [-- ARGS...]
+Usage: ./bootstrap.sh [--role ROLE] [--extra NAME]... [--no-mdns] [--sync-only] [--yes] [-- ARGS...]
 
   --role ROLE   Which role to provision this box as. Default: satellite.
                 `satellite` = a thin client that offloads to a LAN brain. `voice-host` = the brain
@@ -54,6 +55,11 @@ Usage: ./bootstrap.sh [--role ROLE] [--extra NAME]... [--no-mdns] [--yes] [-- AR
                 job is to find and offload to a LAN brain); pass `--no-mdns` to opt out. Absent it,
                 discovery fail-softs to a manual host prompt, so opting out never breaks an install.
   --no-mdns     Do NOT install the mdns/zeroconf extra for a satellite (reverts to typed-IP only).
+  --sync-only   Provision the venv (find/install uv, create .venv, sync deps WITH the role's extras)
+                and STOP — do not run the interactive role provisioner. For the packaged install: the
+                AUR launcher owns its own working-copy sync and `.env` seed, and needs only the venv
+                from here, not the prompting/unit-installing provisioner. On success it marks the venv
+                (.venv/.va-provisioned) so the launcher can fast-stat instead of re-syncing every start.
   --yes         Do not ask before installing `uv`. For unattended runs.
   -- ARGS...    Everything after `--` is passed through to the provisioner.
 
@@ -67,6 +73,7 @@ while [ $# -gt 0 ]; do
         --role)    ROLE="${2:?--role needs a value}"; shift 2 ;;
         --extra)   EXTRAS+=("--extra" "${2:?--extra needs a value}"); shift 2 ;;
         --no-mdns) NO_MDNS=1; shift ;;
+        --sync-only) SYNC_ONLY=1; shift ;;
         --yes|-y)  ASSUME_YES=1; shift ;;
         -h|--help) usage; exit 0 ;;
         --)        shift; break ;;
@@ -180,6 +187,23 @@ uv sync "${SYNC_FLAGS[@]}" "${EXTRAS[@]+"${EXTRAS[@]}"}"
 
 VENV_PYTHON="$ROOT/.venv/bin/python"
 [ -x "$VENV_PYTHON" ] || { echo "bootstrap: expected an interpreter at $VENV_PYTHON after sync." >&2; exit 15; }
+
+# --- packaged install: stop after the venv is provisioned ---------------------------------------
+# --sync-only stops here, BEFORE the interactive role provisioner (which prompts and installs a
+# --user unit). The AUR launcher already seeds .env and owns its own working-copy sync; it needs only
+# a usable venv. The sync above ran WITH the role's extras (mdns for a satellite), so the venv is
+# complete. An interpreter existing is NOT proof of a populated venv — `uv run --no-sync` (run.sh)
+# CREATES an empty .venv, which is exactly how a fresh packaged install crashed on `import dotenv`.
+# So we PROBE a core import and only then drop a marker the launcher fast-stats to skip re-syncing.
+if [ "$SYNC_ONLY" -eq 1 ]; then
+    if ! "$VENV_PYTHON" -c "import dotenv" >/dev/null 2>&1; then
+        echo "bootstrap: --sync-only probe failed — venv present but a core dependency is missing." >&2
+        exit 15
+    fi
+    : > "$ROOT/.venv/.va-provisioned"
+    echo "bootstrap: venv provisioned (--sync-only); skipping the interactive role provisioner."
+    exit 0
+fi
 
 # --- hand off -------------------------------------------------------------------------------------
 # Everything past this line is Python's job. exec, so the provisioner owns the terminal (it prompts)
